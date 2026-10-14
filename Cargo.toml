@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "sync", "time", "process"] }
 tokio-util = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 futures-util = "0.3"
