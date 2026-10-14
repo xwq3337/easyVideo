@@ -3176,7 +3176,8 @@ pub fn find_ytdlp_in(path_var: impl AsRef<std::ffi::OsStr>) -> Option<PathBuf> {
     } else {
         &["yt-dlp", "youtube-dl"]
     };
-    for dir in std::env::split_paths(path_var) {
+    // 注意是 `&path_var`：`std::env::split_paths` 取 `&T`，传值会 E0308
+    for dir in std::env::split_paths(&path_var) {
         for name in names {
             let candidate = dir.join(name);
             if candidate.is_file() {
