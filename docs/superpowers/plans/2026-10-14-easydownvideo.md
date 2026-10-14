@@ -2899,6 +2899,71 @@ fn scan_ignores_broken_and_done_dirs() {
     std::fs::create_dir_all(task_dir(root.path(), 2)).unwrap();
     assert!(scan_resume(root.path()).is_empty());
 }
+
+#[test]
+fn scan_ignores_dirs_without_task_prefix() {
+    // 下载目录可以由用户改成 ~/Documents 这类地方，而 `manifest.json` 是极常见的文件名
+    // （Web App Manifest / Chrome 扩展 / VS Code）。没有前缀过滤，这些目录会被当成可续传任务。
+    let root = tempfile::tempdir().unwrap();
+
+    // 一个**合法但非任务**的目录：manifest.json 内容完全能解析成 TaskManifest
+    let alien = root.path().join("some-web-app");
+    std::fs::create_dir_all(&alien).unwrap();
+    std::fs::write(
+        alien.join("manifest.json"),
+        r#"{"id":7,"url":"https://x/v.mp4","filename":"v.mp4","download_dir":"/tmp","kind":{"Direct":{"size":null}}}"#,
+    )
+    .unwrap();
+
+    // 同时放一个真任务，确认过滤没有把真任务也滤掉
+    let real = task_dir(root.path(), 3);
+    std::fs::create_dir_all(&real).unwrap();
+    write_manifest(
+        &real,
+        &TaskManifest {
+            id: 3,
+            url: "https://example.com/v.mp4".into(),
+            filename: "v.mp4".into(),
+            download_dir: root.path().join("done"),
+            kind: ManifestKind::Direct { size: None },
+        },
+    )
+    .unwrap();
+
+    let found = scan_resume(root.path());
+    assert_eq!(
+        found.len(),
+        1,
+        "只应认出 task-3；`some-web-app` 里的 manifest.json 再合法也不是任务。实际: {found:?}"
+    );
+    assert_eq!(found[0].id, 3);
+}
+
+#[test]
+fn manifest_roundtrips_hls_kind() {
+    // HLS 续传是核心功能（Task 8 就是为它写的），它的 kind 变体必须真的能往返，
+    // 否则 serde 一旦标签写错，HLS 任务的断点恢复会静默失效 —— 而单测只测 Direct 是看不出来的。
+    let root = tempfile::tempdir().unwrap();
+    let dir = task_dir(root.path(), 9);
+    std::fs::create_dir_all(&dir).unwrap();
+    let m = TaskManifest {
+        id: 9,
+        url: "https://example.com/page".into(),
+        filename: "video.mp4".into(),
+        download_dir: root.path().join("done"),
+        kind: ManifestKind::Hls { playlist_url: "https://cdn.example.com/master.m3u8".into() },
+    };
+    write_manifest(&dir, &m).unwrap();
+
+    let found = scan_resume(root.path());
+    assert_eq!(found.len(), 1);
+    assert_eq!(
+        found[0].kind,
+        ManifestKind::Hls { playlist_url: "https://cdn.example.com/master.m3u8".into() },
+        "Hls 变体必须原样往返"
+    );
+    assert_eq!(found[0].kind, m.kind, "整体必须相等");
+}
 ```
 
 - [ ] **Step 2: 运行确认失败**
@@ -2953,6 +3018,17 @@ pub fn scan_resume(download_root: &Path) -> Vec<TaskManifest> {
         if !path.is_dir() {
             continue;
         }
+        // **必须过滤 `task-<id>` 前缀**。下载目录是**用户可配置**的（设置里可以改成 ~/Documents 之类），
+        // 而 `manifest.json` 是个极常见的文件名 —— Web App Manifest、Chrome 扩展、VS Code 都在用。
+        // 不按前缀过滤的话，用户目录下任何一个含 manifest.json 的子目录都会被当成"可续传任务"，
+        // 于是在启动时凭空冒出一堆假任务，甚至去"续传"一个根本不是下载的目录。
+        // 仅靠"JSON 能解析成 TaskManifest"挡不住：外部 manifest 可能恰好字段同名而解析通过。
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("task-") {
+            continue;
+        }
         let manifest_path = path.join("manifest.json");
         let Ok(text) = std::fs::read_to_string(&manifest_path) else {
             continue;
@@ -2969,7 +3045,7 @@ pub fn scan_resume(download_root: &Path) -> Vec<TaskManifest> {
 - [ ] **Step 4: 运行确认通过**
 
 Run: `cargo test --test task_manifest_test`
-Expected: 2 PASS
+Expected: 4 PASS（原有 2 个 + 本轮补的 `scan_ignores_dirs_without_task_prefix`、`manifest_roundtrips_hls_kind`）
 
 - [ ] **Step 5: Commit**
 
