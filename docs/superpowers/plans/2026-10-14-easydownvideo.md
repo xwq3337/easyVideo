@@ -356,7 +356,8 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
   - `pub enum EngineEvent { StateChanged { id: TaskId, state: TaskState }, Progress { id: TaskId, downloaded: u64, total: u64, unit: ProgressUnit }, ChoicesOffered { id: TaskId, kind: ChoiceKind } }`
   - `pub enum ChoiceKind { HlsVariants(Vec<VariantChoice>), YtdlpFormats(Vec<YtdlpFormat>) }`
   - `pub enum Choice { Variant(usize), YtdlpFormat(usize) }`
-  - `pub struct ProgressHandle`：`new()`、`add(u64)`、`set_total(u64)`、`set_unit(ProgressUnit)`、`unit() -> ProgressUnit`、`snapshot() -> (u64, u64)`、`reset()`
+  - `pub struct ProgressHandle`：`new()`、`add(u64)`、`sub(u64)`、`set_total(u64)`、`set_unit(ProgressUnit)`、`unit() -> ProgressUnit`、`snapshot() -> (u64, u64)`、`reset()`
+    - `sub` 是 Task 7 分块重试回滚所必需的方法（重试失败要撤销该次尝试已累加的字节）
   - `pub enum ProgressUnit { Bytes, Segments }`（HLS 任务按分片计数，GUI 据此决定格式化方式）
   - `pub struct VariantChoice { pub uri: String, pub bandwidth: u64, pub resolution: Option<(u64, u64)> }`
   - `pub struct YtdlpFormat { pub id: String, pub ext: String, pub note: String, pub filesize: Option<u64>, pub url: String }`
@@ -387,6 +388,19 @@ fn progress_handle_unit_defaults_to_bytes() {
     assert_eq!(p.unit(), ProgressUnit::Bytes);
     p.set_unit(ProgressUnit::Segments);
     assert_eq!(p.unit(), ProgressUnit::Segments);
+}
+
+#[test]
+fn sub_rolls_back_without_underflow() {
+    // 分块重试回滚用：撤销一次失败尝试已计入的字节
+    let p = ProgressHandle::new();
+    p.set_total(1000);
+    p.add(300);
+    p.sub(300); // 一次失败尝试的回滚
+    assert_eq!(p.snapshot(), (0, 1000));
+    p.add(50);
+    p.sub(999); // 防御：减去超过已计数的量，必须饱和到 0 而不是回绕成天文数字
+    assert_eq!(p.snapshot(), (0, 1000));
 }
 
 #[test]
@@ -478,6 +492,15 @@ impl ProgressHandle {
     pub fn add(&self, n: u64) {
         self.downloaded.fetch_add(n, Ordering::Relaxed);
     }
+    /// 回退已计入的字节数。分块重试失败时用来撤销该次尝试已累加的进度
+    /// （否则重试会把同一段字节重复累加）。饱和减，绝不回绕成天文数字。
+    pub fn sub(&self, n: u64) {
+        let _ = self.downloaded.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |cur| Some(cur.saturating_sub(n)),
+        );
+    }
     pub fn set_total(&self, n: u64) {
         self.total.store(n, Ordering::Relaxed);
     }
@@ -540,7 +563,7 @@ pub mod parse;
 - [ ] **Step 4: 运行确认通过**
 
 Run: `cargo test --test events_test`
-Expected: 3 PASS
+Expected: 3 PASS（Task 7 会为 `sub()` 追加第 4 个测试，届时本文件为 4 PASS）
 
 - [ ] **Step 5: Commit**
 
@@ -1623,9 +1646,12 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 **Files:**
 - Create: `tests/direct_test.rs`
 - Modify: `src/core/direct.rs`
+- Modify: `src/core/events.rs`（追加 `ProgressHandle::sub` —— 本任务的重试回滚需要它）
+- Modify: `tests/events_test.rs`（追加 `sub_rolls_back_without_underflow`，该文件变为 4 个测试）
 
 **Interfaces:**
-- Consumes: `ProgressHandle`、`tokio_util::sync::CancellationToken`（Task 3）
+- Consumes: `ProgressHandle`（Task 3）、`tokio_util::sync::CancellationToken`（Task 3）
+- 本任务向 `ProgressHandle` 追加 `sub(u64)`：分块重试失败时撤销该次尝试已累加的进度
 - Produces:
   - `pub const MIN_BLOCK_SIZE: u64 = 4 * 1024 * 1024`
   - `pub fn plan_blocks(total: u64, concurrency: usize, min_block: u64) -> Vec<(u64, u64)>`（左闭右开区间，块数 ≤ concurrency）
@@ -1907,19 +1933,53 @@ async fn download_one_block(
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
     use futures_util::StreamExt;
+    // 进度回滚守卫：本次尝试计入的字节先记在守卫里，若这次尝试失败（守卫未被解除），
+    // 退出时把已计入的字节减回去。不做这件事的话，重试会把同一段字节重复累加——
+    // 三次重试后同一块被计三倍，进度超过总数，速度与 ETA 同时失真。
+    let mut rollback = ProgressRollback::new(progress);
     let resp = req.try_clone().context("request not cloneable")?.send().await?.error_for_status()?;
     let mut stream = resp.bytes_stream();
     let mut file = tokio::fs::File::create(part_path).await?;
     while let Some(chunk) = stream.next().await {
         if cancel.is_cancelled() {
-            return Err(anyhow!("canceled"));
+            return Err(anyhow!("canceled")); // 守卫在此 drop，自动回滚
         }
         let chunk = chunk?;
         file.write_all(&chunk).await?;
-        progress.add(chunk.len() as u64);
+        rollback.add(chunk.len() as u64);
     }
     file.flush().await?;
+    rollback.disarm();
     Ok(())
+}
+
+/// 见 `download_one_block` 中的说明：为一次下载尝试的进度累加提供失败回滚。
+struct ProgressRollback<'a> {
+    progress: &'a ProgressHandle,
+    counted: u64,
+    armed: bool,
+}
+
+impl<'a> ProgressRollback<'a> {
+    fn new(progress: &'a ProgressHandle) -> Self {
+        Self { progress, counted: 0, armed: true }
+    }
+    fn add(&mut self, n: u64) {
+        self.progress.add(n);
+        self.counted += n;
+    }
+    /// 尝试成功：保留已计入的字节，撤销回滚。
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProgressRollback<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.progress.sub(self.counted);
+        }
+    }
 }
 ```
 
