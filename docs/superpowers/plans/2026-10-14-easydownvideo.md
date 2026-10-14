@@ -1263,34 +1263,42 @@ pub fn resolve_url(base: &str, relative: &str) -> Option<String> {
 /// KEY 行是 `METHOD=AES-128,...,IV=0x..`，一次都不会被碰到（空转）。
 ///
 /// 设为 `pub` 仅为让集成测试能直接验证"改写范围足够窄"这一性质。
+///
+/// 按**字节**处理而非 `str`：这样对 LF / CRLF / 无末尾换行 / 非 UTF-8 都能逐字节保真，
+/// 不引入任何编码假设。CR 单独摘出再补回，保证占位 IV 插在 CR 之前（否则 IV 会被 CR
+/// 截成新的一行）。
 pub fn patch_iv_less_method_none(content: &[u8]) -> Vec<u8> {
-    // 只按行处理；非 UTF-8 内容原样返回（m3u8 是文本格式，实际不会走到）
-    let Ok(text) = std::str::from_utf8(content) else {
-        return content.to_vec();
-    };
-    let mut out = String::with_capacity(text.len() + 64);
-    for line in text.split_inclusive('\n') {
-        let body = line.trim_end_matches(['\n', '\r']);
-        let needs = body.starts_with("#EXT-X-KEY:")
-            && body.contains("METHOD=NONE")
-            && !body.contains("IV=");
-        if needs {
-            out.push_str(body);
-            out.push_str(",IV=0x00000000000000000000000000000000");
-            // 保留原行的换行（如果有）
-            if line.len() > body.len() {
-                out.push_str(&line[body.len()..]);
-            }
-        } else {
-            out.push_str(line);
+    const PLACEHOLDER_IV: &[u8] = b",IV=0x00000000000000000000000000000000";
+    let mut out: Vec<u8> = Vec::with_capacity(content.len());
+    for (i, raw_line) in content.split(|&b| b == b'\n').enumerate() {
+        if i > 0 {
+            out.push(b'\n');
+        }
+        let (line, had_cr) = match raw_line.strip_suffix(b"\r") {
+            Some(l) => (l, true),
+            None => (raw_line, false),
+        };
+        out.extend_from_slice(line);
+        let is_iv_less_none_key = line.starts_with(b"#EXT-X-KEY:")
+            && contains_subslice(line, b"METHOD=NONE")
+            && !contains_subslice(line, b"IV=");
+        if is_iv_less_none_key {
+            out.extend_from_slice(PLACEHOLDER_IV);
+        }
+        if had_cr {
+            out.push(b'\r');
         }
     }
-    out.into_bytes()
+    out
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 pub fn parse_playlist(base_url: &str, content: &[u8]) -> Result<ParsedPlaylist, HlsParseError> {
-    let patched = patch_iv_less_method_none(content);
-    let playlist = m3u8_rs::parse_playlist_res(&patched)
+    let normalized = patch_iv_less_method_none(content);
+    let playlist = m3u8_rs::parse_playlist_res(&normalized)
         .map_err(|e| HlsParseError::Parse(format!("{e:?}")))?;
     match playlist {
         m3u8_rs::Playlist::MasterPlaylist(mp) => {
@@ -2457,6 +2465,9 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 - [ ] **Step 1: 下载 macOS arm64 静态构建**
 
+**注意（控制器已实测）**：该端点对 **HEAD 返回 404，只有 GET 正常**。所以不要用 `curl -I` 自检——你会看到误导性的 404 而以为链接失效。用下面的 GET：
+已验证：`302 → /download/macos/arm64/<ts>_<ver>/ffmpeg.zip`，`200`，`content-length: 28395699`（≈28MB），且支持 Range（206）。
+
 ```bash
 cd vendor/ffmpeg/macos-aarch64
 curl -fSL --retry 3 -o ffmpeg.zip "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip"
@@ -2466,9 +2477,15 @@ chmod +x ffmpeg
 rm ffmpeg.zip
 ```
 
-Expected: `ffmpeg version ...` 正常输出。
+若 zip 内不止 `ffmpeg` 一个文件（可能含 `ffprobe`），只保留 `ffmpeg`，其余删除——`include_bytes!` 只引用这一个路径。
+
+Expected: `ffmpeg version ...` 正常输出，文件约 70–120MB（解压后）。
 
 - [ ] **Step 2: 下载 Windows x86_64 构建（跨平台二进制，本机可存不可运行）**
+
+**内部结构（控制器已实测）**：该 zip 为 `114768076` 字节，顶层目录名形如
+`ffmpeg-9.0.2-essentials_build/`，可执行文件在 `ffmpeg-<ver>-essentials_build/bin/ffmpeg.exe`。
+所以下面的 `"*/bin/ffmpeg.exe"` 通配是成立的：
 
 ```bash
 cd ../windows-x86_64
