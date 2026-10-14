@@ -67,3 +67,54 @@ fn rejects_sample_aes_explicitly() {
     let err = parse_playlist("https://e.com/m.m3u8", content).unwrap_err();
     assert!(err.to_string().contains("SAMPLE-AES"));
 }
+
+#[test]
+fn malformed_iv_errors_instead_of_panicking() {
+    // 32 字节但含多字节 UTF-8：按字节切分不会 panic，必须返回 Err
+    let mut content = String::from("#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"https://k/x\",IV=");
+    content.push_str(&"€".repeat(10)); // 3 字节 × 10 = 30 字节，再加 2 字节
+    content.push_str("xy"); // 共 32 字节
+    content.push_str("\n#EXTINF:1,\na.ts\n");
+    let err = parse_playlist("https://e.com/m.m3u8", content.as_bytes()).unwrap_err();
+    assert!(err.to_string().contains("bad IV"), "实际错误: {err}");
+
+    // 长度不对
+    let short = b"#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"https://k/x\",IV=0x1234\n#EXTINF:1,\na.ts\n";
+    assert!(parse_playlist("https://e.com/m.m3u8", short).is_err());
+}
+
+#[test]
+fn encrypted_fmp4_init_segment_inherits_key() {
+    // fMP4 + AES-128：EXT-X-MAP 的初始化段本身也被加密，必须挂上 key 且要求有 IV。
+    // KEY 写在 MAP 之前（规范里最常见的顺序）。
+    let with_iv = b"#EXTM3U\n#EXT-X-VERSION:7\n\
+#EXT-X-KEY:METHOD=AES-128,URI=\"https://k/x\",IV=0x00000000000000000000000000000001\n\
+#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:6.0,\ns0.m4s\n#EXT-X-ENDLIST\n";
+    match parse_playlist("https://c/f/i.m3u8", with_iv).unwrap() {
+        ParsedPlaylist::Media(m) => {
+            assert!(m.is_fmp4);
+            let init = &m.segments[0];
+            assert!(init.is_init);
+            let k = init.key.as_ref().expect("init 段必须继承 key");
+            assert_eq!(k.uri, "https://k/x");
+            let mut expect_iv = [0u8; 16];
+            expect_iv[15] = 1;
+            assert_eq!(k.iv, Some(expect_iv));
+        }
+        _ => panic!("expected Media"),
+    }
+
+    // 缺 IV：按 RFC 8216 §4.3.2.5 必须明确报错，绝不能按媒体序号推导 IV 解出错的内容
+    let no_iv = b"#EXTM3U\n#EXT-X-VERSION:7\n\
+#EXT-X-KEY:METHOD=AES-128,URI=\"https://k/x\"\n\
+#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:6.0,\ns0.m4s\n#EXT-X-ENDLIST\n";
+    let err = parse_playlist("https://c/f/i.m3u8", no_iv).unwrap_err();
+    assert!(err.to_string().contains("IV"), "实际错误: {err}");
+}
+
+#[test]
+fn rejects_unknown_key_method() {
+    let content = b"#EXTM3U\n#EXT-X-KEY:METHOD=AES-256,URI=\"https://k/x\"\n#EXTINF:1,\na.ts\n";
+    let err = parse_playlist("https://e.com/m.m3u8", content).unwrap_err();
+    assert!(err.to_string().contains("AES-256"), "实际错误: {err}");
+}
