@@ -114,6 +114,8 @@ fn main() -> eframe::Result<()> {
 `src/app.rs`：
 
 ```rust
+use eframe::egui;
+
 #[derive(Default)]
 pub struct App;
 
@@ -2454,6 +2456,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
   - `events(&self) -> tokio::sync::broadcast::Receiver<EngineEvent>`
   - `task_info(&self, id: TaskId) -> Option<(String url, String filename)>`
   - `list_tasks(&self) -> Vec<TaskSnapshot>`，`pub struct TaskSnapshot { pub id: TaskId, pub url: String, pub filename: String, pub state: TaskState, pub progress: ProgressHandle }`（供 GUI 启动时水合，尤其是 `resume` 恢复的任务）
+  - `update_settings(&self, s: Settings)` / `current_settings(&self) -> Settings`（GUI 改设置后立即生效于新启动的任务，无需重启）
 
 **实现要点：** `Inner` 持 `Mutex<HashMap<TaskId, TaskEntry>>`（entry 含 `TaskState`、`CancellationToken`、`pending_choice: Option<ChoiceKind>`）与 `Mutex<VecDeque<TaskId>>` 排队顺序；每次状态变化后 `pump()`：活跃数 < `max_active_tasks` 时从队首启动 worker。worker 流程：probe → Direct 直接下载；Hls 拉 playlist → Master 则 `AwaitingChoice` + `ChoicesOffered` 事件 → 收到 `set_choice` 后拉 media playlist 继续 → 下完 `Merging` → ffmpeg remux → `Done`。下载循环内每个分块/分片失败重试 3 次（退避 1s/2s/4s），最终失败才标任务失败——单任务失败不阻塞队列（worker 结束即 pump 下一个）。进度转发：worker 内起一个 300ms 定时任务读 `ProgressHandle.snapshot()` 发 `EngineEvent::Progress`。
 
@@ -2505,20 +2508,19 @@ async fn wait_state(
 async fn end_to_end_direct_download() {
     let data: Vec<u8> = (0..2048u32).map(|i| (i % 253) as u8).collect();
     let server = MockServer::start().await;
-    for (range, body) in [("bytes=0-1023", &data[0..1024]), ("bytes=1024-2047", &data[1024..])] {
-        Mock::given(method("GET")).and(path("/v.mp4")).and(header("range", range))
-            .respond_with(ResponseTemplate::new(206)
-                .insert_header("content-type", "video/mp4")
-                .insert_header("content-range", &format!("bytes {}/2048", &range[6..]))
-                .set_body_bytes(body.to_vec()))
-            .mount(&server).await;
-    }
-    // probe 请求（Range bytes=0-63）：匹配任一 range mock 的前缀即可，单独再挂一个
+    // probe 请求
     Mock::given(method("GET")).and(path("/v.mp4")).and(header("range", "bytes=0-63"))
         .respond_with(ResponseTemplate::new(206)
             .insert_header("content-type", "video/mp4")
             .insert_header("content-range", "bytes 0-63/2048")
             .set_body_bytes(data[0..64].to_vec()))
+        .mount(&server).await;
+    // 引擎用 MIN_BLOCK_SIZE(4MB)，2048 字节的小文件只会切出 1 个块 → 单次全量 range 请求
+    Mock::given(method("GET")).and(path("/v.mp4")).and(header("range", "bytes=0-2047"))
+        .respond_with(ResponseTemplate::new(206)
+            .insert_header("content-type", "video/mp4")
+            .insert_header("content-range", "bytes 0-2047/2048")
+            .set_body_bytes(data.clone()))
         .mount(&server).await;
 
     let dir = tempfile::tempdir().unwrap();
@@ -2540,7 +2542,7 @@ async fn failure_does_not_block_queue() {
     Mock::given(method("GET")).and(path("/missing.mp4"))
         .respond_with(ResponseTemplate::new(404))
         .mount(&server).await;
-    // 好 URL 可完整下载
+    // 好 URL 可完整下载（512 字节 → 1 个块 → 单次全量 range）
     let data: Vec<u8> = (0..512u32).map(|i| (i % 251) as u8).collect();
     Mock::given(method("GET")).and(path("/v.mp4")).and(header("range", "bytes=0-63"))
         .respond_with(ResponseTemplate::new(206)
@@ -2548,9 +2550,10 @@ async fn failure_does_not_block_queue() {
             .insert_header("content-range", "bytes 0-63/512")
             .set_body_bytes(data[0..64].to_vec()))
         .mount(&server).await;
-    Mock::given(method("GET")).and(path("/v.mp4"))
-        .respond_with(ResponseTemplate::new(200)
+    Mock::given(method("GET")).and(path("/v.mp4")).and(header("range", "bytes=0-511"))
+        .respond_with(ResponseTemplate::new(206)
             .insert_header("content-type", "video/mp4")
+            .insert_header("content-range", "bytes 0-511/512")
             .set_body_bytes(data.clone()))
         .mount(&server).await;
 
@@ -2602,6 +2605,19 @@ async fn existing_file_gets_renamed() {
     wait_state(&mut rx, id, TaskState::Done, 30).await;
     assert_eq!(std::fs::read(dir.path().join("v.mp4")).unwrap(), b"existing");
     assert!(dir.path().join("v (1).mp4").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_settings_changes_concurrency() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let engine = Engine::new(rt, settings_with(dir.path()), dir.path().join("data"));
+    let mut s = settings_with(dir.path());
+    s.segment_concurrency = 12;
+    s.ytdlp_enabled = false;
+    engine.update_settings(s);
+    assert_eq!(engine.current_settings().segment_concurrency, 12);
+    assert!(!engine.current_settings().ytdlp_enabled);
 }
 ```
 
@@ -2709,6 +2725,15 @@ impl Engine {
     pub fn task_info(&self, id: TaskId) -> Option<(String, String)> {
         let tasks = self.inner.tasks.lock().unwrap();
         tasks.get(&id).map(|t| (t.url.clone(), t.filename.clone()))
+    }
+
+    pub fn update_settings(&self, s: Settings) {
+        *self.inner.settings.lock().unwrap() = s;
+        self.pump(); // 并发上限提高时可立即启动排队中的任务
+    }
+
+    pub fn current_settings(&self) -> Settings {
+        self.inner.settings.lock().unwrap().clone()
     }
 
     pub fn list_tasks(&self) -> Vec<TaskSnapshot> {
@@ -3057,6 +3082,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 mod app;
 mod core;
 
+use eframe::egui;
 use easydownvideo::settings::Settings;
 
 fn main() -> eframe::Result<()> {
@@ -3483,6 +3509,8 @@ impl eframe::App for App {
                     ui.add(egui::Slider::new(&mut self.settings.max_active_tasks, 1..=8));
                 });
                 ui.checkbox(&mut self.settings.ytdlp_enabled, "启用 yt-dlp 网页解析");
+                // 立即推给引擎（其余任务用新并发/开关，无需重启）
+                self.engine.update_settings(self.settings.clone());
                 if self.settings.save().is_err() {
                     ui.colored_label(egui::Color32::LIGHT_RED, "设置保存失败");
                 }
