@@ -2009,7 +2009,9 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Produces:
   - `pub struct ConcatPlan { pub list_file: PathBuf, pub segment_files: Vec<PathBuf> }`（**没有** `is_ts`：转封装参数与容器类型无关，见 Task 9）
   - `pub async fn download_media(client: &Client, media: &MediaInfo, task_dir: &Path, concurrency: usize, progress: &ProgressHandle, cancel: CancellationToken) -> anyhow::Result<ConcatPlan>`
-    - 分片写 `task_dir/seg-XXXXX.<ext>`；已存在且大小匹配则跳过（续传）
+    - 分片先写 `task_dir/seg-XXXXX.<ext>.part`，成功后原子改名为 `seg-XXXXX.<ext>`；
+      **只有改好名的文件才视为已完成**（`exists()` 即等价于"完整"，不需要额外记录大小）。
+      遗留的 `.part` 会被下次 `create` 截断覆盖，绝不当成成品
     - IV 缺省时按 HLS 规则取 `media_sequence + 分片序号` 的 64 位大端（前 8 字节补零）
     - key 按 URI 缓存，只拉一次
     - 完成后写 `task_dir/concat.txt`（ffmpeg concat 列表）并返回 `ConcatPlan`
@@ -2220,6 +2222,54 @@ async fn stale_part_file_is_not_treated_as_complete() {
 }
 
 #[test]
+fn escape_concat_path_escapes_single_quotes() {
+    use easydownvideo::core::hls::escape_concat_path;
+    // 实测：不转义时 ffmpeg 把 `file '/tmp/My's Videos/seg.ts'` 解析成 `/tmp/Mys` 并报
+    // "Impossible to open"。用户把下载目录设在含撇号的路径下（如 ~/My's Videos）很常见，
+    // 不转义等于**每一次 HLS 下载都在合并这一步失败**。
+    assert_eq!(escape_concat_path("/tmp/a.ts"), "/tmp/a.ts", "无特殊字符时原样返回");
+    assert_eq!(
+        escape_concat_path("/tmp/My's Videos/a.ts"),
+        "/tmp/My'\\''s Videos/a.ts",
+        "路径里的单引号必须转义成 '\\''"
+    );
+    // 多个撇号都要转义
+    assert_eq!(escape_concat_path("it's a 'test'.ts"), "it'\\''s a '\\''test'\\''.ts");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concat_list_uses_escaped_paths() {
+    // 端到端确认生成的 concat.txt 真的用了转义（纯函数测试保护不了"有没有调用它"）
+    let server = MockServer::start().await;
+    let s0 = vec![7u8; 100];
+    Mock::given(method("GET")).and(path("/seg0.ts"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(s0.clone()))
+        .mount(&server).await;
+
+    let media = media_no_crypto(&[format!("{}/seg0.ts", server.uri())]);
+    // 任务目录名固定为 task-<id>，但父目录来自 download_dir —— 这里用一个带撇号的临时目录
+    let parent = tempfile::tempdir().unwrap();
+    let weird = parent.path().join("My's Videos");
+    std::fs::create_dir_all(&weird).unwrap();
+    let task_dir = weird.join("task-1");
+
+    let plan = download_media(
+        &reqwest::Client::new(), &media, &task_dir, 1,
+        &ProgressHandle::new(), CancellationToken::new(),
+    ).await.unwrap();
+
+    let list = std::fs::read_to_string(&plan.list_file).unwrap();
+    assert!(
+        list.contains("'\\''"),
+        "concat 列表里的单引号必须已转义，实际内容: {list:?}"
+    );
+    assert!(
+        !list.contains("Videos/task-1/"),
+        "未转义的路径形态不应出现（那说明转义没生效）: {list:?}"
+    );
+}
+
+#[test]
 fn init_segment_does_not_shift_media_indices() {
     // IV 由 `media_sequence + 媒体序号` 推导。init 段（fMP4 的 EXT-X-MAP）不占媒体序号，
     // 若按 segments 数组下标推导 IV，init 之后的每个分片序号都会多 1，解出乱码。
@@ -2277,6 +2327,21 @@ use parse::{KeyRef, MediaInfo, SegmentRef};
 pub struct ConcatPlan {
     pub list_file: PathBuf,
     pub segment_files: Vec<PathBuf>,
+}
+
+/// 转义 ffmpeg concat 列表里的路径。
+///
+/// ffmpeg 的 concat 解析器用单引号界定路径，路径里的 `'` 必须写成 `'\''`，否则会被当成
+/// 引号结束。**实测**：`file '/tmp/My's Videos/seg.ts'` 被解析成 `/tmp/Mys` 并报
+/// "Impossible to open" —— 用户只要把下载目录设在含撇号的路径下（如 `~/My's Videos`），
+/// **每一次 HLS 下载都会在最后合并这一步失败**。
+///
+/// 实测有效的两种写法是 `'\''` 与全反斜杠转义；双引号包裹无效。这里取前者。
+///
+/// 抽成公开的纯函数是为了能直接单测：转义逻辑曾被我放在 ffmpeg 模块一个**没有任何调用方**
+/// 的函数里，导致真正的 bug 一直存在而"修复"落在死代码上。逻辑在哪落地，测试就盯哪。
+pub fn escape_concat_path(path: &str) -> String {
+    path.replace('\'', "'\\''")
 }
 
 pub async fn download_media(
@@ -2363,10 +2428,12 @@ pub async fn download_media(
         files.push(h.await??);
     }
 
+    // 写 ffmpeg concat 列表。列表的生成属于本模块（顺序是这里决定的），所以路径转义
+    // 也放在这里，不要指望调用方再处理一遍。
     let list_file = task_dir.join("concat.txt");
     let mut list = String::new();
     for f in &files {
-        list.push_str(&format!("file '{}'\n", f.display()));
+        list.push_str(&format!("file '{}'\n", escape_concat_path(&f.to_string_lossy())));
     }
     std::fs::write(&list_file, list)?;
 
@@ -2466,7 +2533,7 @@ fn default_iv(media_sequence: u64, segment_index: usize) -> [u8; 16] {
 - [ ] **Step 4: 运行确认通过**
 
 Run: `cargo test --test hls_download_test`
-Expected: 6 PASS
+Expected: 8 PASS
 
 - [ ] **Step 5: Commit**
 
@@ -2488,16 +2555,18 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 **Interfaces:**
 - Produces:
   - `pub fn ensure_ffmpeg(data_dir: &Path) -> anyhow::Result<PathBuf>`（内嵌二进制 → `data_dir/ffmpeg[.exe]`，SHA256 校验，已存在且校验通过则跳过；Unix 加 755 权限）
-  - `pub fn write_concat_list(path: &Path, files: &[PathBuf]) -> anyhow::Result<()>`
-  - `pub fn build_remux(ffmpeg: &Path, list: &Path, output: &Path, is_ts: bool) -> tokio::process::Command`
+  - `pub fn build_remux(ffmpeg: &Path, list: &Path, output: &Path) -> tokio::process::Command`
   - `pub async fn remux_to_mp4(ffmpeg: &Path, plan: &crate::core::hls::ConcatPlan, output: &Path) -> anyhow::Result<()>`
+- **不产出** `write_concat_list`：concat 列表由 Task 8 生成（顺序在那里决定，转义也在那里），
+  本模块只消费 `plan.list_file`。原计划里的 `write_concat_list` 无任何调用方，是死代码，
+  而且会让"转义"出现两个可能不同步的实现位置。
 
 - [ ] **Step 1: 写失败测试**
 
 `tests/ffmpeg_test.rs`：
 
 ```rust
-use easydownvideo::core::ffmpeg::{build_remux, ensure_ffmpeg, write_concat_list};
+use easydownvideo::core::ffmpeg::{build_remux, ensure_ffmpeg};
 use std::path::PathBuf;
 
 #[test]
@@ -2515,31 +2584,6 @@ fn ensure_extracts_and_reuses() {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&p1).unwrap().permissions().mode() & 0o111, 0o111);
     }
-}
-
-#[test]
-fn write_concat_list_format() {
-    let dir = tempfile::tempdir().unwrap();
-    let list = dir.path().join("concat.txt");
-    let files: Vec<PathBuf> = vec!["/tmp/a.ts".into(), "/tmp/b.ts".into()];
-    write_concat_list(&list, &files).unwrap();
-    let text = std::fs::read_to_string(&list).unwrap();
-    assert_eq!(text, "file '/tmp/a.ts'\nfile '/tmp/b.ts'\n");
-}
-
-#[test]
-fn write_concat_list_escapes_single_quotes() {
-    // 实测：不转义时 ffmpeg 把 `file '/tmp/My's Videos/seg.ts'` 解析成 `/tmp/Mys` 并报错。
-    // 用户下载目录名含撇号是很常见的（如 ~/My's Videos），不转义等于 HLS 下载全部失败。
-    let dir = tempfile::tempdir().unwrap();
-    let list = dir.path().join("concat.txt");
-    let files: Vec<PathBuf> = vec!["/tmp/My's Videos/a.ts".into()];
-    write_concat_list(&list, &files).unwrap();
-    let text = std::fs::read_to_string(&list).unwrap();
-    assert_eq!(
-        text, "file '/tmp/My'\\''s Videos/a.ts'\n",
-        "路径里的单引号必须转义成 '\\''"
-    );
 }
 
 #[test]
@@ -2623,19 +2667,10 @@ pub fn ensure_ffmpeg(data_dir: &Path) -> anyhow::Result<PathBuf> {
     Ok(target)
 }
 
-pub fn write_concat_list(path: &Path, files: &[PathBuf]) -> anyhow::Result<()> {
-    let mut text = String::new();
-    for f in files {
-        // ffmpeg 的 concat 解析器用单引号界定路径，路径里的单引号必须写成 '\''，
-        // 否则会被当成引号结束。实测：`file '/tmp/My's Videos/seg.ts'` 被解析成
-        // `/tmp/Mys` 并直接报 "Impossible to open" —— 也就是说，用户只要把下载目录
-        // 设在含撇号的路径下（如 ~/My's Videos），**每一次 HLS 下载都会在合并这一步失败**。
-        // 转义后的 '\\'' 与全反斜杠转义实测都能工作，这里取前者。
-        let escaped = f.to_string_lossy().replace('\'', "'\\''");
-        text.push_str(&format!("file '{escaped}'\n"));
-    }
-    std::fs::write(path, text).context("write concat list")
-}
+// 注意：**没有** `write_concat_list`。concat 列表由 Task 8 的 `download_media` 生成
+// （分片顺序是在那里决定的），转义也在那里完成。本模块只负责把已有的 `plan.list_file`
+// 交给 ffmpeg。曾计划在此提供一个 `write_concat_list`，但它从头到尾没有调用方——
+// 属于死代码，且会让"转义"这件事出现两个可能不同步的实现位置。
 
 pub fn build_remux(
     ffmpeg: &Path,
@@ -2687,7 +2722,7 @@ printf 'fake-ffmpeg' > vendor/ffmpeg/windows-x86_64/ffmpeg.exe
 ```
 
 Run: `cargo test --test ffmpeg_test`
-Expected: 4 PASS（占位文件满足提取/复用/权限逻辑测试；`build_remux` 与二进制无关）
+Expected: 3 PASS（占位文件满足提取/复用/权限逻辑测试；`build_remux` 与二进制无关）
 
 - [ ] **Step 5: Commit**
 
