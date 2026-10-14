@@ -163,23 +163,26 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ### Task 2: settings 模块（配置加载/保存）
 
 **Files:**
+- Create: `src/lib.rs`
 - Create: `tests/settings_test.rs`
-- Modify: `src/settings.rs`
+- Modify: `src/settings.rs`（当前为空文件）
+- Modify: `src/main.rs`（移除 `mod core;` 与 `mod settings;`）
 
 **Interfaces:**
 - Produces:
   - `pub struct Settings { pub download_dir: PathBuf, pub segment_concurrency: usize, pub max_active_tasks: usize, pub ytdlp_enabled: bool, pub ffmpeg_path_override: Option<PathBuf> }`
   - `impl Default for Settings`（download_dir = `~/Downloads/easydownvideo`，segment_concurrency=6，max_active_tasks=2，ytdlp_enabled=true，ffmpeg_path_override=None）
-  - `Settings::load() -> Self`（读不到或解析失败则返回默认并尽力回写）
-  - `Settings::save(&self) -> anyhow::Result<()>`
-  - `Settings::config_dir() -> PathBuf`（`directories::ProjectDirs::from("dev", "easydownvideo", "easydownvideo").config_dir` 创建后返回）
+  - `Settings::load() -> Self` / `Settings::save(&self) -> anyhow::Result<()>`（走固定 config 目录）
+  - `Settings::load_from(&Path) -> Option<Self>` / `Settings::save_to(&self, &Path) -> anyhow::Result<()>`（`pub`，供测试注入临时路径）
+  - `Settings::config_dir() -> PathBuf`
 
 - [ ] **Step 1: 写失败测试**
 
-`tests/settings_test.rs`：
+`tests/settings_test.rs`（这是最终版本，只写这一版）：
 
 ```rust
 use easydownvideo::settings::Settings;
+use std::path::Path;
 
 #[test]
 fn defaults_are_spec_values() {
@@ -192,48 +195,31 @@ fn defaults_are_spec_values() {
 }
 
 #[test]
-fn save_then_load_roundtrips() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut s = Settings::default();
-    s.download_dir = dir.path().join("downloads");
-    s.segment_concurrency = 8;
-    s.save().unwrap(); // 注意：save 写到固定 config 目录
-    let loaded = Settings::load();
-    assert_eq!(loaded.segment_concurrency, 8);
-}
-```
-
-注：`save/load` 使用真实用户 config 目录（测试环境即开发者机器）。为可测性，内部实现 `fn save_to(&self, path: &Path)` / `fn load_from(path: &Path) -> Option<Self>` 为 pub(crate)，测试改为通过临时目录测它们，再保留一个走默认目录的薄测试：
-
-`tests/settings_test.rs` 改用：
-
-```rust
-use easydownvideo::settings::Settings;
-use std::path::Path;
-
-#[test]
-fn defaults_are_spec_values() { /* 同上 */ }
-
-#[test]
 fn save_load_roundtrip_via_tempdir() {
-    // save_to / load_from 通过临时 config 目录做往返
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("settings.json");
     let mut s = Settings::default();
     s.segment_concurrency = 9;
-    s.save_to(&cfg);
+    s.ytdlp_enabled = false;
+    s.save_to(&cfg).unwrap();
     let loaded = Settings::load_from(&cfg).unwrap();
     assert_eq!(loaded.segment_concurrency, 9);
+    assert!(!loaded.ytdlp_enabled);
 }
 
 #[test]
 fn load_from_missing_file_returns_none() {
-    let loaded = Settings::load_from(Path::new("/nonexistent/settings.json"));
-    assert!(loaded.is_none());
+    assert!(Settings::load_from(Path::new("/nonexistent/settings.json")).is_none());
+}
+
+#[test]
+fn load_from_corrupt_file_returns_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("settings.json");
+    std::fs::write(&cfg, "{ not valid json").unwrap();
+    assert!(Settings::load_from(&cfg).is_none());
 }
 ```
-
-（`save_to`/`load_from` 设为 `pub` 以便集成测试访问。）
 
 - [ ] **Step 2: 运行确认失败**
 
@@ -322,8 +308,7 @@ pub mod settings;
 ```rust
 use easydownvideo::settings::Settings;
 
-mod app;
-mod core; // 与 lib 共享同一份源码（binary 直接使用 lib 的 core）
+mod app; // 只有 app 属于 binary；core / settings 一律走 lib crate
 
 fn main() -> eframe::Result<()> {
     let _settings = Settings::load();
@@ -335,7 +320,11 @@ fn main() -> eframe::Result<()> {
 }
 ```
 
-同时删除 `src/main.rs` 中的 `mod settings;`，`src/core/mod.rs` 由 lib.rs 与 main.rs 共用会出现 "defined multiple times"？不会——`mod core;` 在 lib.rs 和 main.rs 中是两套独立模块树，各自编译同一份文件，cargo 允许。为避免歧义，`src/app.rs` 中引用 core 时用 `easydownvideo::core::...`。
+**关键：删除 `src/main.rs` 里的 `mod core;` 和 `mod settings;`。** 只保留 `mod app;`。
+
+原因（务必理解，否则后续任务会踩坑）：`mod core;` 同时出现在 `lib.rs` 和 `main.rs` 里会编译出**两套互相独立的 core 模块树**。那样 `easydownvideo::core::events::TaskState`（来自 lib）与 `crate::core::events::TaskState`（来自 binary）是**两个不同的类型**，彼此不能赋值、不能匹配。Task 13/14 的 `app.rs` 用的是 `easydownvideo::core::...` 路径，一旦 binary 里还有自己的 `mod core;`，就会出现"expected `TaskState`, found `TaskState`"这种极难看懂的类型错误。
+
+所以规则是：**core 与 settings 的唯一定义在 lib crate；binary 只声明 `mod app;`，app.rs 内一律用 `easydownvideo::core::...` / `easydownvideo::settings::...` 绝对路径。**
 
 - [ ] **Step 4: 运行确认通过**
 
@@ -1141,26 +1130,23 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 - [ ] **Step 1: 写失败测试**
 
-测试向量用 Python 生成一次（本机执行，结果硬编码进测试）：
+先用 openssl CLI（macOS 自带）生成两组测试向量，把 hex 输出硬编码进测试：
 
 ```bash
-python3 - <<'EOF'
-from Crypto.Cipher import AES
-EOF
-```
-
-若无 pycryptodome，改用已知 RFC 向量：AES-128-CBC key=`2b7e151628aed2a6abf7158809cf4f3c` iv=`000102030405060708090a0b0c0d0e0f` plaintext=`6bc1bee22e409f96e93d7e117393172a`（128-bit，无填充）→ ciphertext=`7649abac8119b246cee98e9b12e9197d`（经典 FIPS-197/AES 标准测试向量，AES-128 无 CBC 时…… 注：该向量是 AES-ECB 单块；CBC 首块 IV 参与后密文不同）。
-
-直接用 openssl CLI 生成 CBC 向量（macOS 自带）：
-
-```bash
-# 16 字节明文（PKCS7 会再补 16 字节填充）
 printf '0123456789abcdef' > /tmp/pt.bin
-openssl enc -aes-128-cbc -K 00112233445566778899aabbccddeeff -iv 0102030405060708090a0b0c0d0e0f10 -in /tmp/pt.bin -out /tmp/ct.bin
-xxd -p /tmp/ct.bin
+
+# 向量 A：带 PKCS7 填充（明文 16 字节 → 填充后 32 字节密文）
+openssl enc -aes-128-cbc -K 00112233445566778899aabbccddeeff -iv 0102030405060708090a0b0c0d0e0f10 \
+  -in /tmp/pt.bin -out /tmp/ct_pad.bin
+xxd -p /tmp/ct_pad.bin
+
+# 向量 B：无填充（恰好 16 字节密文，用于走 PKCS7 去填充失败的回退分支）
+openssl enc -aes-128-cbc -nopad -K 00112233445566778899aabbccddeeff -iv 0102030405060708090a0b0c0d0e0f10 \
+  -in /tmp/pt.bin -out /tmp/ct_nopad.bin
+xxd -p /tmp/ct_nopad.bin
 ```
 
-把输出的 hex 硬编码进测试。
+两组向量测的是**不同的代码路径**：向量 A 走 PKCS7 成功去填充（密文 32 字节 → 明文 16 字节）；向量 B 走 PKCS7 失败后回退到 NoPadding（密文 16 字节 → 明文 16 字节）。
 
 `tests/hls_crypto_test.rs`：
 
@@ -1169,31 +1155,44 @@ use easydownvideo::core::hls::crypto::decrypt_aes128;
 
 const KEY: [u8; 16] = *b"\x00\x11\x22\x33\x44\x55\x66\x77\x88\x99\xaa\xbb\xcc\xdd\xee\xff";
 const IV: [u8; 16] = *b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10";
-// openssl enc -aes-128-cbc 对 "0123456789abcdef" 加密（含 PKCS7 填充）的密文 hex：
-const CT_HEX: &str = "<openssl 输出，执行时替换>";
+
+// 向量 A：带 PKCS7 填充的密文（32 字节），来自上面的 openssl 命令
+const CT_PADDED_HEX: &str = "<向量 A 的 hex>";
+// 向量 B：无填充的密文（16 字节，-nopad）
+const CT_UNPADDED_HEX: &str = "<向量 B 的 hex>";
 
 fn unhex(s: &str) -> Vec<u8> {
-    (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+        .collect()
 }
 
 #[test]
 fn decrypts_pkcs7_padded_segment() {
-    let pt = decrypt_aes128(&KEY, &IV, &unhex(CT_HEX)).unwrap();
-    assert_eq!(&pt[..16], b"0123456789abcdef");
-    assert_eq!(pt.len(), 16); // 填充已被去除
+    let ct = unhex(CT_PADDED_HEX);
+    assert_eq!(ct.len(), 32, "向量 A 应为 32 字节（16 字节明文 + 16 字节 PKCS7 填充）");
+    let pt = decrypt_aes128(&KEY, &IV, &ct).unwrap();
+    assert_eq!(pt, b"0123456789abcdef");
+    assert_eq!(pt.len(), 16, "PKCS7 填充应被去除");
+}
+
+#[test]
+fn falls_back_to_nopadding_when_pkcs7_unpad_fails() {
+    // 末尾字节 0x66 > 16，不是合法 PKCS7 填充 → 应回退到 NoPadding 并原样返回 16 字节
+    let ct = unhex(CT_UNPADDED_HEX);
+    assert_eq!(ct.len(), 16);
+    let pt = decrypt_aes128(&KEY, &IV, &ct).unwrap();
+    assert_eq!(pt, b"0123456789abcdef");
 }
 
 #[test]
 fn rejects_non_blocksize_input() {
-    let r = decrypt_aes128(&KEY, &IV, b"not-a-multiple!");
-    assert!(r.is_err());
+    assert!(decrypt_aes128(&KEY, &IV, b"not-a-multiple!").is_err());
 }
 
 #[test]
-fn tolerates_unpadded_ciphertext() {
-    // 无填充密文（恰好整块）：PKCS7 去除失败时应回退按无填充返回
-    let pt = decrypt_aes128(&KEY, &IV, &unhex(CT_HEX)).unwrap();
-    assert!(pt.starts_with(b"0123456789abcdef"));
+fn rejects_empty_input() {
+    assert!(decrypt_aes128(&KEY, &IV, b"").is_err());
 }
 ```
 
@@ -3096,8 +3095,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 `src/main.rs`：
 
 ```rust
-mod app;
-mod core;
+mod app; // 只声明 app；core / settings 走 lib crate（不要写 `mod core;`）
 
 use eframe::egui;
 use easydownvideo::settings::Settings;
