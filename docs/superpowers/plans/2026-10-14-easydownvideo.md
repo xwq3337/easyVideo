@@ -2402,6 +2402,21 @@ fn write_concat_list_format() {
 }
 
 #[test]
+fn write_concat_list_escapes_single_quotes() {
+    // 实测：不转义时 ffmpeg 把 `file '/tmp/My's Videos/seg.ts'` 解析成 `/tmp/Mys` 并报错。
+    // 用户下载目录名含撇号是很常见的（如 ~/My's Videos），不转义等于 HLS 下载全部失败。
+    let dir = tempfile::tempdir().unwrap();
+    let list = dir.path().join("concat.txt");
+    let files: Vec<PathBuf> = vec!["/tmp/My's Videos/a.ts".into()];
+    write_concat_list(&list, &files).unwrap();
+    let text = std::fs::read_to_string(&list).unwrap();
+    assert_eq!(
+        text, "file '/tmp/My'\\''s Videos/a.ts'\n",
+        "路径里的单引号必须转义成 '\\''"
+    );
+}
+
+#[test]
 fn build_remux_args_are_container_agnostic() {
     let ffmpeg = PathBuf::from("/usr/bin/ffmpeg");
     let list = PathBuf::from("/tmp/concat.txt");
@@ -2485,7 +2500,13 @@ pub fn ensure_ffmpeg(data_dir: &Path) -> anyhow::Result<PathBuf> {
 pub fn write_concat_list(path: &Path, files: &[PathBuf]) -> anyhow::Result<()> {
     let mut text = String::new();
     for f in files {
-        text.push_str(&format!("file '{}'\n", f.display()));
+        // ffmpeg 的 concat 解析器用单引号界定路径，路径里的单引号必须写成 '\''，
+        // 否则会被当成引号结束。实测：`file '/tmp/My's Videos/seg.ts'` 被解析成
+        // `/tmp/Mys` 并直接报 "Impossible to open" —— 也就是说，用户只要把下载目录
+        // 设在含撇号的路径下（如 ~/My's Videos），**每一次 HLS 下载都会在合并这一步失败**。
+        // 转义后的 '\\'' 与全反斜杠转义实测都能工作，这里取前者。
+        let escaped = f.to_string_lossy().replace('\'', "'\\''");
+        text.push_str(&format!("file '{escaped}'\n"));
     }
     std::fs::write(path, text).context("write concat list")
 }
@@ -2540,7 +2561,7 @@ printf 'fake-ffmpeg' > vendor/ffmpeg/windows-x86_64/ffmpeg.exe
 ```
 
 Run: `cargo test --test ffmpeg_test`
-Expected: 3 PASS（占位文件满足提取/复用/权限逻辑测试；`build_remux` 与二进制无关）
+Expected: 4 PASS（占位文件满足提取/复用/权限逻辑测试；`build_remux` 与二进制无关）
 
 - [ ] **Step 5: Commit**
 
