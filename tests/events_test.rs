@@ -22,6 +22,18 @@ fn progress_handle_unit_defaults_to_bytes() {
 }
 
 #[test]
+fn sub_rolls_back_without_underflow() {
+    let p = ProgressHandle::new();
+    p.set_total(1000);
+    p.add(300);
+    p.sub(120);
+    assert_eq!(p.snapshot(), (180, 1000));
+    // 回滚量超过已计入时饱和到 0，绝不回绕成天文数字
+    p.sub(999);
+    assert_eq!(p.snapshot(), (0, 1000));
+}
+
+#[test]
 fn task_state_variants_exist() {
     use easydownvideo::core::events::TaskState;
     let states = [

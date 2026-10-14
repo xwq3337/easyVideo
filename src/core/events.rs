@@ -59,6 +59,16 @@ impl ProgressHandle {
     pub fn add(&self, n: u64) {
         self.downloaded.fetch_add(n, Ordering::Relaxed);
     }
+    /// 饱和回滚：失败的分块重试需要撤销该次尝试已计入的进度。
+    /// 用 `fetch_update` + `saturating_sub`，因此回滚量大于已计入量时
+    /// 只会停在 0，绝不会下溢回绕成一个天文数字。
+    pub fn sub(&self, n: u64) {
+        let _ = self
+            .downloaded
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(n))
+            });
+    }
     pub fn set_total(&self, n: u64) {
         self.total.store(n, Ordering::Relaxed);
     }
