@@ -10,7 +10,16 @@ fn parse_formats_keeps_video_entries() {
     assert_eq!(formats.len(), 3);
     assert_eq!(formats[0].id, "18");
     assert_eq!(formats[0].note, "360p");
-    assert_eq!(formats[1].filesize, None);
+    assert_eq!(formats[0].filesize, Some(1_000_000));
+    // 22 号格式是 `"filesize": null` + `"filesize_approx": 2000000` —— 真实 yt-dlp 就这么输出。
+    // 必须回退到 approx；写成 `assert_eq!(filesize, None)` 等于把 bug 当成期望值钉死。
+    assert_eq!(
+        formats[1].filesize,
+        Some(2_000_000),
+        "filesize 为 null 时必须回退到 filesize_approx（or_else 不会被 Some(Null) 触发）"
+    );
+    // hls-1 没有 format_note，note 必须回退到 resolution
+    assert_eq!(formats[2].note, "1920x1080", "format_note 缺失时应回退到 resolution");
     assert!(formats.iter().all(|f| f.url.starts_with("https://")));
 }
 

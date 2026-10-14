@@ -55,7 +55,14 @@ pub fn parse_formats(json: &serde_json::Value) -> Vec<YtdlpFormat> {
             id: f.get("format_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             ext: f.get("ext").and_then(|v| v.as_str()).unwrap_or("mp4").to_string(),
             note,
-            filesize: f.get("filesize").or_else(|| f.get("filesize_approx")).and_then(|v| v.as_u64()),
+            // 必须**先 `and_then` 再 `or_else`**。真实 yt-dlp 对很多格式输出的是
+            // `"filesize": null`，此时 `f.get("filesize")` 返回的是 `Some(Value::Null)` 而**不是**
+            // `None`，于是 `or_else` 永远不触发，`as_u64()` 在 Null 上得到 None ——
+            // `filesize_approx` 被白白丢掉，而且恰好发生在最需要它的时候。
+            filesize: f
+                .get("filesize")
+                .and_then(|v| v.as_u64())
+                .or_else(|| f.get("filesize_approx").and_then(|v| v.as_u64())),
             url: url.to_string(),
         });
     }
