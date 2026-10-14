@@ -564,6 +564,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Produces:
   - `pub enum ProbeOutcome { Direct { url: String, size: Option<u64>, accepts_ranges: bool, filename: String }, Hls { url: String }, WebPage }`
   - `pub async fn probe(client: &reqwest::Client, url: &str) -> anyhow::Result<ProbeOutcome>`
+  - `pub fn filename_from_url(url: &str) -> String` —— **全项目唯一一份文件名推导逻辑**，Task 13 的 engine 与 Task 14 的 GUI 都复用它，不得各自再抄一份
 
 **实现要点：** GET 带 `Range: bytes=0-63`；只读响应流第一帧（≤64 字节）判断 `#EXTM3U` 前缀，随后丢弃连接；size 取自 `content-range` 的 `/total` 或 `content-length`；`206` + `content-range` 视为支持 Range；`text/html` → WebPage；URL 无有效文件名时回退 `video.mp4`。
 
@@ -682,6 +683,28 @@ async fn url_without_filename_uses_default() {
 }
 ```
 
+再补一个纯函数测试，覆盖文件名推导的边界（这是全项目唯一一份该逻辑，engine 与 GUI 都复用它）：
+
+```rust
+#[test]
+fn filename_from_url_decodes_and_falls_back() {
+    use easydownvideo::core::probe::filename_from_url;
+    // 百分号解码：URL 里带空格的文件名很常见
+    assert_eq!(filename_from_url("https://host/a/My%20Video.mp4"), "My Video.mp4");
+    // 查询串不参与文件名
+    assert_eq!(filename_from_url("https://host/a/video.mp4?token=abc"), "video.mp4");
+    // 无可用文件名 → 回退
+    assert_eq!(filename_from_url("https://host/download?id=123"), "video.mp4");
+    assert_eq!(filename_from_url("https://host/video"), "video.mp4");
+    assert_eq!(filename_from_url("https://host/"), "video.mp4");
+    assert_eq!(filename_from_url("not a url"), "video.mp4");
+    // 非法转义原样保留，不 panic
+    assert_eq!(filename_from_url("https://h/a%ZZb.mp4"), "a%ZZb.mp4");
+    // 大写扩展名保留原样
+    assert_eq!(filename_from_url("https://h/VIDEO.MP4"), "VIDEO.MP4");
+}
+```
+
 - [ ] **Step 2: 运行确认失败**
 
 Run: `cargo test --test probe_test`
@@ -709,16 +732,43 @@ pub enum ProbeOutcome {
     WebPage,
 }
 
-fn filename_from_url(url: &str) -> String {
-    let parsed = url::Url::parse(url).ok();
-    let last = parsed
+/// 从 URL 推导保存用的文件名。**这是全项目唯一一处该逻辑**（engine 与 GUI 都调用它，
+/// 不要各自再抄一份——重复的逻辑块会被审查判为重要缺陷）。
+///
+/// 行为：取路径最后一段并做百分号解码（`My%20Video.mp4` → `My Video.mp4`），
+/// 无可用段（以 `/` 结尾、无点、裸主机）时回退 `video.mp4`。永不返回空串、永不 panic。
+pub fn filename_from_url(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
         .as_ref()
         .and_then(|u| u.path_segments())
         .and_then(|mut segs| segs.next_back())
+        .map(percent_decode)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty() && s.contains('.'))
-        .unwrap_or_else(|| "video.mp4".to_string());
-    if last.contains('.') { last } else { format!("{last}.mp4") }
+        .unwrap_or_else(|| "video.mp4".to_string())
+}
+
+/// 极简百分号解码（不引入额外依赖）：`%XX` → 字节，其余原样，最后按 UTF-8 宽松解码。
+/// 非法转义（如 `%ZZ`、截断的 `%A`）原样保留，不报错。
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 pub async fn probe(client: &reqwest::Client, url: &str) -> anyhow::Result<ProbeOutcome> {
@@ -795,7 +845,7 @@ fn parse_total_from_content_range(headers: &reqwest::header::HeaderMap) -> Optio
 - [ ] **Step 4: 运行确认通过**
 
 Run: `cargo test --test probe_test`
-Expected: 5 PASS
+Expected: 6 PASS
 
 - [ ] **Step 5: Commit**
 
@@ -2657,7 +2707,7 @@ use crate::core::direct::{download_direct, unique_path, MIN_BLOCK_SIZE};
 use crate::core::events::{Choice, ChoiceKind, EngineEvent, ProgressHandle, TaskId, TaskState};
 use crate::core::ffmpeg::{ensure_ffmpeg, remux_to_mp4};
 use crate::core::hls::{download_media, parse::parse_playlist, parse::ParsedPlaylist};
-use crate::core::probe::{probe, ProbeOutcome};
+use crate::core::probe::{filename_from_url, probe, ProbeOutcome};
 use crate::core::task::{task_dir, write_manifest, ManifestKind, TaskManifest};
 use crate::core::ytdlp::{fetch_formats, find_ytdlp};
 use crate::settings::Settings;
@@ -2768,13 +2818,8 @@ impl Engine {
 
     pub fn add_url(&self, url: String) -> TaskId {
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
-        let filename = url
-            .split('?').next().unwrap_or("")
-            .trim_end_matches('/')
-            .rsplit('/').next()
-            .filter(|s| !s.is_empty() && s.contains('.'))
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "video.mp4".into());
+        // 复用 probe 里的唯一实现，不要在这里再抄一份推导逻辑
+        let filename = filename_from_url(&url);
         self.insert_entry(id, url, filename, None);
         id
     }
@@ -3313,13 +3358,8 @@ impl App {
             return;
         }
         let id = self.engine.add_url(url.clone());
-        let filename = url
-            .split('?').next().unwrap_or("")
-            .trim_end_matches('/')
-            .rsplit('/').next()
-            .filter(|s| !s.is_empty() && s.contains('.'))
-            .unwrap_or("video.mp4")
-            .to_string();
+        // 同一份推导逻辑，来自 probe 模块（不要在 GUI 里再抄一遍）
+        let filename = easydownvideo::core::probe::filename_from_url(&url);
         self.tasks.push(UiTask {
             id,
             url,
