@@ -2021,7 +2021,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```rust
 use easydownvideo::core::events::ProgressHandle;
 use easydownvideo::core::hls::{download_media, plan_segment_indices};
-use easydownvideo::core::hls::parse::{MediaInfo, SegmentRef};
+use easydownvideo::core::hls::parse::{KeyRef, MediaInfo, SegmentRef};
 use tokio_util::sync::CancellationToken;
 use wiremock::{matchers::{method, path}, Mock, MockServer, ResponseTemplate};
 
@@ -2123,6 +2123,94 @@ async fn retries_failed_segment() {
     assert_eq!(std::fs::read(&plan.segment_files[0]).unwrap(), s0);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn decrypts_with_derived_iv_across_an_init_offset() {
+    // 这是对「数组下标 vs 媒体序号」这条不变式的端到端验证，而不只是测那个纯函数。
+    // 设计要点：MediaInfo 里第一个元素是 init 段，所以媒体分片的**数组下标**是 1、2，
+    // 而**媒体序号**是 0、1。若实现用 idx 推 IV，第一个分片就会拿 IV1 去解，
+    // PKCS7 校验必然失败（或即便碰巧通过，明文断言也会挂）→ 测试失败。
+    //
+    // 向量用 openssl 生成（明文 32 字节 "0123456789abcdef0123456789abcdef"，key/IV 如下）：
+    //   IV0 = 0x00..00（media_sequence 0 + 媒体序号 0）
+    //   IV1 = 0x00..01（media_sequence 0 + 媒体序号 1）
+    //   openssl enc -aes-128-cbc -K 00112233445566778899aabbccddeeff -iv <IV> -in pt32.bin | xxd -p
+    const CT_IV0: &str = "<openssl 输出（IV=00..00）>";
+    const CT_IV1: &str = "<openssl 输出（IV=00..01）>";
+    const KEY_HEX: &str = "00112233445566778899aabbccddeeff";
+    const PLAINTEXT: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/key.bin"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(unhex(KEY_HEX)))
+        .mount(&server).await;
+    Mock::given(method("GET")).and(path("/init.mp4"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 16]))
+        .mount(&server).await;
+    Mock::given(method("GET")).and(path("/e0.m4s"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(unhex(CT_IV0)))
+        .mount(&server).await;
+    Mock::given(method("GET")).and(path("/e1.m4s"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(unhex(CT_IV1)))
+        .mount(&server).await;
+
+    // 注意 iv: None —— 走"按媒体序号推导 IV"这条路径，这正是要验证的分支
+    let key = KeyRef { uri: format!("{}/key.bin", server.uri()), iv: None };
+    let media = MediaInfo {
+        segments: vec![
+            SegmentRef { uri: format!("{}/init.mp4", server.uri()), key: None, is_init: true },
+            SegmentRef { uri: format!("{}/e0.m4s", server.uri()), key: Some(key.clone()), is_init: false },
+            SegmentRef { uri: format!("{}/e1.m4s", server.uri()), key: Some(key), is_init: false },
+        ],
+        media_sequence: 0,
+        is_fmp4: true,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let plan = download_media(
+        &reqwest::Client::new(), &media, dir.path(), 4,
+        &ProgressHandle::new(), CancellationToken::new(),
+    ).await.unwrap();
+
+    assert_eq!(plan.segment_files.len(), 3, "init + 两个媒体分片");
+    assert!(
+        plan.segment_files[0].to_string_lossy().contains("init"),
+        "init 段必须排在最前"
+    );
+    for i in [1usize, 2usize] {
+        assert_eq!(
+            std::fs::read(&plan.segment_files[i]).unwrap(),
+            PLAINTEXT,
+            "分片 {i} 解密结果不对 —— 检查 IV 是否用了媒体序号而非数组下标"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn truncated_leftover_segment_is_not_treated_as_complete() {
+    // 只判 exists() 的续传会把上次中断留下的半截分片当完成，ffmpeg 之后产出损坏文件而不报错。
+    // 完成标志必须是"写临时名后原子改名"的结果。
+    let server = MockServer::start().await;
+    let s0 = vec![7u8; 100];
+    Mock::given(method("GET")).and(path("/seg0.ts"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(s0.clone()))
+        .mount(&server).await;
+
+    let media = media_no_crypto(&[format!("{}/seg0.ts", server.uri())]);
+    let dir = tempfile::tempdir().unwrap();
+    // 预置一个同名但内容被截断的"半成品"（模拟：上次 create 之后、写满之前被杀）
+    std::fs::write(dir.path().join("seg-00000.ts"), vec![7u8; 40]).unwrap();
+
+    let plan = download_media(
+        &reqwest::Client::new(), &media, dir.path(), 1,
+        &ProgressHandle::new(), CancellationToken::new(),
+    ).await.unwrap();
+    assert_eq!(
+        std::fs::read(&plan.segment_files[0]).unwrap(),
+        s0,
+        "被截断的遗留分片必须重新下载，不能当成已完成"
+    );
+}
+
 #[test]
 fn init_segment_does_not_shift_media_indices() {
     // IV 由 `media_sequence + 媒体序号` 推导。init 段（fMP4 的 EXT-X-MAP）不占媒体序号，
@@ -2208,6 +2296,12 @@ pub async fn download_media(
     for (idx, media_index) in plan_segment_indices(&media.segments) {
         let seg = &media.segments[idx];
         let file_path = task_dir.join(format!("seg-{idx:05}.{ext}"));
+        // 先写临时名，成功后改名。"已完成"的唯一标志是**改名后的文件存在**。
+        // 不能只用 exists() 判续传：写入路径是 create(截断) + write_all，
+        // 若进程在两步之间被杀，会留下半截文件；下一轮会把它当成完成，
+        // concat 列表照样列它，ffmpeg 产出损坏输出且**全程不报错**。
+        // rename 在同一文件系统内是原子的，所以"存在"就等价于"完整"。
+        let tmp_path = task_dir.join(format!("seg-{idx:05}.{ext}.part"));
         let client = client.clone();
         let seg_uri = seg.uri.clone();
         let key = seg.key.clone();
@@ -2217,7 +2311,7 @@ pub async fn download_media(
         let permit = sem.clone().acquire_owned().await?;
         handles.push(tokio::spawn(async move {
             let _permit = permit;
-            // 续传：文件已存在则跳过
+            // 续传：只认已改名完成的文件；遗留的 .part 会被下面的 create 覆盖
             if file_path.exists() {
                 progress.add(1);
                 return Ok(file_path);
@@ -2225,7 +2319,7 @@ pub async fn download_media(
             if cancel.is_cancelled() {
                 return Err(anyhow!("canceled"));
             }
-            let ciphertext = fetch_bytes(&client, &seg_uri).await?;
+            let ciphertext = fetch_bytes(&client, &seg_uri, &cancel).await?;
             let data = match &key {
                 Some(KeyRef { uri, iv }) => {
                     let k = {
@@ -2233,7 +2327,7 @@ pub async fn download_media(
                         if let Some(k) = cache.get(uri) {
                             *k
                         } else {
-                            let raw = fetch_bytes(&client, uri).await?;
+                            let raw = fetch_bytes(&client, uri, &cancel).await?;
                             let k: [u8; 16] = raw.try_into().map_err(|_| anyhow!("key length != 16"))?;
                             cache.insert(uri.clone(), k);
                             k
@@ -2246,9 +2340,11 @@ pub async fn download_media(
                 }
                 None => ciphertext,
             };
-            let mut file = tokio::fs::File::create(&file_path).await?;
+            let mut file = tokio::fs::File::create(&tmp_path).await?;
             file.write_all(&data).await?;
             file.flush().await?;
+            drop(file); // 改名之前必须关闭句柄（Windows 上尤其如此）
+            tokio::fs::rename(&tmp_path, &file_path).await?;
             progress.add(1);
             Ok::<_, anyhow::Error>(file_path)
         }));
@@ -2272,15 +2368,29 @@ pub async fn download_media(
     })
 }
 
-async fn fetch_bytes(client: &reqwest::Client, uri: &str) -> anyhow::Result<Vec<u8>> {
+async fn fetch_bytes(
+    client: &reqwest::Client,
+    uri: &str,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Vec<u8>> {
     // 重试 3 次：指数退避 1s/2s/4s
     let mut last_err = None;
     for attempt in 0..3 {
+        if cancel.is_cancelled() {
+            anyhow::bail!("canceled");
+        }
         match fetch_once(client, uri).await {
             Ok(bytes) => return Ok(bytes),
             Err(e) => {
                 last_err = Some(e);
-                tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+                // 最后一次失败后不要再睡：那是纯粹的无效等待（每段白等 4 秒）。
+                // 退避期间也必须能被取消打断，否则用户点了取消仍要等满退避。
+                if attempt < 2 {
+                    tokio::select! {
+                        _ = cancel.cancelled() => anyhow::bail!("canceled"),
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)) => {}
+                    }
+                }
             }
         }
     }
@@ -2326,21 +2436,29 @@ fn default_iv(media_sequence: u64, segment_index: usize) -> [u8; 16] {
 }
 ```
 
-注（内存特性，务必知道，不要误以为本模块是 O(1)）：`fetch_bytes` 把**整个分片**读进内存再解密。这满足「内存不随**文件**大小增长」——分片有界，所以下 10GB 的文件内存也不会涨。但实际峰值是 **并发数 × 单分片大小**（默认 6 路）：
+注（内存特性，务必知道，不要误以为本模块是 O(1)）：`fetch_bytes` 把**整个分片**读进内存再解密。这满足「内存不随**文件**大小增长」——分片有界，所以下 10GB 的文件内存也不会涨。但实际峰值是 **并发数 × 单分片大小 × 系数**（默认 6 路），系数不为 1：
 
-| 场景 | 单分片 | 峰值 |
-|---|---|---|
-| 1080p，6s 分片，5 Mbps | ≈3.8MB | ≈23MB |
-| 4K，6s 分片，25 Mbps | ≈19MB | ≈110MB（**超出 spec 的 ~100MB 预算**） |
+- **稳态 ≈ 2×**：加密分片的 `ciphertext` 与解密结果 `data` 会同时存活。
+- **解密瞬时 ≈ 3×**：`decrypt_aes128` 内部先 `data.to_vec()` 再返回 `pt.to_vec()`，短时间三份并存。
 
-所以：常见场景没问题，**4K 长分片可能超预算**。AES-CBC 需要整段数据才能解密，要真正做到 O(1) 必须改成流式解密（逐分组解密、只滞留最后一个分组用于 PKCS7 校验）——那要引入 `&mut [Block]` 的转换与边界处理，约 60 行，复杂度不低。
+| 场景 | 单分片 | 稳态 | 解密瞬时 |
+|---|---|---|---|
+| 1080p，6s 分片，5 Mbps | ≈3.8MB | ≈46MB | ≈68MB |
+| 4K，6s 分片，25 Mbps | ≈19MB | ≈228MB | **≈342MB（严重超预算）** |
 
-**决定：先不做这个优化。** 理由：这是性能预算问题而非正确性问题，而且 Task 15 有实测 RSS 的验收项。先让它能跑、能量出真实数字，再决定要不要为它付那 60 行复杂度。若 Task 15 实测超标，优化方向就按上面的流式解密做。
+即：1080p 已逼近 spec 的 ~100MB 预算，4K 远超。这不影响正确性，但确实与「内存占用不高」的目标有张力。
+
+**决定：先不做优化，按代价从低到高留两级台阶。** 理由：这是性能预算问题而非正确性问题，且 Task 15 有实测 RSS 的验收项；没有测量数据就动手，等于在代码里最需要克制的地方引入复杂度（本模块同类问题已产出 3 个静默损坏缺陷）。
+
+若 Task 15 实测超标，优化顺序如下（**先做 1，只有 1 不够才做 2**）：
+
+1. **廉价：原地解密** —— 加 `decrypt_aes128_in_place(key, iv, buf: &mut Vec<u8>)`，用 `decrypt_padded_mut` 原地解、再 `buf.truncate(明文长度)`。一次分配都不多，直接把系数从 2×/3× 降到 **1×**。约 10 行。
+2. **昂贵：流式解密** —— 逐分组解密、只滞留最后一个分组做 PKCS7 校验，做到真正 O(1)。需处理 `&mut [Block]` 转换与边界，约 60 行。
 
 - [ ] **Step 4: 运行确认通过**
 
 Run: `cargo test --test hls_download_test`
-Expected: 4 PASS
+Expected: 6 PASS
 
 - [ ] **Step 5: Commit**
 
