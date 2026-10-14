@@ -1,2 +1,164 @@
 pub mod crypto;
 pub mod parse;
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, Context};
+use futures_util::StreamExt;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+
+use crate::core::events::ProgressHandle;
+use crypto::decrypt_aes128;
+use parse::{KeyRef, MediaInfo, SegmentRef};
+
+#[derive(Clone, Debug)]
+pub struct ConcatPlan {
+    pub list_file: PathBuf,
+    pub segment_files: Vec<PathBuf>,
+}
+
+pub async fn download_media(
+    client: &reqwest::Client,
+    media: &MediaInfo,
+    task_dir: &Path,
+    concurrency: usize,
+    progress: &ProgressHandle,
+    cancel: CancellationToken,
+) -> anyhow::Result<ConcatPlan> {
+    use std::sync::Arc;
+    std::fs::create_dir_all(task_dir).context("create task dir")?;
+
+    // HLS 进度按"已下分片数/总分片数"计数，GUI 用 ProgressUnit 决定展示格式
+    progress.set_unit(crate::core::events::ProgressUnit::Segments);
+    progress.set_total(media.segments.len() as u64);
+
+    let ext = if media.is_fmp4 { "m4s" } else { "ts" };
+    let keys = Arc::new(Mutex::new(HashMap::new()));
+    let sem = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
+    let media_sequence = media.media_sequence;
+
+    let mut handles = Vec::new();
+    // (segments 下标, 媒体序号偏移):init 段不占媒体序号,见 plan_segment_indices 的说明
+    for (idx, media_index) in plan_segment_indices(&media.segments) {
+        let seg = &media.segments[idx];
+        let file_path = task_dir.join(format!("seg-{idx:05}.{ext}"));
+        let client = client.clone();
+        let seg_uri = seg.uri.clone();
+        let key = seg.key.clone();
+        let progress = progress.clone();
+        let cancel = cancel.clone();
+        let keys = keys.clone();
+        let permit = sem.clone().acquire_owned().await?;
+        handles.push(tokio::spawn(async move {
+            let _permit = permit;
+            // 续传:文件已存在则跳过
+            if file_path.exists() {
+                progress.add(1);
+                return Ok(file_path);
+            }
+            if cancel.is_cancelled() {
+                return Err(anyhow!("canceled"));
+            }
+            let ciphertext = fetch_bytes(&client, &seg_uri).await?;
+            let data = match &key {
+                Some(KeyRef { uri, iv }) => {
+                    let k = {
+                        let mut cache = keys.lock().await;
+                        if let Some(k) = cache.get(uri) {
+                            *k
+                        } else {
+                            let raw = fetch_bytes(&client, uri).await?;
+                            let k: [u8; 16] = raw
+                                .try_into()
+                                .map_err(|_| anyhow!("key length != 16"))?;
+                            cache.insert(uri.clone(), k);
+                            k
+                        }
+                    };
+                    // 用媒体序号而非数组下标推导 IV
+                    let effective_iv = iv.unwrap_or_else(|| default_iv(media_sequence, media_index));
+                    decrypt_aes128(&k, &effective_iv, &ciphertext)?
+                }
+                None => ciphertext,
+            };
+            let mut file = tokio::fs::File::create(&file_path).await?;
+            file.write_all(&data).await?;
+            file.flush().await?;
+            progress.add(1);
+            Ok::<_, anyhow::Error>(file_path)
+        }));
+    }
+    // parse 阶段已把 init segment 排在首位,handle 顺序即 concat 顺序
+    let mut files = Vec::new();
+    for h in handles {
+        files.push(h.await??);
+    }
+
+    let list_file = task_dir.join("concat.txt");
+    let mut list = String::new();
+    for f in &files {
+        list.push_str(&format!("file '{}'\n", f.display()));
+    }
+    std::fs::write(&list_file, list)?;
+
+    Ok(ConcatPlan {
+        list_file,
+        segment_files: files,
+    })
+}
+
+async fn fetch_bytes(client: &reqwest::Client, uri: &str) -> anyhow::Result<Vec<u8>> {
+    // 重试 3 次:指数退避 1s/2s/4s
+    let mut last_err = None;
+    for attempt in 0..3 {
+        match fetch_once(client, uri).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+            }
+        }
+    }
+    Err(last_err.unwrap())
+}
+
+async fn fetch_once(client: &reqwest::Client, uri: &str) -> anyhow::Result<Vec<u8>> {
+    let resp = client.get(uri).send().await?.error_for_status()?;
+    let mut stream = resp.bytes_stream();
+    let mut out = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        out.extend_from_slice(&chunk?);
+    }
+    Ok(out)
+}
+
+/// 为一个 media playlist 规划每个分段的 `(segments 数组下标, 媒体序号偏移)`。
+///
+/// init 段(fMP4 的 `#EXT-X-MAP`)**不占媒体序号**,所以它之后的第一个媒体分片的媒体序号
+/// 仍是 0。若直接拿数组下标当媒体序号去推导 IV,`#EXT-X-KEY` 未显式给 IV 时每个分片都会
+/// 用错一个序号的 IV,解出乱码且不会报错。单独抽成纯函数就是为了能直接测这个不变式。
+pub fn plan_segment_indices(segments: &[SegmentRef]) -> Vec<(usize, usize)> {
+    let mut out = Vec::with_capacity(segments.len());
+    let mut media_index = 0usize;
+    for (idx, seg) in segments.iter().enumerate() {
+        let mi = if seg.is_init {
+            0 // init 段不使用 IV,占位
+        } else {
+            let v = media_index;
+            media_index += 1;
+            v
+        };
+        out.push((idx, mi));
+    }
+    out
+}
+
+fn default_iv(media_sequence: u64, segment_index: usize) -> [u8; 16] {
+    let seq = media_sequence.wrapping_add(segment_index as u64);
+    let mut iv = [0u8; 16];
+    iv[8..].copy_from_slice(&seq.to_be_bytes());
+    iv
+}
