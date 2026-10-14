@@ -3813,6 +3813,13 @@ struct TaskEntry {
     cancel: CancellationToken,
     pending_choice: Option<ChoiceKind>,
     progress: ProgressHandle,
+    /// 这个任务的磁盘目录（`<当时的下载目录>/task-<id>`），**引擎自己做过的记录**。
+    ///
+    /// 清理时用它，而不是 `current_settings().download_dir` —— 下载目录是可以在任务进行中
+    /// 被改掉的，按"当前设置"去删会删错路径：真正的 `old_root/task-<id>/manifest.json`
+    /// 留在盘上，只要用户把目录改回去，这个"已经被删掉"的任务就会被 `scan_resume` 复活。
+    /// `None` = 这个任务还没在盘上留下任何东西（`add_url` 且尚未开跑）。
+    dir: Option<PathBuf>,
 }
 
 impl TaskEntry {
@@ -3991,9 +3998,20 @@ impl Engine {
         // （`cancel_while_queued_is_not_resurrected` 覆盖不到这一条：它取消的任务来自
         //   `add_url`，manifest 是 None，盘上本来就没有东西可泄漏。）
         if !worker_running {
-            let root = self.current_settings().download_dir;
-            std::fs::remove_dir_all(task_dir(&root, id)).ok();
+            // 用任务**自己记录**的目录，而不是 `current_settings().download_dir`。
+            // 下载目录可以在任务进行中被改掉；按"当前设置"删会删错路径，真正的
+            // `old_root/task-<id>/manifest.json` 会留下来 —— 用户一旦把目录改回去，
+            // 这个已经被删掉的任务就会被 scan_resume 复活。
+            if let Some(dir) = e.dir.as_deref() {
+                std::fs::remove_dir_all(dir).ok();
+            }
         }
+    }
+
+    /// 任务当前记录的磁盘目录（清理用）。若没有记录（从未落盘）则退回按当前设置推导。
+    fn recorded_dir(&self, id: TaskId) -> Option<PathBuf> {
+        let tasks = self.inner.tasks.lock().unwrap();
+        tasks.get(&id).and_then(|t| t.dir.clone())
     }
 
     fn state_of(&self, id: TaskId) -> Option<TaskState> {
@@ -4028,16 +4046,18 @@ impl Engine {
     fn insert_entry(&self, id: TaskId, url: String, filename: String, manifest: Option<TaskManifest>) {
         let (state, cancel) = (TaskState::Queued, CancellationToken::new());
         let progress = ProgressHandle::new();
+        // 启动时若带 manifest 立即写盘，保证恢复信息存在；并记下目录供日后清理使用
+        let dir = manifest.as_ref().map(|m| {
+            let root = self.inner.settings.lock().unwrap().download_dir.clone();
+            let d = task_dir(&root, id);
+            let _ = write_manifest(&d, m);
+            d
+        });
         {
             let mut tasks = self.inner.tasks.lock().unwrap();
-            tasks.insert(id, TaskEntry { url: url.clone(), filename, state, cancel, pending_choice: None, progress });
+            tasks.insert(id, TaskEntry { url: url.clone(), filename, state, cancel, pending_choice: None, progress, dir });
         }
         self.inner.queue.lock().unwrap().push_back(id);
-        // 启动时若带 manifest 立即写盘，保证恢复信息存在
-        if let Some(m) = manifest {
-            let root = self.inner.settings.lock().unwrap().download_dir.clone();
-            let _ = write_manifest(&task_dir(&root, id), &m);
-        }
         self.pump();
     }
 
@@ -4127,8 +4147,11 @@ impl Engine {
                         // 用户主动取消：清掉断点目录。否则 manifest 还在，下次启动
                         // scan_resume 会把已取消的任务当未完成任务复活并重新下载。
                         if matches!(engine.state_of(id), Some(TaskState::Canceled)) {
-                            let root = engine.current_settings().download_dir;
-                            std::fs::remove_dir_all(task_dir(&root, id)).ok();
+                            // 同样用任务记录的目录（见 TaskEntry.dir 的说明），
+                            // 而不是当前设置里的下载目录 —— 两者可能在任务进行中被改得不一致
+                            if let Some(dir) = engine.recorded_dir(id) {
+                                std::fs::remove_dir_all(&dir).ok();
+                            }
                         } else if matches!(engine.state_of(id), Some(TaskState::Paused)) {
                             // 暂停：保留断点与 manifest，等待用户继续
                         } else {
@@ -4182,6 +4205,14 @@ impl Engine {
                     }
                 }
                 let (final_path, tdir) = self.paths(id, &settings);
+                // 记下本任务真正使用的目录，供取消/失败时清理（可能与任务排队时不同：
+                // 排队期间用户可能改了下载目录）
+                {
+                    let mut tasks = self.inner.tasks.lock().unwrap();
+                    if let Some(t) = tasks.get_mut(&id) {
+                        t.dir = Some(tdir.clone());
+                    }
+                }
                 // 任务一开始就写 manifest：中途退出应用可据扫描恢复。
                 //
                 // **必须在 `set_state(Downloading)` 之前落盘。** "进入 Downloading"被当作
@@ -4235,6 +4266,13 @@ impl Engine {
             ParsedPlaylist::Media(m) => m,
         };
         let (final_path, tdir) = self.paths(id, settings);
+        // 与 Direct 分支同理：记下真正使用的目录，供清理时使用
+        {
+            let mut tasks = self.inner.tasks.lock().unwrap();
+            if let Some(t) = tasks.get_mut(&id) {
+                t.dir = Some(tdir.clone());
+            }
+        }
         // HLS 任务同样要落 manifest：否则中途退出后无法续传，违反 spec §6。
         // 记的是 media playlist 的 URL（master 已在上面转成具体码率的 media）。
         // 与 Direct 分支同理，**落盘必须早于 `set_state(Downloading)`**。
@@ -4356,6 +4394,13 @@ fn data_dir_is_app_scoped() {
         "数据目录必须应用专属，实际: {}",
         d.display()
     );
+    // **这条断言在 Windows 上不成立，必须按平台限定。**
+    // Windows 上 ProjectDirs 的 config_dir 是 `…\easydownvideo\easydownvideo\config`、
+    // data_dir 是**同级**的 `…\easydownvideo\easydownvideo\data`，两者恰好满足
+    // `config_dir().parent().join("data")` —— 而这里要防的"退回到多应用共享目录"问题
+    // （macOS 的 ~/Library/Application Support、Linux 的 ~/.config）在 Windows 上本来就不存在。
+    // 上面那条"必须含应用名"的断言在三个平台都成立，保持无条件执行。
+    #[cfg(not(windows))]
     assert_ne!(
         d,
         c.parent().unwrap().join("data"),
@@ -4662,30 +4707,93 @@ impl App {
     }
 
     fn poll_events(&mut self) {
-        while let Ok(ev) = self.events.try_recv() {
-            match ev {
-                EngineEvent::StateChanged { id, state } => {
-                    if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
-                        t.state = state.clone();
-                        if matches!(state, TaskState::Done | TaskState::Failed(_) | TaskState::Canceled) {
-                            t.choices = None;
-                            t.show_choices = false;
-                        }
+        loop {
+            match self.events.try_recv() {
+                Ok(ev) => self.apply_event(ev),
+                // **掉事件之后必须重新对齐，不能把 Lagged 当成"队列空了"。**
+                //
+                // 广播通道容量 256（engine.rs:69），每个任务每 300ms 发一条进度
+                // （engine.rs:357）。默认 2 个活跃任务 = 每秒约 6.7 条 —— 于是大约 **38 秒**
+                // 就能把通道灌满，而 tokio 广播溢出时丢的是**最旧的**消息。
+                //
+                // 最能触发的场景就在设置窗口里：`rfd::FileDialog::pick_folder()` 会**阻塞 UI
+                // 线程**（app.rs:418），用户打开系统目录选择框、慢慢挑一分钟是常事。回来时通道
+                // 早已溢出。若被丢掉的恰好是 `StateChanged{Done|Failed|Canceled}` 或
+                // `ChoicesOffered`，那一行就会**永久**显示错误状态：已完成的任务永远停在
+                // "下载中"且进度条卡死，或者停在"等待选择"而"选择格式"按钮根本不出现
+                // （那个按钮的门是 `t.choices.is_some()`）。除了重启应用没有别的办法恢复。
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                    tracing::warn!("UI 落后 {n} 条事件，改为从引擎重新同步任务列表");
+                    self.rehydrate_from_engine();
+                }
+                Err(_) => break, // Closed：不会再有事件
+            }
+        }
+    }
+
+    fn apply_event(&mut self, ev: EngineEvent) {
+        match ev {
+            EngineEvent::StateChanged { id, state } => {
+                if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
+                    t.state = state.clone();
+                    if matches!(state, TaskState::Done | TaskState::Failed(_) | TaskState::Canceled) {
+                        t.choices = None;
+                        t.show_choices = false;
                     }
                 }
-                EngineEvent::Progress { id, downloaded, total, unit } => {
-                    if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
-                        t.downloaded = downloaded;
-                        t.total = total;
-                        t.unit = unit;
+            }
+            EngineEvent::Progress { id, downloaded, total, unit } => {
+                if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
+                    t.downloaded = downloaded;
+                    t.total = total;
+                    t.unit = unit;
+                }
+            }
+            EngineEvent::ChoicesOffered { id, kind } => {
+                if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
+                    t.choices = Some(kind);
+                    t.show_choices = true;
+                }
+            }
+        }
+    }
+
+    /// 掉事件之后的重新对齐：以引擎的 `list_tasks()` 为准，覆盖已有行、补齐缺失行、删掉多余行。
+    fn rehydrate_from_engine(&mut self) {
+        let snapshots = self.engine.list_tasks();
+        let known: std::collections::HashSet<TaskId> = snapshots.iter().map(|s| s.id).collect();
+        // 引擎里已经没有的（已被删除）→ 从 UI 去掉
+        self.tasks.retain(|t| known.contains(&t.id));
+        for s in snapshots {
+            let (downloaded, total) = s.progress.snapshot();
+            match self.tasks.iter_mut().find(|t| t.id == s.id) {
+                Some(t) => {
+                    t.url = s.url.clone();
+                    t.filename = s.filename.clone();
+                    t.state = s.state.clone();
+                    t.downloaded = downloaded;
+                    t.total = total;
+                    t.unit = s.progress.unit();
+                    if matches!(t.state, TaskState::Done | TaskState::Failed(_) | TaskState::Canceled) {
+                        t.choices = None;
+                        t.show_choices = false;
                     }
                 }
-                EngineEvent::ChoicesOffered { id, kind } => {
-                    if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
-                        t.choices = Some(kind);
-                        t.show_choices = true;
-                    }
-                }
+                // 引擎里有而 UI 没有 → 补一行（订阅之前就存在、又没被水合到的任务）
+                None => self.tasks.push(UiTask {
+                    id: s.id,
+                    url: s.url.clone(),
+                    filename: s.filename.clone(),
+                    state: s.state.clone(),
+                    downloaded,
+                    total,
+                    unit: s.progress.unit(),
+                    speed_bps: 0.0,
+                    last_downloaded: downloaded,
+                    last_tick: Instant::now(),
+                    choices: None,
+                    show_choices: false,
+                }),
             }
         }
     }
@@ -4762,7 +4870,15 @@ impl eframe::App for App {
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                let total_speed: f64 = self.tasks.iter().map(|t| t.speed_bps).sum();
+                // **只累加按字节计量的任务。** HLS 任务的 unit 是分片，其 speed_bps 是"分片/秒"，
+                // 混进来会把总量算成毫无意义的数字（例如 HLS 下载时显示"总速度: 3.0 B/s"，
+                // 而实际吞吐是 MB/s）。单个任务的标签已经这样过滤了，这里必须一致。
+                let total_speed: f64 = self
+                    .tasks
+                    .iter()
+                    .filter(|t| t.unit == ProgressUnit::Bytes)
+                    .map(|t| t.speed_bps)
+                    .sum();
                 ui.label(format!("总速度: {}", format_speed(total_speed)));
                 let active = self.tasks.iter().filter(|t| {
                     matches!(t.state, TaskState::Downloading | TaskState::Probing | TaskState::Merging)
@@ -4840,7 +4956,16 @@ impl eframe::App for App {
                         if let Some(kind) = t.choices.clone() {
                             let mut open = t.show_choices;
                             let mut chosen: Option<Choice> = None;
+                            // **每个任务的模态框必须有各自的 Id。**
+                            // `egui::Window` 默认用标题派生 Id，而这里是在**逐任务循环里**画的 ——
+                            // 两个任务同时进入 AwaitingChoice 就会在同一帧里画出两个同 Id 的窗口。
+                            // 默认配置正好允许：max_active_tasks=2，而引擎把 AwaitingChoice 也算作
+                            // 占用槽位。于是连着粘两个 m3u8 master（或 yt-dlp）链接就能触发。
+                            // 后果：两个窗口共享存储状态、子控件 Id 冲突（egui 在 debug 下会直接报
+                            // "ID clashes"），交互不再可靠地路由到光标下的窗口 —— 其中一个任务的
+                            // 格式按钮点不动，永远卡在"等待选择"。
                             egui::Window::new("选择下载格式")
+                                .id(egui::Id::new(("format-choice", t.id)))
                                 .collapsible(false)
                                 .resizable(false)
                                 .open(&mut open)
@@ -4900,29 +5025,41 @@ impl eframe::App for App {
         // 设置窗口
         if self.settings_open {
             egui::Window::new("设置").collapsible(false).show(ctx, |ui| {
+                // **只有这一帧真的有控件变了才推送 + 落盘。**
+                // 原稿无条件每帧执行：设置窗口开着的时候，每秒约 5 次（200ms 重绘）
+                // 真实写文件到 settings.json。功能上没错，但白耗磁盘。
+                let mut dirty = false;
                 ui.horizontal(|ui| {
                     ui.label("下载目录：");
                     ui.label(self.settings.download_dir.display().to_string());
                     if ui.button("更改…").clicked() {
+                        // 注意：这会**阻塞 UI 线程**（系统模态目录选择框），而进度事件
+                        // 在此期间持续进入广播通道 —— 这正是 poll_events 里 Lagged 分支要处理的情况。
                         if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                             self.settings.download_dir = dir;
-                            let _ = self.settings.save();
+                            dirty = true;
                         }
                     }
                 });
                 ui.horizontal(|ui| {
                     ui.label("单任务并发：");
-                    ui.add(egui::Slider::new(&mut self.settings.segment_concurrency, 1..=16));
+                    dirty |= ui
+                        .add(egui::Slider::new(&mut self.settings.segment_concurrency, 1..=16))
+                        .changed();
                 });
                 ui.horizontal(|ui| {
                     ui.label("同时下载任务数：");
-                    ui.add(egui::Slider::new(&mut self.settings.max_active_tasks, 1..=8));
+                    dirty |= ui
+                        .add(egui::Slider::new(&mut self.settings.max_active_tasks, 1..=8))
+                        .changed();
                 });
-                ui.checkbox(&mut self.settings.ytdlp_enabled, "启用 yt-dlp 网页解析");
-                // 立即推给引擎（其余任务用新并发/开关，无需重启）
-                self.engine.update_settings(self.settings.clone());
-                if self.settings.save().is_err() {
-                    ui.colored_label(egui::Color32::LIGHT_RED, "设置保存失败");
+                dirty |= ui.checkbox(&mut self.settings.ytdlp_enabled, "启用 yt-dlp 网页解析").changed();
+                if dirty {
+                    // 立即推给引擎（新并发/开关对后续调度生效，无需重启），并落盘
+                    self.engine.update_settings(self.settings.clone());
+                    if self.settings.save().is_err() {
+                        ui.colored_label(egui::Color32::LIGHT_RED, "设置保存失败");
+                    }
                 }
             });
         }
