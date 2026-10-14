@@ -3759,7 +3759,10 @@ impl Engine {
         // 用户看到的是"我刚加了个任务，上一个任务凭空消失了"。
         // 这不是边角情况：它发生在每次重启后的第一次新增。
         self.inner.next_id.fetch_max(m.id + 1, Ordering::SeqCst);
-        self.insert_entry(m.id, m.url, m.filename, Some(m));
+        // 先把字段取出来再整体移动 m：`insert_entry(m.id, m.url, m.filename, Some(m))`
+        // 会先移走 `m.url`/`m.filename` 再移动整个 `m`，触发 E0382（借用已移动的值）。
+        let (id, url, filename) = (m.id, m.url.clone(), m.filename.clone());
+        self.insert_entry(id, url, filename, Some(m));
     }
 
     pub fn set_filename(&self, id: TaskId, name: String) {
@@ -3924,13 +3927,22 @@ impl Engine {
                 // 进度转发：每 300ms 把原子计数器快照发为事件
                 let mut ticker = tokio::time::interval(std::time::Duration::from_millis(300));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // `run_task` 的 future **必须在 select! 之外创建并 pin 住**，循环里只借用它（`&mut task`）。
+                //
+                // 原稿把 `engine.run_task(...)` 直接写在 select! 的分支里，那是**错的**：select!
+                // 每轮丢弃未胜出的分支，而 ticker 每 300ms 必然胜出一次 —— 于是 run_task 每 300ms
+                // 被从头重建，probe 反复重跑，任务永远到不了终止态。实测症状：一个本该在数秒内
+                // 失败的 404 任务会**永久卡在 Downloading**（20 秒都不出结果）。
+                // 这类 bug 编译期完全看不出来，只有跑起来才显形。
+                let task = engine.run_task(id, url.clone(), progress.clone());
+                tokio::pin!(task);
                 let result = loop {
                     tokio::select! {
                         _ = ticker.tick() => {
                             let (d, t) = progress.snapshot();
                             let _ = tx.send(EngineEvent::Progress { id, downloaded: d, total: t, unit: progress.unit() });
                         }
-                        r = engine.run_task(id, url.clone(), progress.clone()) => break r,
+                        r = &mut task => break r,
                     }
                 };
                 let (d, t) = progress.snapshot();
@@ -4002,9 +4014,14 @@ impl Engine {
                         }
                     }
                 }
-                self.set_state(id, TaskState::Downloading);
                 let (final_path, tdir) = self.paths(id, &settings);
-                // 任务一开始就写 manifest：中途退出应用可据扫描恢复
+                // 任务一开始就写 manifest：中途退出应用可据扫描恢复。
+                //
+                // **必须在 `set_state(Downloading)` 之前落盘。** "进入 Downloading"被当作
+                // "断点信息已经存在"的信号 —— `cancel_cleans_resume_artifacts` 就是等到
+                // Downloading 才取消并断言 scan_resume 为空。先置状态再写盘会留下一个窗口：
+                // 此刻 `scan_resume()` 什么都扫不到（目录已建但 manifest 还没写），
+                // 与"任务已在下载"的状态自相矛盾。原稿就是这个顺序，实测让该测试失败。
                 let manifest = TaskManifest {
                     id,
                     url: url.clone(),
@@ -4013,6 +4030,7 @@ impl Engine {
                     kind: ManifestKind::Direct { size },
                 };
                 let _ = write_manifest(&tdir, &manifest);
+                self.set_state(id, TaskState::Downloading);
                 let cancel = self.inner.tasks.lock().unwrap().get(&id).unwrap().cancel.clone();
                 download_direct(
                     &self.inner.client, &url, &final_path, &tdir,
@@ -4049,10 +4067,10 @@ impl Engine {
             }
             ParsedPlaylist::Media(m) => m,
         };
-        self.set_state(id, TaskState::Downloading);
         let (final_path, tdir) = self.paths(id, settings);
         // HLS 任务同样要落 manifest：否则中途退出后无法续传，违反 spec §6。
         // 记的是 media playlist 的 URL（master 已在上面转成具体码率的 media）。
+        // 与 Direct 分支同理，**落盘必须早于 `set_state(Downloading)`**。
         let _ = write_manifest(
             &tdir,
             &TaskManifest {
@@ -4066,6 +4084,7 @@ impl Engine {
                 kind: ManifestKind::Hls { playlist_url: playlist_url.to_string() },
             },
         );
+        self.set_state(id, TaskState::Downloading);
         let cancel = self.inner.tasks.lock().unwrap().get(&id).unwrap().cancel.clone();
         let plan = download_media(
             &self.inner.client, &media, &tdir, settings.segment_concurrency, progress, cancel,
