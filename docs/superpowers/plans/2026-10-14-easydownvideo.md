@@ -2007,7 +2007,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: `parse.rs`（`MediaInfo`/`SegmentRef`/`KeyRef`）、`crypto.rs`（`decrypt_aes128`）、`events::ProgressHandle`
 - Produces:
-  - `pub struct ConcatPlan { pub list_file: PathBuf, pub is_ts: bool, pub segment_files: Vec<PathBuf> }`
+  - `pub struct ConcatPlan { pub list_file: PathBuf, pub segment_files: Vec<PathBuf> }`（**没有** `is_ts`：转封装参数与容器类型无关，见 Task 9）
   - `pub async fn download_media(client: &Client, media: &MediaInfo, task_dir: &Path, concurrency: usize, progress: &ProgressHandle, cancel: CancellationToken) -> anyhow::Result<ConcatPlan>`
     - 分片写 `task_dir/seg-XXXXX.<ext>`；已存在且大小匹配则跳过（续传）
     - IV 缺省时按 HLS 规则取 `media_sequence + 分片序号` 的 64 位大端（前 8 字节补零）
@@ -2175,7 +2175,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::core::events::ProgressHandle;
 use crypto::decrypt_aes128;
-use parse::{KeyRef, MediaInfo};
+use parse::{KeyRef, MediaInfo, SegmentRef};
 
 #[derive(Clone, Debug)]
 pub struct ConcatPlan {
