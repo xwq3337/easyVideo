@@ -3288,7 +3288,8 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
   - `Engine::new(rt: tokio::runtime::Handle, settings: Settings, data_dir: PathBuf) -> Engine`
   - `add_url(&self, url: String) -> TaskId`
   - `resume(&self, m: TaskManifest)`（扫盘恢复）
-  - `pause(&self, id: TaskId)` / `unpause(&self, id: TaskId)` / `cancel(&self, id: TaskId)`
+  - `pause(&self, id: TaskId)` / `unpause(&self, id: TaskId)` / `retry(&self, id: TaskId)` / `cancel(&self, id: TaskId)`
+    （`retry` 接受 `Failed` 状态重新入队；GUI 的"重试"按钮用它。`unpause` 只认 `Paused`，两者不能互相顶替）
   - `set_choice(&self, id: TaskId, choice: Choice)`
   - `set_filename(&self, id: TaskId, name: String)`（GUI 重命名）
   - `events(&self) -> tokio::sync::broadcast::Receiver<EngineEvent>`
@@ -3316,6 +3317,23 @@ fn settings_with(dir: &std::path::Path) -> Settings {
         max_active_tasks: 1,
         ytdlp_enabled: false,
         ffmpeg_path_override: None,
+    }
+}
+
+async fn wait_failed(
+    rx: &mut tokio::sync::broadcast::Receiver<EngineEvent>,
+    id: u64,
+    secs: u64,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        let ev = tokio::time::timeout(
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            rx.recv(),
+        ).await.expect("timeout waiting for failure");
+        if let Ok(EngineEvent::StateChanged { id: eid, state: TaskState::Failed(_) }) = ev {
+            if eid == id { return; }
+        }
     }
 }
 
@@ -3567,6 +3585,27 @@ async fn cancel_while_queued_is_not_resurrected() {
         snap.state
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retry_requeues_a_failed_task() {
+    // 失败的"重试"必须真的重新跑一遍，而不是只把状态字段改一改、或者干脆没反应。
+    // 用一个恒定 404 的 URL：重试成功的话会**再次**失败，于是能等到第二个 Failed 事件。
+    // （GUI 的"重试"按钮曾经调的是 unpause，而 unpause 只认 Paused —— 死按钮。）
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/missing.mp4"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let engine = Engine::new(rt, settings_with(dir.path()), dir.path().join("data"));
+    let mut rx = engine.events();
+    let id = engine.add_url(format!("{}/missing.mp4", server.uri()));
+
+    wait_failed(&mut rx, id, 30).await; // 第一次失败
+    engine.retry(id);
+    wait_failed(&mut rx, id, 30).await; // 重试后第二次失败 —— 证明它真的重跑了
+}
 ```
 
 注（原文有误，已更正）：`failure_does_not_block_queue` 里 good 任务的双 range mock **已经在上面写好了**（文件 512 字节，`content-range: bytes 0-511/512`），不需要另行补齐；原文说"执行时补齐、大小取 2048"，与该测试实际内容矛盾，是残留草稿。
@@ -3757,6 +3796,33 @@ impl Engine {
             }
         };
         if was_paused {
+            self.inner.queue.lock().unwrap().push_back(id);
+            self.pump();
+        }
+    }
+
+    /// 重试：把失败的任务重新排队。
+    ///
+    /// 与 `unpause` 的区别是它接受 `Failed` 状态 —— GUI 的"重试"按钮直接调这个方法。
+    /// （原先 GUI 调的是 `unpause`，而 `unpause` 只认 `Paused`，于是失败任务的"重试"
+    /// 按钮点了毫无反应：不报错、不变化，纯粹是个死按钮。）
+    ///
+    /// 清掉 `pending_choice`：失败可能发生在等待选择的阶段，重试应当重新探测，
+    /// 而不是沿用上一次那份已经过期的候选列表。
+    pub fn retry(&self, id: TaskId) {
+        let ok = {
+            let mut tasks = self.inner.tasks.lock().unwrap();
+            match tasks.get_mut(&id) {
+                Some(t) if matches!(t.state, TaskState::Failed(_)) => {
+                    t.state = TaskState::Queued;
+                    t.cancel = CancellationToken::new();
+                    t.pending_choice = None;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if ok {
             self.inner.queue.lock().unwrap().push_back(id);
             self.pump();
         }
@@ -4038,7 +4104,7 @@ impl Engine {
 - [ ] **Step 4: 运行确认通过**
 
 Run: `cargo test --test engine_test`
-Expected: 7 PASS
+Expected: 8 PASS
 
 - [ ] **Step 5: Commit**
 
@@ -4056,6 +4122,58 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 **Files:**
 - Modify: `src/app.rs`
 - Modify: `src/main.rs`（挂接 Engine、tokio Runtime、tracing）
+- Modify: `src/settings.rs`（新增 `data_dir()` —— 见下面"数据目录"一节；现状里没有这个方法）
+- Modify: `tests/settings_test.rs`（为 `data_dir()` 补测试）
+
+**数据目录（本任务新增 `Settings::data_dir()`）**
+
+原稿写的是 `Settings::config_dir().parent().unwrap().join("data")`，**是错的**。`config_dir()` 返回的是
+`directories::ProjectDirs` 给出的**应用专属**目录（macOS `~/Library/Application Support/dev.easydownvideo.easydownvideo`，
+Linux `~/.config/easydownvideo`）。取它的 `parent()` 会**退回到多应用共享的那一级**：
+macOS 得 `~/Library/Application Support/data`，Linux 得 `~/.config/data`。于是释放的 ffmpeg 和日志会落在
+一个**与别的应用共用、且不带应用名**的目录里 —— 既污染共享位置，也可能与其他同样"取 parent 再拼 data"的
+程序撞名。spec 说的是"应用数据目录（`directories` crate 定位）"，那就该用 `ProjectDirs::data_dir()`。
+
+在 `src/settings.rs` 里加：
+
+```rust
+/// 应用数据目录（`ProjectDirs::data_dir()`）：释放出来的 ffmpeg 与日志放这里。
+///
+/// **不要用 `config_dir().parent()` 去凑**：`config_dir()` 已经是应用专属的那一级，
+/// 取 parent 会退回到 `~/.config` / `~/Library/Application Support` 这类**多应用共享**目录，
+/// 于是 ffmpeg 和日志会落到一个不带应用名的公共位置。
+pub fn data_dir() -> PathBuf {
+    let dir = directories::ProjectDirs::from("dev", "easydownvideo", "easydownvideo")
+        .expect("home directory must exist")
+        .data_dir()
+        .to_path_buf();
+    std::fs::create_dir_all(&dir).ok();
+    dir
+}
+```
+
+`tests/settings_test.rs` 补一个测试（**1 PASS**，该文件原有测试数 +1）：
+
+```rust
+#[test]
+fn data_dir_is_app_scoped() {
+    // 关键：数据目录必须带应用名，且**不等于**"取 config_dir 的 parent 再拼 data"那个共享位置。
+    // macOS 上 data_dir 与 config_dir 恰好是同一个路径，两者都带应用名；Linux 上分别是
+    // ~/.local/share/easydownvideo 与 ~/.config/easydownvideo。两种平台下本断言都成立。
+    let d = Settings::data_dir();
+    let c = Settings::config_dir();
+    assert!(
+        d.to_string_lossy().contains("easydownvideo"),
+        "数据目录必须应用专属，实际: {}",
+        d.display()
+    );
+    assert_ne!(
+        d,
+        c.parent().unwrap().join("data"),
+        "不得退回到共享目录（config_dir 的父目录 + data）"
+    );
+}
+```
 
 **Interfaces:**
 - Consumes: `Engine`（Task 13）、`Settings`（Task 2）、`EngineEvent`/`TaskState`/`ChoiceKind`/`Choice`（Task 3）
@@ -4072,8 +4190,9 @@ use eframe::egui;
 use easydownvideo::settings::Settings;
 
 fn main() -> eframe::Result<()> {
-    // 日志：stderr + 应用数据目录 logs/easydownvideo.log（按天滚动）
-    let data_dir = Settings::config_dir().parent().unwrap().join("data");
+    // 日志：应用数据目录 logs/easydownvideo.log（按天滚动）
+    // 注意用 Settings::data_dir() 而不是 config_dir().parent().join("data") —— 后者会落到共享目录
+    let data_dir = Settings::data_dir();
     std::fs::create_dir_all(data_dir.join("logs")).ok();
     let (file_writer, _guard) = tracing_appender::non_blocking(
         tracing_appender::rolling::daily(&data_dir.join("logs"), "easydownvideo.log"),
@@ -4389,7 +4508,9 @@ impl eframe::App for App {
                                     }
                                     TaskState::Failed(_) => {
                                         if ui.button("重试").clicked() {
-                                            self.engine.unpause(t.id); // 重试=重新入队
+                                            // 必须调 retry：unpause 只认 Paused，对 Failed 毫无反应，
+                                            // 那样这个按钮就是个点了没任何动静的死按钮。
+                                            self.engine.retry(t.id);
                                         }
                                     }
                                     _ => {}
