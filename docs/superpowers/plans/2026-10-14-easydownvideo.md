@@ -1456,7 +1456,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Produces:
   - `pub fn decrypt_aes128(key: &[u8; 16], iv: &[u8; 16], data: &[u8]) -> Result<Vec<u8>, HlsCryptoError>`
   - `pub enum HlsCryptoError { InvalidLength, Decrypt(String) }`（thiserror）
-- 语义：先按 PKCS7 去填充解密；失败则按无填充重试（容错非标准填充的分片）。
+- 语义：AES-128-CBC 解密并做 PKCS7 去填充。**去填充失败即报 `BadPadding` 错误，不做"按无填充返回"的宽容回退** —— 详见实现处的说明：HLS AES-128 无 MAC，PKCS7 是唯一的完整性信号，宽容化会把可检测的损坏变成静默的坏视频。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -1481,7 +1481,7 @@ xxd -p /tmp/ct_nopad.bin
 `tests/hls_crypto_test.rs`：
 
 ```rust
-use easydownvideo::core::hls::crypto::decrypt_aes128;
+use easydownvideo::core::hls::crypto::{decrypt_aes128, HlsCryptoError};
 
 const KEY: [u8; 16] = *b"\x00\x11\x22\x33\x44\x55\x66\x77\x88\x99\xaa\xbb\xcc\xdd\xee\xff";
 const IV: [u8; 16] = *b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10";
@@ -1507,22 +1507,41 @@ fn decrypts_pkcs7_padded_segment() {
 }
 
 #[test]
-fn falls_back_to_nopadding_when_pkcs7_unpad_fails() {
-    // 末尾字节 0x66 > 16，不是合法 PKCS7 填充 → 应回退到 NoPadding 并原样返回 16 字节
+fn rejects_bad_padding_instead_of_returning_garbage() {
+    // 向量 B：无填充密文，末尾解出 0x66(>16)，不是合法 PKCS7 填充。
+    // HLS AES-128 没有 MAC，PKCS7 校验是**唯一**的完整性信号——
+    // 这里必须报错，绝不能"宽容地"把明文（连同填充）返回出去：
+    // 那等于把每一次可检测的损坏变成静默的坏视频。
     let ct = unhex(CT_UNPADDED_HEX);
     assert_eq!(ct.len(), 16);
-    let pt = decrypt_aes128(&KEY, &IV, &ct).unwrap();
-    assert_eq!(pt, b"0123456789abcdef");
+    let err = decrypt_aes128(&KEY, &IV, &ct).unwrap_err();
+    assert!(
+        matches!(err, HlsCryptoError::BadPadding),
+        "期望 BadPadding，实际: {err}"
+    );
+}
+
+#[test]
+fn wrong_key_errors_rather_than_returning_garbage() {
+    // 用错误密钥解出来的整段都是乱码；PKCS7 校验必须把它拦住。
+    let ct = unhex(CT_PADDED_HEX);
+    let wrong_key = [0u8; 16];
+    let r = decrypt_aes128(&wrong_key, &IV, &ct);
+    assert!(r.is_err(), "错误密钥必须报错，而不是产出看似成功的乱码");
 }
 
 #[test]
 fn rejects_non_blocksize_input() {
-    assert!(decrypt_aes128(&KEY, &IV, b"not-a-multiple!").is_err());
+    let err = decrypt_aes128(&KEY, &IV, b"not-a-multiple!").unwrap_err();
+    assert!(matches!(err, HlsCryptoError::InvalidLength(15)), "实际: {err}");
 }
 
 #[test]
 fn rejects_empty_input() {
-    assert!(decrypt_aes128(&KEY, &IV, b"").is_err());
+    let err = decrypt_aes128(&KEY, &IV, b"").unwrap_err();
+    // 空输入必须走 Empty 而不是 InvalidLength：0 本身是 16 的倍数，
+    // 若不单独判空会落到 InvalidLength 并给出"长度 0 不是 16 的倍数"这种错误信息。
+    assert!(matches!(err, HlsCryptoError::Empty), "实际: {err}");
 }
 ```
 
@@ -1543,10 +1562,15 @@ type Aes128CbcDecrypt = cbc::Decryptor<aes::Aes128>;
 
 #[derive(Error, Debug)]
 pub enum HlsCryptoError {
+    #[error("ciphertext is empty")]
+    Empty,
     #[error("ciphertext length {0} is not a multiple of 16")]
     InvalidLength(usize),
-    #[error("decrypt failed: {0}")]
-    Decrypt(String),
+    #[error(
+        "PKCS7 去填充失败：分片已损坏，或密钥/IV 不匹配。\
+HLS AES-128 不带 MAC，PKCS7 校验是它唯一的完整性信号，因此这里必须报错"
+    )]
+    BadPadding,
 }
 
 pub fn decrypt_aes128(
@@ -1554,32 +1578,34 @@ pub fn decrypt_aes128(
     iv: &[u8; 16],
     data: &[u8],
 ) -> Result<Vec<u8>, HlsCryptoError> {
-    if data.len() % 16 != 0 || data.is_empty() {
+    if data.is_empty() {
+        return Err(HlsCryptoError::Empty);
+    }
+    if data.len() % 16 != 0 {
         return Err(HlsCryptoError::InvalidLength(data.len()));
     }
     // 用原地解密 API 而非 `decrypt_padded_vec_mut`：后者需要 cipher 的 `alloc` feature，
-    // 而当前解析到的 cipher v0.4.4 未启用该 feature（启用它等于改依赖）。
+    // 而当前解析到的 cipher v0.4.4 未启用（启用它等于改依赖）。
+    //
+    // **不做"去填充失败就按无填充返回"的宽容回退**。原因：
+    // 1) 密钥/IV 正确时，解出的最后一个分组本来就是原始 PKCS7 填充，去填充必然成功。
+    //    因此失败只可能意味着密钥/IV 错或数据损坏 —— 此时解出的**整段**都是乱码，
+    //    不只是尾部，返回它没有任何好处。
+    // 2) HLS AES-128 没有 MAC：PKCS7 校验是格式提供的**唯一**完整性信号。
+    //    把它降级成"宽容通过"，等于把每一次本可检测的损坏变成静默的坏视频。
     let mut buf = data.to_vec();
     let decryptor = Aes128CbcDecrypt::new(key.into(), iv.into());
-    if let Ok(pt) = decryptor.decrypt_padded_mut::<Pkcs7>(&mut buf) {
-        return Ok(pt.to_vec());
+    match decryptor.decrypt_padded_mut::<Pkcs7>(&mut buf) {
+        Ok(pt) => Ok(pt.to_vec()),
+        Err(_) => Err(HlsCryptoError::BadPadding),
     }
-    // 关键：`decrypt_padded_mut` 原地解密，去填充失败时 buf 已经被改写成明文。
-    // 不还原就重试等于把明文再解密一次，产出稳定的错误数据（且不报错）。
-    buf.copy_from_slice(data);
-    // 非标准填充：按无填充解密，原样保留全部字节（TS 播放器可容忍尾部无填充）
-    let decryptor = Aes128CbcDecrypt::new(key.into(), iv.into());
-    let pt = decryptor
-        .decrypt_padded_mut::<aes::cipher::block_padding::NoPadding>(&mut buf)
-        .map_err(|e| HlsCryptoError::Decrypt(format!("{e:?}")))?;
-    Ok(pt.to_vec())
 }
 ```
 
 - [ ] **Step 4: 运行确认通过**
 
 Run: `cargo test --test hls_crypto_test`
-Expected: 4 PASS
+Expected: 5 PASS
 
 - [ ] **Step 5: Commit**
 
