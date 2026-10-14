@@ -20,6 +20,18 @@ pub struct ConcatPlan {
     pub segment_files: Vec<PathBuf>,
 }
 
+/// 转义 ffmpeg concat 列表里的路径。
+///
+/// ffmpeg 的 concat 解析器用单引号界定路径，路径里的 `'` 必须写成 `'\''`，否则会被当成
+/// 引号结束。**实测**：`file '/tmp/My's Videos/seg.ts'` 被解析成 `/tmp/Mys` 并报
+/// "Impossible to open" —— 用户只要把下载目录设在含撇号的路径下（如 `~/My's Videos`），
+/// **每一次 HLS 下载都会在最后合并这一步失败**。
+///
+/// 实测有效的两种写法是 `'\''` 与全反斜杠转义；双引号包裹无效。这里取前者。
+pub fn escape_concat_path(path: &str) -> String {
+    path.replace('\'', "'\\''")
+}
+
 pub async fn download_media(
     client: &reqwest::Client,
     media: &MediaInfo,
@@ -105,10 +117,15 @@ pub async fn download_media(
         files.push(h.await??);
     }
 
+    // 写 ffmpeg concat 列表。列表的生成属于本模块（顺序是这里决定的），所以路径转义
+    // 也放在这里，不要指望调用方再处理一遍。
     let list_file = task_dir.join("concat.txt");
     let mut list = String::new();
     for f in &files {
-        list.push_str(&format!("file '{}'\n", f.display()));
+        list.push_str(&format!(
+            "file '{}'\n",
+            escape_concat_path(&f.to_string_lossy())
+        ));
     }
     std::fs::write(&list_file, list)?;
 

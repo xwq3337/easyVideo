@@ -271,6 +271,62 @@ async fn truncated_leftover_segment_is_not_treated_as_complete() {
 }
 
 #[test]
+fn escape_concat_path_escapes_single_quotes() {
+    use easydownvideo::core::hls::escape_concat_path;
+    // 实测：不转义时 ffmpeg 把 `file '/tmp/My's Videos/seg.ts'` 解析成 `/tmp/Mys` 并报
+    // "Impossible to open"。用户把下载目录设在含撇号的路径下（如 ~/My's Videos）很常见，
+    // 不转义等于**每一次 HLS 下载都在合并这一步失败**。
+    assert_eq!(escape_concat_path("/tmp/a.ts"), "/tmp/a.ts", "无特殊字符时原样返回");
+    assert_eq!(
+        escape_concat_path("/tmp/My's Videos/a.ts"),
+        "/tmp/My'\\''s Videos/a.ts",
+        "路径里的单引号必须转义成 '\\''"
+    );
+    // 多个撇号都要转义
+    assert_eq!(escape_concat_path("it's a 'test'.ts"), "it'\\''s a '\\''test'\\''.ts");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concat_list_uses_escaped_paths() {
+    // 端到端确认生成的 concat.txt 真的用了转义（纯函数测试保护不了"有没有调用它"）
+    let server = MockServer::start().await;
+    let s0 = vec![7u8; 100];
+    Mock::given(method("GET"))
+        .and(path("/seg0.ts"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(s0.clone()))
+        .mount(&server)
+        .await;
+
+    let media = media_no_crypto(&[format!("{}/seg0.ts", server.uri())]);
+    // 任务目录名固定为 task-<id>，但父目录来自 download_dir —— 这里用一个带撇号的临时目录
+    let parent = tempfile::tempdir().unwrap();
+    let weird = parent.path().join("My's Videos");
+    std::fs::create_dir_all(&weird).unwrap();
+    let task_dir = weird.join("task-1");
+
+    let plan = download_media(
+        &reqwest::Client::new(),
+        &media,
+        &task_dir,
+        1,
+        &ProgressHandle::new(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let list = std::fs::read_to_string(&plan.list_file).unwrap();
+    assert!(
+        list.contains("'\\''"),
+        "concat 列表里的单引号必须已转义，实际内容: {list:?}"
+    );
+    assert!(
+        !list.contains("My's"),
+        "未转义的 `My's` 形态不应出现（那说明转义没生效）: {list:?}"
+    );
+}
+
+#[test]
 fn init_segment_does_not_shift_media_indices() {
     // IV 由 `media_sequence + 媒体序号` 推导。init 段（fMP4 的 EXT-X-MAP）不占媒体序号，
     // 若按 segments 数组下标推导 IV，init 之后的每个分片序号都会多 1，解出乱码。
