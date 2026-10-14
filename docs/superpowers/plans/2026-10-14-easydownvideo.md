@@ -820,7 +820,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
   - （Task 3 已建 `VariantChoice`，本任务添加其余类型）
   - `pub struct KeyRef { pub uri: String, pub iv: Option<[u8; 16]> }`
   - `pub struct SegmentRef { pub uri: String, pub key: Option<KeyRef>, pub is_init: bool }`
-  - `pub struct MediaInfo { pub segments: Vec<SegmentRef>, pub media_sequence: u64, pub is_fmp4: bool, pub title: Option<String> }`
+  - `pub struct MediaInfo { pub segments: Vec<SegmentRef>, pub media_sequence: u64, pub is_fmp4: bool }`
   - `pub enum ParsedPlaylist { Master { variants: Vec<VariantChoice> }, Media(MediaInfo) }`
   - `pub fn parse_playlist(base_url: &str, content: &[u8]) -> Result<ParsedPlaylist, HlsParseError>`
   - `pub fn resolve_url(base: &str, relative: &str) -> Option<String>`
@@ -981,7 +981,6 @@ pub struct MediaInfo {
     pub segments: Vec<SegmentRef>,
     pub media_sequence: u64,
     pub is_fmp4: bool,
-    pub title: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1022,8 +1021,6 @@ pub fn parse_playlist(base_url: &str, content: &[u8]) -> Result<ParsedPlaylist, 
         m3u8_rs::Playlist::MediaPlaylist(mp) => {
             let media_sequence = mp.media_sequence;
             let is_fmp4 = mp.segments.iter().any(|s| s.map.is_some());
-            // m3u8-rs 的 MediaPlaylist 没有节目级 title 字段；最接近的是首个分片 EXTINF 的 title
-            let title = mp.segments.first().and_then(|s| s.title.clone());
             let mut segments: Vec<SegmentRef> = Vec::new();
             if let Some(map) = mp.segments.iter().find_map(|s| s.map.clone()) {
                 segments.push(SegmentRef {
@@ -1068,7 +1065,6 @@ pub fn parse_playlist(base_url: &str, content: &[u8]) -> Result<ParsedPlaylist, 
                 segments,
                 media_sequence,
                 is_fmp4,
-                title,
             }))
         }
     }
@@ -1613,7 +1609,6 @@ fn media_no_crypto(seg_uris: &[String]) -> MediaInfo {
         }).collect(),
         media_sequence: 0,
         is_fmp4: false,
-        title: None,
     }
 }
 
