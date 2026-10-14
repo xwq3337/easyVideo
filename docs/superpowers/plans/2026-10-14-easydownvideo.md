@@ -1666,7 +1666,6 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```rust
 use easydownvideo::core::direct::{download_direct, plan_blocks, unique_path, MIN_BLOCK_SIZE};
 use easydownvideo::core::events::ProgressHandle;
-use std::path::Path;
 use tokio_util::sync::CancellationToken;
 use wiremock::{matchers::{header, method, path}, Mock, MockServer, ResponseTemplate};
 
