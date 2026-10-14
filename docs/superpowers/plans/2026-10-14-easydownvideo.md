@@ -3067,7 +3067,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 **Interfaces:**
 - Produces:
-  - `pub fn find_ytdlp() -> Option<PathBuf>`（取 `PATH` 环境变量并交 `find_ytdlp_in`；PATH 中依次找 `yt-dlp`、`yt-dlp.exe`、`youtube-dl`、`youtube-dl.exe`）
+  - `pub fn find_ytdlp() -> Option<PathBuf>`（取 `PATH` 环境变量并交 `find_ytdlp_in`；Unix 依次找 `yt-dlp`、`youtube-dl`，Windows 依次找 `yt-dlp.exe`、`youtube-dl.exe`、`yt-dlp`、`youtube-dl` —— **以 Step 4 代码为准**，此前的散文描述与代码顺序不一致）
   - `pub fn find_ytdlp_in(path_var: impl AsRef<std::ffi::OsStr>) -> Option<PathBuf>`（纯函数，扫描传入的 PATH 字符串；拆出来是为了可测，避免测试改全局环境变量）
   - `pub fn parse_formats(json: &serde_json::Value) -> Vec<YtdlpFormat>`（只保留带 `url` 且有视频流的格式，`note` 取 `format_note` 或 `resolution`）
   - `pub async fn fetch_formats(exe: &Path, page_url: &str) -> anyhow::Result<Vec<YtdlpFormat>>`（`exe -J url`，超时 120s）
@@ -3076,15 +3076,19 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 `tests/fixtures/ytdlp_dump.json`：
 
+> 字段是**刻意**这么摆的，不要"整理"掉：22 号格式用 `filesize: null` + `filesize_approx`（真实 yt-dlp
+> 的常见形态，用来钉住 null-vs-缺失 的回退），hls-1 **不给** `format_note`（用来钉住回退到 `resolution`）。
+> 少了这两处，两个回退分支就都没有测试覆盖 —— 而这正是缺陷藏身之处。
+
 ```json
 {
   "id": "abc123",
   "title": "demo",
   "formats": [
     { "format_id": "18", "ext": "mp4", "resolution": "640x360", "format_note": "360p", "filesize": 1000000, "vcodec": "avc1.42001E", "url": "https://cdn.example.com/v/18.mp4" },
-    { "format_id": "22", "ext": "mp4", "resolution": "1280x720", "format_note": "720p", "filesize": null, "vcodec": "avc1.64001F", "url": "https://cdn.example.com/v/22.mp4" },
+    { "format_id": "22", "ext": "mp4", "resolution": "1280x720", "format_note": "720p", "filesize": null, "filesize_approx": 2000000, "vcodec": "avc1.64001F", "url": "https://cdn.example.com/v/22.mp4" },
     { "format_id": "139", "ext": "m4a", "resolution": null, "format_note": "audio", "filesize": 100000, "vcodec": "none", "url": "https://cdn.example.com/a/139.m4a" },
-    { "format_id": "hls-1", "ext": "mp4", "resolution": "1920x1080", "format_note": "1080p", "protocol": "m3u8_native", "vcodec": "avc1.640028", "url": "https://cdn.example.com/hls/master.m3u8" }
+    { "format_id": "hls-1", "ext": "mp4", "resolution": "1920x1080", "protocol": "m3u8_native", "vcodec": "avc1.640028", "url": "https://cdn.example.com/hls/master.m3u8" }
   ]
 }
 ```
@@ -3106,7 +3110,16 @@ fn parse_formats_keeps_video_entries() {
     assert_eq!(formats.len(), 3);
     assert_eq!(formats[0].id, "18");
     assert_eq!(formats[0].note, "360p");
-    assert_eq!(formats[1].filesize, None);
+    assert_eq!(formats[0].filesize, Some(1_000_000));
+    // 22 号格式是 `"filesize": null` + `"filesize_approx": 2000000` —— 真实 yt-dlp 就这么输出。
+    // 必须回退到 approx；写成 `assert_eq!(filesize, None)` 等于把 bug 当成期望值钉死。
+    assert_eq!(
+        formats[1].filesize,
+        Some(2_000_000),
+        "filesize 为 null 时必须回退到 filesize_approx（or_else 不会被 Some(Null) 触发）"
+    );
+    // hls-1 没有 format_note，note 必须回退到 resolution
+    assert_eq!(formats[2].note, "1920x1080", "format_note 缺失时应回退到 resolution");
     assert!(formats.iter().all(|f| f.url.starts_with("https://")));
 }
 
@@ -3211,7 +3224,14 @@ pub fn parse_formats(json: &serde_json::Value) -> Vec<YtdlpFormat> {
             id: f.get("format_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             ext: f.get("ext").and_then(|v| v.as_str()).unwrap_or("mp4").to_string(),
             note,
-            filesize: f.get("filesize").or_else(|| f.get("filesize_approx")).and_then(|v| v.as_u64()),
+            // 必须**先 `and_then` 再 `or_else`**。真实 yt-dlp 对很多格式输出的是
+            // `"filesize": null`，此时 `f.get("filesize")` 返回的是 `Some(Value::Null)` 而**不是**
+            // `None`，于是 `or_else` 永远不触发，`as_u64()` 在 Null 上得到 None ——
+            // `filesize_approx` 被白白丢掉，而且恰好发生在最需要它的时候。
+            filesize: f
+                .get("filesize")
+                .and_then(|v| v.as_u64())
+                .or_else(|| f.get("filesize_approx").and_then(|v| v.as_u64())),
             url: url.to_string(),
         });
     }
