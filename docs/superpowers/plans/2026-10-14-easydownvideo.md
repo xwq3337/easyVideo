@@ -2550,6 +2550,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 **Files:**
 - Create: `tests/ffmpeg_test.rs`
 - Modify: `src/core/ffmpeg.rs`
+- Modify: `Cargo.toml` —— 接口里出现 `tokio::process::Command`，而 `tokio::process` 在 `process` feature 之后；原稿的 feature 列表没有它，模块无法编译。加 `"process"` 即可（唯一允许的依赖改动，`Cargo.lock` 随之 +1 行）
 
 **Interfaces:**
 - Produces:
@@ -2698,7 +2699,8 @@ pub async fn remux_to_mp4(
     output: &Path,
 ) -> anyhow::Result<()> {
     let out = output.to_path_buf();
-    let cmd = build_remux(ffmpeg, &plan.list_file, &out);
+    // 必须 `mut`：`Command::output` 取 `&mut self`（原稿写 `let cmd` 编译不过）
+    let mut cmd = build_remux(ffmpeg, &plan.list_file, &out);
     let output_status = cmd.output().await.context("spawn ffmpeg")?;
     if !output_status.status.success() {
         return Err(anyhow!(
@@ -2721,7 +2723,7 @@ printf 'fake-ffmpeg' > vendor/ffmpeg/windows-x86_64/ffmpeg.exe
 ```
 
 Run: `cargo test --test ffmpeg_test`
-Expected: 3 PASS（占位文件满足提取/复用/权限逻辑测试；`build_remux` 与二进制无关）
+Expected: 2 PASS（占位文件满足提取/复用/权限逻辑测试；`build_remux` 与二进制无关。**原写 3 PASS 是陈旧计数**：DEFECT-21 删掉死函数 `write_concat_list` 时一并删了它的测试，但计数没跟着降；本任务的实际测试块始终只有 2 个）
 
 - [ ] **Step 5: Commit**
 
