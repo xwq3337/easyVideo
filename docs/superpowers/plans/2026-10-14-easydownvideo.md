@@ -2775,7 +2775,9 @@ rm ffmpeg.zip
 
 若 zip 内不止 `ffmpeg` 一个文件（可能含 `ffprobe`），只保留 `ffmpeg`，其余删除——`include_bytes!` 只引用这一个路径。
 
-Expected: `ffmpeg version ...` 正常输出，文件约 70–120MB（解压后）。
+Expected: `ffmpeg version ...` 正常输出。实测解压后 **66332880 字节（≈63.3 MiB）**，低于原先估计的
+70–120MB —— 该区间只是估计值，**以实测大小与 SHA256 为准**（见 `vendor/ffmpeg/README.md` 的表），
+别因为"比预期小"就以为下载不全。
 
 - [ ] **Step 2: 下载 Windows x86_64 构建（跨平台二进制，本机可存不可运行）**
 
@@ -2823,7 +2825,8 @@ git commit -m "chore: vendor ffmpeg 静态二进制（macOS arm64 / Windows x86_
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
-注：提交体积约 150MB，属 spec 已接受的权衡。Linux 与其他架构的获取命令记录在 `vendor/ffmpeg/README.md`：
+注：实测提交体积 **约 172MB**（macOS 66.3MB + Windows 105.4MB，原写"约 150MB"是估计值），属 spec 已
+接受的权衡。校验值与各平台获取命令记录在 `vendor/ffmpeg/README.md`：
 
 ```markdown
 # ffmpeg 静态构建来源
