@@ -702,6 +702,39 @@ fn filename_from_url_decodes_and_falls_back() {
     assert_eq!(filename_from_url("https://h/a%ZZb.mp4"), "a%ZZb.mp4");
     // 大写扩展名保留原样
     assert_eq!(filename_from_url("https://h/VIDEO.MP4"), "VIDEO.MP4");
+    // 末尾截断的转义符也不 panic
+    assert_eq!(filename_from_url("https://h/x%"), "video.mp4");
+    assert_eq!(filename_from_url("https://h/x%2"), "video.mp4");
+}
+
+#[test]
+fn filename_from_url_never_escapes_the_download_dir() {
+    use easydownvideo::core::probe::filename_from_url;
+    // 百分号解码会把 %2F 变成 '/'、%5C 变成 '\'。返回值绝不允许含路径分隔符，
+    // 否则下游 dir.join(filename) 会让写入逃出下载目录。
+    for url in [
+        "https://h/a%2Fb.mp4",
+        "https://h/a%5Cb.mp4",
+        "https://h/%2e%2e%2fsecret.mp4",
+        "https://h/..%2Fsecret.mp4",
+        "https://h/%2e%2e",
+        "https://h/..",
+        "https://h/.",
+    ] {
+        let name = filename_from_url(url);
+        assert!(
+            !name.contains('/') && !name.contains('\\'),
+            "{url} 产出含分隔符的文件名: {name:?}"
+        );
+        assert_ne!(name, "..", "{url} 产出父目录引用");
+        assert_ne!(name, ".", "{url} 产出当前目录引用");
+        assert!(!name.is_empty(), "{url} 产出空文件名");
+    }
+    // 具体期望：取最后一个路径分量，保留可用后缀
+    assert_eq!(filename_from_url("https://h/a%2Fb.mp4"), "b.mp4");
+    assert_eq!(filename_from_url("https://h/%2e%2e%2fsecret.mp4"), "secret.mp4");
+    // 纯 `..` 无扩展名，回退默认名
+    assert_eq!(filename_from_url("https://h/%2e%2e"), "video.mp4");
 }
 ```
 
@@ -735,18 +768,34 @@ pub enum ProbeOutcome {
 /// 从 URL 推导保存用的文件名。**这是全项目唯一一处该逻辑**（engine 与 GUI 都调用它，
 /// 不要各自再抄一份——重复的逻辑块会被审查判为重要缺陷）。
 ///
-/// 行为：取路径最后一段并做百分号解码（`My%20Video.mp4` → `My Video.mp4`），
-/// 无可用段（以 `/` 结尾、无点、裸主机）时回退 `video.mp4`。永不返回空串、永不 panic。
+/// 行为：取路径最后一段，做百分号解码（`My%20Video.mp4` → `My Video.mp4`），
+/// 再取解码结果中最后一个路径分量并校验。无可用段（以 `/` 结尾、无点、裸主机、
+/// 段为 `.`/`..`）时回退 `video.mp4`。**返回值保证不含路径分隔符、不为空、不含 `.`/`..`。**
 pub fn filename_from_url(url: &str) -> String {
     url::Url::parse(url)
         .ok()
         .as_ref()
         .and_then(|u| u.path_segments())
         .and_then(|mut segs| segs.next_back())
-        .map(percent_decode)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && s.contains('.'))
+        .and_then(sanitize_segment)
+        .filter(|s| s.contains('.'))
         .unwrap_or_else(|| "video.mp4".to_string())
+}
+
+/// 把 URL 的一个路径段变成安全的文件名。返回 `None` 表示该段不可用，调用方回退默认名。
+///
+/// **安全要点**：百分号解码会把 `%2F` 变成 `/`、`%5C` 变成 `\`。若原样返回，
+/// `https://host/%2e%2e%2fsecret.mp4` 就会得到 `../secret.mp4`，而下游用
+/// `dir.join(filename)` 落盘——写入会逃出下载目录。所以解码后只取最后一个路径分量，
+/// 并显式拒绝 `.` 与 `..`。
+fn sanitize_segment(seg: &str) -> Option<String> {
+    let decoded = percent_decode(seg);
+    let last = decoded.rsplit(['/', '\\']).next().unwrap_or("");
+    let trimmed = last.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 /// 极简百分号解码（不引入额外依赖）：`%XX` → 字节，其余原样，最后按 UTF-8 宽松解码。
@@ -845,7 +894,7 @@ fn parse_total_from_content_range(headers: &reqwest::header::HeaderMap) -> Optio
 - [ ] **Step 4: 运行确认通过**
 
 Run: `cargo test --test probe_test`
-Expected: 6 PASS
+Expected: 7 PASS
 
 - [ ] **Step 5: Commit**
 
