@@ -45,6 +45,12 @@ pub async fn download_media(
     for (idx, media_index) in plan_segment_indices(&media.segments) {
         let seg = &media.segments[idx];
         let file_path = task_dir.join(format!("seg-{idx:05}.{ext}"));
+        // 先写临时名，成功后改名。"已完成"的唯一标志是**改名后的文件存在**。
+        // 不能只用 exists() 判续传：写入路径是 create(截断) + write_all，
+        // 若进程在两步之间被杀，会留下半截文件；下一轮会把它当成完成，
+        // concat 列表照样列它，ffmpeg 产出损坏输出且**全程不报错**。
+        // rename 在同一文件系统内是原子的，所以"存在"就等价于"完整"。
+        let tmp_path = task_dir.join(format!("seg-{idx:05}.{ext}.part"));
         let client = client.clone();
         let seg_uri = seg.uri.clone();
         let key = seg.key.clone();
@@ -54,7 +60,7 @@ pub async fn download_media(
         let permit = sem.clone().acquire_owned().await?;
         handles.push(tokio::spawn(async move {
             let _permit = permit;
-            // 续传:文件已存在则跳过
+            // 续传：只认已改名完成的文件；遗留的 .part 会被下面的 create 覆盖
             if file_path.exists() {
                 progress.add(1);
                 return Ok(file_path);
@@ -62,7 +68,7 @@ pub async fn download_media(
             if cancel.is_cancelled() {
                 return Err(anyhow!("canceled"));
             }
-            let ciphertext = fetch_bytes(&client, &seg_uri).await?;
+            let ciphertext = fetch_bytes(&client, &seg_uri, &cancel).await?;
             let data = match &key {
                 Some(KeyRef { uri, iv }) => {
                     let k = {
@@ -70,7 +76,7 @@ pub async fn download_media(
                         if let Some(k) = cache.get(uri) {
                             *k
                         } else {
-                            let raw = fetch_bytes(&client, uri).await?;
+                            let raw = fetch_bytes(&client, uri, &cancel).await?;
                             let k: [u8; 16] = raw
                                 .try_into()
                                 .map_err(|_| anyhow!("key length != 16"))?;
@@ -84,9 +90,11 @@ pub async fn download_media(
                 }
                 None => ciphertext,
             };
-            let mut file = tokio::fs::File::create(&file_path).await?;
+            let mut file = tokio::fs::File::create(&tmp_path).await?;
             file.write_all(&data).await?;
             file.flush().await?;
+            drop(file); // 改名之前必须关闭句柄（Windows 上尤其如此）
+            tokio::fs::rename(&tmp_path, &file_path).await?;
             progress.add(1);
             Ok::<_, anyhow::Error>(file_path)
         }));
@@ -110,15 +118,29 @@ pub async fn download_media(
     })
 }
 
-async fn fetch_bytes(client: &reqwest::Client, uri: &str) -> anyhow::Result<Vec<u8>> {
-    // 重试 3 次:指数退避 1s/2s/4s
+async fn fetch_bytes(
+    client: &reqwest::Client,
+    uri: &str,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Vec<u8>> {
+    // 重试 3 次：指数退避 1s/2s/4s
     let mut last_err = None;
     for attempt in 0..3 {
+        if cancel.is_cancelled() {
+            anyhow::bail!("canceled");
+        }
         match fetch_once(client, uri).await {
             Ok(bytes) => return Ok(bytes),
             Err(e) => {
                 last_err = Some(e);
-                tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+                // 最后一次失败后不要再睡：那是纯粹的无效等待（每段白等 4 秒）。
+                // 退避期间也必须能被取消打断，否则用户点了取消仍要等满退避。
+                if attempt < 2 {
+                    tokio::select! {
+                        _ = cancel.cancelled() => anyhow::bail!("canceled"),
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)) => {}
+                    }
+                }
             }
         }
     }

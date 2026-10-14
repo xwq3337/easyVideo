@@ -1,11 +1,19 @@
 use easydownvideo::core::events::ProgressHandle;
-use easydownvideo::core::hls::parse::{MediaInfo, SegmentRef};
+use easydownvideo::core::hls::parse::{KeyRef, MediaInfo, SegmentRef};
 use easydownvideo::core::hls::{download_media, plan_segment_indices};
 use tokio_util::sync::CancellationToken;
 use wiremock::{
     matchers::{method, path},
     Mock, MockServer, ResponseTemplate,
 };
+
+fn unhex(s: &str) -> Vec<u8> {
+    let bytes = s.as_bytes();
+    bytes
+        .chunks_exact(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect()
+}
 
 fn media_no_crypto(seg_uris: &[String]) -> MediaInfo {
     MediaInfo {
@@ -128,6 +136,138 @@ async fn retries_failed_segment() {
     .await
     .unwrap();
     assert_eq!(std::fs::read(&plan.segment_files[0]).unwrap(), s0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn decrypts_with_derived_iv_across_an_init_offset() {
+    // 这是对「数组下标 vs 媒体序号」这条不变式的端到端验证，而不只是测那个纯函数。
+    // 设计要点：MediaInfo 里第一个元素是 init 段，所以媒体分片的**数组下标**是 1、2，
+    // 而**媒体序号**是 0、1。若实现用 idx 推 IV，第一个分片就会拿 IV1 去解，
+    // PKCS7 校验必然失败（或即便碰巧通过，明文断言也会挂）→ 测试失败。
+    //
+    // 向量用 openssl 生成（明文 32 字节 "0123456789abcdef0123456789abcdef"，key/IV 如下）：
+    //   IV0 = 0x00..00（media_sequence 0 + 媒体序号 0）
+    //   IV1 = 0x00..01（media_sequence 0 + 媒体序号 1）
+    //   openssl enc -aes-128-cbc -K 00112233445566778899aabbccddeeff -iv <IV> -in pt32.bin | xxd -p
+    const CT_IV0: &str = "aebdd39b144089d5e31cacd35b7a113aad3edcb953ecb7bc0147f441cc48eff7\
+                          71ac64c87a490d1f4f09cac5d740f31b";
+    const CT_IV1: &str = "430df7fdf3d0ec5e7f44bf99464a00f098ff2795c5f955d82f453683c8dbf1c6\
+                          2024e95979a1b81afe3cac283088663a";
+    const KEY_HEX: &str = "00112233445566778899aabbccddeeff";
+    const PLAINTEXT: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/key.bin"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(unhex(KEY_HEX)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/init.mp4"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 16]))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/e0.m4s"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(unhex(CT_IV0)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/e1.m4s"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(unhex(CT_IV1)))
+        .mount(&server)
+        .await;
+
+    // 注意 iv: None —— 走"按媒体序号推导 IV"这条路径，这正是要验证的分支
+    let key = KeyRef {
+        uri: format!("{}/key.bin", server.uri()),
+        iv: None,
+    };
+    let media = MediaInfo {
+        segments: vec![
+            SegmentRef {
+                uri: format!("{}/init.mp4", server.uri()),
+                key: None,
+                is_init: true,
+            },
+            SegmentRef {
+                uri: format!("{}/e0.m4s", server.uri()),
+                key: Some(key.clone()),
+                is_init: false,
+            },
+            SegmentRef {
+                uri: format!("{}/e1.m4s", server.uri()),
+                key: Some(key),
+                is_init: false,
+            },
+        ],
+        media_sequence: 0,
+        is_fmp4: true,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let plan = download_media(
+        &reqwest::Client::new(),
+        &media,
+        dir.path(),
+        4,
+        &ProgressHandle::new(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(plan.segment_files.len(), 3, "init + 两个媒体分片");
+    // init 段按 idx 命名（`seg-00000.{ext}`），不是 `init.*`：断言它必须是第一个。
+    assert_eq!(
+        plan.segment_files[0],
+        dir.path().join("seg-00000.m4s"),
+        "init 段必须排在最前（数组下标 0）"
+    );
+    for i in [1usize, 2usize] {
+        assert_eq!(
+            std::fs::read(&plan.segment_files[i]).unwrap(),
+            PLAINTEXT,
+            "分片 {i} 解密结果不对 —— 检查 IV 是否用了媒体序号而非数组下标"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn truncated_leftover_segment_is_not_treated_as_complete() {
+    // 只判 exists() 的续传会把上次中断留下的半截分片当完成，ffmpeg 之后产出损坏文件而不报错。
+    // 完成标志必须是"写临时名后原子改名"的结果。
+    let server = MockServer::start().await;
+    let s0 = vec![7u8; 100];
+    Mock::given(method("GET"))
+        .and(path("/seg0.ts"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(s0.clone()))
+        .mount(&server)
+        .await;
+
+    let media = media_no_crypto(&[format!("{}/seg0.ts", server.uri())]);
+    let dir = tempfile::tempdir().unwrap();
+    // 预置上次中断留下的半截**临时文件**（新协议下 create 写的是 `.part`，被杀即留下它）。
+    // 注意：不能把它写成最终名 `seg-00000.ts`——按"改名成功才算完成"的语义，最终名存在就
+    // 等价于完整，40 字节的最终名文件会被直接信任；且 `resumes_existing_segments` 证明
+    // 续传判定不发请求、无从得知期望大小。被截断的产物只可能是 `.part`。
+    std::fs::write(dir.path().join("seg-00000.ts.part"), vec![7u8; 40]).unwrap();
+
+    let plan = download_media(
+        &reqwest::Client::new(),
+        &media,
+        dir.path(),
+        1,
+        &ProgressHandle::new(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(&plan.segment_files[0]).unwrap(),
+        s0,
+        "被截断的遗留分片必须重新下载，不能当成已完成"
+    );
 }
 
 #[test]
