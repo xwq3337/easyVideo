@@ -1,4 +1,6 @@
-use easydownvideo::core::hls::parse::{parse_playlist, resolve_url, ParsedPlaylist};
+use easydownvideo::core::hls::parse::{
+    parse_playlist, patch_iv_less_method_none, resolve_url, ParsedPlaylist,
+};
 
 fn fixture(name: &str) -> String {
     std::fs::read_to_string(format!("{}/tests/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name)).unwrap()
@@ -165,7 +167,9 @@ fn new_key_replaces_previous_for_later_segments() {
 
 #[test]
 fn method_none_clears_the_key_for_later_segments() {
-    // METHOD=NONE 表示"自此不再加密"，不能被当成"沿用上一个 key"
+    // METHOD=NONE 表示"自此不再加密"，不能被当成"沿用上一个 key"。
+    // 注意：这里的 NONE 行**故意不带 IV**——m3u8-rs 6.0.1 会把这种行整条丢弃成
+    // unknown tag，正是需要 patch_iv_less_method_none 补占位 IV 才能解析出来的情形。
     let content = b"#EXTM3U\n#EXT-X-VERSION:3\n\
 #EXT-X-KEY:METHOD=AES-128,URI=\"https://k/x\"\n#EXTINF:9.9,\na.ts\n\
 #EXT-X-KEY:METHOD=NONE\n#EXTINF:9.9,\nb.ts\n#EXT-X-ENDLIST\n";
@@ -176,4 +180,31 @@ fn method_none_clears_the_key_for_later_segments() {
         }
         _ => panic!("expected Media"),
     }
+}
+
+#[test]
+fn patch_leaves_normal_encrypted_playlists_untouched() {
+    // 改写只允许命中"含 METHOD=NONE 且不含 IV=" 的 KEY 行。
+    // 真实加密播放列表的 KEY 行不该被碰：给 AES-128 行补个 IV 会误导解密。
+    let content = b"#EXTM3U\n#EXT-X-VERSION:3\n\
+#EXT-X-KEY:METHOD=AES-128,URI=\"https://k/x\",IV=0x00000000000000000000000000000007\n\
+#EXTINF:9.9,\na.ts\n#EXT-X-ENDLIST\n";
+    let patched = String::from_utf8(patch_iv_less_method_none(content)).unwrap();
+    assert_eq!(patched, String::from_utf8_lossy(content), "正常的 AES KEY 行不应被改写");
+
+    // 不带 IV 的 AES KEY 行同样不该被改写（它本来就能被 m3u8-rs 正常解析）
+    let aes_no_iv = b"#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"https://k/x\"\n#EXTINF:9.9,\na.ts\n";
+    let p2 = String::from_utf8(patch_iv_less_method_none(aes_no_iv)).unwrap();
+    assert_eq!(p2, String::from_utf8_lossy(aes_no_iv), "AES 缺 IV 的行不应被加 IV");
+
+    // 带 IV 的 METHOD=NONE 已是合法行，不该被重复追加
+    let none_with_iv =
+        b"#EXTM3U\n#EXT-X-KEY:METHOD=NONE,IV=0x00000000000000000000000000000000\n#EXTINF:1,\na.ts\n";
+    let p3 = String::from_utf8(patch_iv_less_method_none(none_with_iv)).unwrap();
+    assert_eq!(p3, String::from_utf8_lossy(none_with_iv));
+
+    // 保留末行无换行符的形态
+    let no_trailing_nl = b"#EXTM3U\n#EXT-X-KEY:METHOD=NONE\nseg.ts";
+    let p4 = String::from_utf8(patch_iv_less_method_none(no_trailing_nl)).unwrap();
+    assert_eq!(p4, "#EXTM3U\n#EXT-X-KEY:METHOD=NONE,IV=0x00000000000000000000000000000000\nseg.ts");
 }

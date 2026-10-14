@@ -47,7 +47,7 @@ pub fn resolve_url(base: &str, relative: &str) -> Option<String> {
 }
 
 pub fn parse_playlist(base_url: &str, content: &[u8]) -> Result<ParsedPlaylist, HlsParseError> {
-    let normalized = normalize_none_keys(content);
+    let normalized = patch_iv_less_method_none(content);
     let playlist = m3u8_rs::parse_playlist_res(&normalized)
         .map_err(|e| HlsParseError::Parse(format!("{e:?}")))?;
     match playlist {
@@ -167,26 +167,36 @@ fn parse_iv(hexstr: &str) -> Result<[u8; 16], HlsParseError> {
     Ok(out)
 }
 
-/// 给"缺 IV 的 METHOD=NONE"这个 m3u8-rs 缺陷打补丁。
+/// 给不带 IV 的 `#EXT-X-KEY:METHOD=NONE` 补一个占位 IV，仅用于越过 m3u8-rs 的一处缺陷。
 ///
-/// 实测（m3u8-rs 6.0.1）：`Key::from_hashmap`（playlist.rs:979）在 `METHOD=NONE` 未带
-/// `IV` 时返回 Err，`map_res` 于是把整条 `#EXT-X-KEY:METHOD=NONE` 降级成 Unknown tag
-/// 塞进 `segment.unknown_tags`，`segment.key` 里再也看不到它。后果是"自此不再加密"
-/// 无法表达——我们的作用域逻辑会把上一个 key 继续往后套，导致本不该解密的分片被解密。
-/// 更糟的是 `#EXT-X-KEY:METHOD=NONE` 与 `#EXT-X-KEY:METHOD=AES-128` 相邻时，m3u8-rs
-/// 输出的 `(key, unknown_tags)` 组合完全一样，靠 unknown_tags 无法还原先后顺序。
+/// **实测确认（m3u8-rs 6.0.1）**：`Key::from_hashmap`（playlist.rs:979）的守卫写反了——
+/// 它在 `method == None && iv.is_none()` 时报错，而错误信息自述的语义是
+/// "IV is required unless METHOD is NONE"。结果是不带 IV 的 `METHOD=NONE` 整行被丢弃：
+/// ```text
+/// #EXT-X-KEY:METHOD=NONE            ->  seg.key = None, 且标签落入 seg.unknown_tags
+/// #EXT-X-KEY:METHOD=NONE,IV=0x00..  ->  seg.key = Some(Key{method: None})  ✓
+/// ```
+/// 被丢弃后我们既不知道"这里曾经有过一个 NONE"、也不知道它出现在哪个分片之前，于是
+/// `METHOD=NONE` 之后的分片会被错误地继续解密——又是一次静默产出乱码。
 ///
-/// RFC 8216 中 METHOD=NONE 本就不需要 IV。这里给这类标签补一个会被忽略的占位 IV，
-/// 让 m3u8-rs 正常解析成 `Key { method: None }`，从而按行序保留 EXT-X-KEY 的作用域信息。
-/// 该占位 IV 不会被使用：`parse_key` 对 `KeyMethod::None` 直接返回 `None`。
-fn normalize_none_keys(content: &[u8]) -> Vec<u8> {
+/// 之所以敢直接改文本：占位 IV 对我们是**可证无用**的——`parse_key` 对
+/// `KeyMethod::None` 立刻返回 `None`，从不读 iv；URI 等其余属性也不受影响。
+/// 且该改写只命中"含 METHOD=NONE 且不含 IV=" 的 `#EXT-X-KEY:` 行：真实加密播放列表的
+/// KEY 行是 `METHOD=AES-128,...,IV=0x..`，一次都不会被碰到（空转）。
+///
+/// 设为 `pub` 仅为让集成测试能直接验证"改写范围足够窄"这一性质。
+pub fn patch_iv_less_method_none(content: &[u8]) -> Vec<u8> {
     const PLACEHOLDER_IV: &[u8] = b",IV=0x00000000000000000000000000000000";
     let mut out: Vec<u8> = Vec::with_capacity(content.len());
     for (i, raw_line) in content.split(|&b| b == b'\n').enumerate() {
         if i > 0 {
             out.push(b'\n');
         }
-        let line = trim_trailing_cr(raw_line);
+        // 单独摘出结尾的 CR，保证占位 IV 插在 CR 之前（否则 IV 会被 CR 截成新的一行）。
+        let (line, had_cr) = match raw_line.strip_suffix(b"\r") {
+            Some(l) => (l, true),
+            None => (raw_line, false),
+        };
         out.extend_from_slice(line);
         let is_iv_less_none_key = line.starts_with(b"#EXT-X-KEY:")
             && contains_subslice(line, b"METHOD=NONE")
@@ -194,16 +204,11 @@ fn normalize_none_keys(content: &[u8]) -> Vec<u8> {
         if is_iv_less_none_key {
             out.extend_from_slice(PLACEHOLDER_IV);
         }
+        if had_cr {
+            out.push(b'\r');
+        }
     }
     out
-}
-
-fn trim_trailing_cr(line: &[u8]) -> &[u8] {
-    let mut end = line.len();
-    while end > 0 && line[end - 1] == b'\r' {
-        end -= 1;
-    }
-    &line[..end]
 }
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
