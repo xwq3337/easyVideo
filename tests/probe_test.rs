@@ -123,4 +123,37 @@ fn filename_from_url_decodes_and_falls_back() {
     assert_eq!(filename_from_url("https://h/a%ZZb.mp4"), "a%ZZb.mp4");
     // 大写扩展名保留原样
     assert_eq!(filename_from_url("https://h/VIDEO.MP4"), "VIDEO.MP4");
+    // 末尾截断的转义符也不 panic
+    assert_eq!(filename_from_url("https://h/x%"), "video.mp4");
+    assert_eq!(filename_from_url("https://h/x%2"), "video.mp4");
+}
+
+#[test]
+fn filename_from_url_never_escapes_the_download_dir() {
+    use easydownvideo::core::probe::filename_from_url;
+    // 百分号解码会把 %2F 变成 '/'、%5C 变成 '\'。返回值绝不允许含路径分隔符,
+    // 否则下游 dir.join(filename) 会让写入逃出下载目录。
+    for url in [
+        "https://h/a%2Fb.mp4",
+        "https://h/a%5Cb.mp4",
+        "https://h/%2e%2e%2fsecret.mp4",
+        "https://h/..%2Fsecret.mp4",
+        "https://h/%2e%2e",
+        "https://h/..",
+        "https://h/.",
+    ] {
+        let name = filename_from_url(url);
+        assert!(
+            !name.contains('/') && !name.contains('\\'),
+            "{url} 产出含分隔符的文件名: {name:?}"
+        );
+        assert_ne!(name, "..", "{url} 产出父目录引用");
+        assert_ne!(name, ".", "{url} 产出当前目录引用");
+        assert!(!name.is_empty(), "{url} 产出空文件名");
+    }
+    // 具体期望:取最后一个路径分量,保留可用后缀
+    assert_eq!(filename_from_url("https://h/a%2Fb.mp4"), "b.mp4");
+    assert_eq!(filename_from_url("https://h/%2e%2e%2fsecret.mp4"), "secret.mp4");
+    // 纯 `..` 无扩展名,回退默认名
+    assert_eq!(filename_from_url("https://h/%2e%2e"), "video.mp4");
 }

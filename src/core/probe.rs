@@ -18,15 +18,34 @@ pub enum ProbeOutcome {
 /// 从 URL 提取下载文件名。这是本项目内该逻辑的唯一实现:
 /// engine(Task 13 的 `add_url`)与 GUI(Task 14 的 `add_task`)都调用本函数,
 /// 不要各自复制一份。
+///
+/// 保证:返回值绝不含路径分隔符(`/` 或 `\`),绝不为空,也绝不为 `.` 或 `..`,
+/// 因此可安全用于 `dir.join(filename)`。
 pub fn filename_from_url(url: &str) -> String {
     url::Url::parse(url)
         .ok()
         .as_ref()
         .and_then(|u| u.path_segments())
         .and_then(|mut segs| segs.next_back())
-        .map(|s| percent_decode(s).trim().to_string())
-        .filter(|s| !s.is_empty() && s.contains('.'))
+        .and_then(sanitize_segment)
+        .filter(|s| s.contains('.'))
         .unwrap_or_else(|| "video.mp4".to_string())
+}
+
+/// 把 URL 的一个路径段变成安全的文件名。返回 `None` 表示该段不可用,调用方回退默认名。
+///
+/// **安全要点**:百分号解码会把 `%2F` 变成 `/`、`%5C` 变成 `\`。若原样返回,
+/// `https://host/%2e%2e%2fsecret.mp4` 就会得到 `../secret.mp4`,而下游用
+/// `dir.join(filename)` 落盘——写入会逃出下载目录。所以解码后只取最后一个路径分量,
+/// 并显式拒绝 `.` 与 `..`。
+fn sanitize_segment(seg: &str) -> Option<String> {
+    let decoded = percent_decode(seg);
+    let last = decoded.rsplit(['/', '\\']).next().unwrap_or("");
+    let trimmed = last.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 /// 将 `%XX` 十六进制转义还原为字节,其余字符原样通过。
