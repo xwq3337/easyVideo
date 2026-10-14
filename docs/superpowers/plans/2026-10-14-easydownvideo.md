@@ -1006,6 +1006,65 @@ fn parses_media_with_aes_key() {
             expected_iv[15] = 5; // IV=0x...0005
             assert_eq!(key.iv, Some(expected_iv));
             assert!(!m.segments[0].is_init);
+            // 关键：同一个 KEY 必须对**后面所有**分片继续生效。
+            // m3u8-rs 只把 key 挂在紧随其后的那一个分片上，这里断了就等于后面全不解密。
+            assert!(
+                m.segments[1].key.is_some(),
+                "第二个分片必须继承同一个 KEY（RFC 8216 §4.3.2.4）"
+            );
+            assert_eq!(m.segments[1].key.as_ref().unwrap().uri, "https://keys.example.com/k.bin");
+        }
+        _ => panic!("expected Media"),
+    }
+}
+
+#[test]
+fn key_applies_to_every_following_segment() {
+    // 实测 m3u8-rs 6.0.1 只给第一个分片带 key：一个 KEY + 3 个分片时只有 seg[0] 有 key。
+    // 我们要按 RFC 补齐：KEY 对其后所有分片生效，直到下一个 KEY 标签。
+    let content = b"#EXTM3U\n#EXT-X-VERSION:3\n\
+#EXT-X-KEY:METHOD=AES-128,URI=\"https://k/x\",IV=0x00000000000000000000000000000009\n\
+#EXTINF:9.9,\na.ts\n#EXTINF:9.9,\nb.ts\n#EXTINF:9.9,\nc.ts\n#EXT-X-ENDLIST\n";
+    match parse_playlist("https://c/m.m3u8", content).unwrap() {
+        ParsedPlaylist::Media(m) => {
+            assert_eq!(m.segments.len(), 3);
+            for (i, seg) in m.segments.iter().enumerate() {
+                let k = seg.key.as_ref().unwrap_or_else(|| {
+                    panic!("分片 {i} 丢了 key —— 真实播放列表里这些分片将不被解密")
+                });
+                assert_eq!(k.uri, "https://k/x", "分片 {i} 的 key 应沿用同一个");
+            }
+        }
+        _ => panic!("expected Media"),
+    }
+}
+
+#[test]
+fn new_key_replaces_previous_for_later_segments() {
+    let content = b"#EXTM3U\n#EXT-X-VERSION:3\n\
+#EXT-X-KEY:METHOD=AES-128,URI=\"https://k/1.bin\"\n#EXTINF:9.9,\na.ts\n#EXTINF:9.9,\nb.ts\n\
+#EXT-X-KEY:METHOD=AES-128,URI=\"https://k/2.bin\"\n#EXTINF:9.9,\nc.ts\n#EXT-X-ENDLIST\n";
+    match parse_playlist("https://c/m.m3u8", content).unwrap() {
+        ParsedPlaylist::Media(m) => {
+            let uri = |i: usize| m.segments[i].key.as_ref().map(|k| k.uri.clone());
+            assert_eq!(uri(0).as_deref(), Some("https://k/1.bin"));
+            assert_eq!(uri(1).as_deref(), Some("https://k/1.bin"), "b 应沿用第一个 key");
+            assert_eq!(uri(2).as_deref(), Some("https://k/2.bin"), "新 KEY 应替换旧的");
+        }
+        _ => panic!("expected Media"),
+    }
+}
+
+#[test]
+fn method_none_clears_the_key_for_later_segments() {
+    // METHOD=NONE 表示"自此不再加密"，不能被当成"沿用上一个 key"
+    let content = b"#EXTM3U\n#EXT-X-VERSION:3\n\
+#EXT-X-KEY:METHOD=AES-128,URI=\"https://k/x\"\n#EXTINF:9.9,\na.ts\n\
+#EXT-X-KEY:METHOD=NONE\n#EXTINF:9.9,\nb.ts\n#EXT-X-ENDLIST\n";
+    match parse_playlist("https://c/m.m3u8", content).unwrap() {
+        ParsedPlaylist::Media(m) => {
+            assert!(m.segments[0].key.is_some(), "第一个分片应加密");
+            assert!(m.segments[1].key.is_none(), "METHOD=NONE 之后不应再解密");
         }
         _ => panic!("expected Media"),
     }
@@ -1171,26 +1230,39 @@ pub fn parse_playlist(base_url: &str, content: &[u8]) -> Result<ParsedPlaylist, 
         m3u8_rs::Playlist::MediaPlaylist(mp) => {
             let media_sequence = mp.media_sequence;
             let is_fmp4 = mp.segments.iter().any(|s| s.map.is_some());
+
+            // 按 RFC 8216 §4.3.2.4 实现 EXT-X-KEY 的作用域：一个 KEY 标签对其后**所有**
+            // 分片生效，直到出现下一个 KEY 标签。
+            //
+            // 这件事必须自己做，不能直接用 m3u8-rs 给出的 `segment.key`。**实测确认**：
+            // m3u8-rs 6.0.1 只把 key 挂在紧随其后的那一个分片上（它的 parser 在每个 media
+            // URI 之后会把 encryption_key 重置为 None）：
+            //     一个 KEY + 3 个分片 → 只有 seg[0] 带 key，seg[1]/seg[2] 都是 None
+            // 若不在这里补齐，真实播放列表（一个 KEY + 几百个分片）里除第一个分片外全部
+            // 不会被解密——下载"成功"，产出的 mp4 却从约第 10 秒起全是乱码，且不报任何错误。
+            let mut effective: Vec<Option<KeyRef>> = Vec::with_capacity(mp.segments.len());
+            let mut current: Option<KeyRef> = None;
+            for seg in mp.segments.iter() {
+                if let Some(k) = seg.key.clone() {
+                    // 显式设置：METHOD=NONE 经 parse_key 得到 None，表示"自此不再加密"
+                    current = parse_key(base_url, k)?;
+                }
+                // seg.key 为 None 表示沿用上一个 KEY（而非"无加密"）
+                effective.push(current.clone());
+            }
+
             let mut segments: Vec<SegmentRef> = Vec::new();
 
-            // init 段（EXT-X-MAP）：在 AES-128 + fMP4 下它同样是被加密的，必须挂上当前
-            // 生效的 key，否则下载端会跳过解密、静默产出损坏文件而不报错。
-            // RFC 8216 §4.3.2.5 规定：加密的初始化段要求 EXT-X-KEY 带 IV 属性——
-            // 缺 IV 时我们明确报错，因为按媒体序号推导 IV 对 init 段是错的。
+            // init 段（EXT-X-MAP）：AES-128 + fMP4 下初始化段本身也被加密，必须挂上生效的
+            // key，否则下载端跳过解密、静默产出损坏文件。RFC 8216 §4.3.2.5 规定加密的初始
+            // 化段要求 EXT-X-KEY 带 IV——缺 IV 明确报错，因为按媒体序号推导 IV 对 init 段是错的。
             if let Some(map) = mp.segments.iter().find_map(|s| s.map.clone()) {
-                let inherited = match mp.segments.iter().find_map(|s| s.key.clone()) {
-                    Some(k) => {
-                        let parsed = parse_key(base_url, k)?;
-                        if parsed.as_ref().is_some_and(|kr| kr.iv.is_none()) {
-                            return Err(HlsParseError::Parse(
-                                "AES-128 加密的 fMP4 初始化段缺少 IV 属性（RFC 8216 §4.3.2.5）"
-                                    .into(),
-                            ));
-                        }
-                        parsed
-                    }
-                    None => None,
-                };
+                let inherited = effective.iter().find_map(|k| k.clone());
+                if inherited.as_ref().is_some_and(|kr| kr.iv.is_none()) {
+                    return Err(HlsParseError::Parse(
+                        "AES-128 加密的 fMP4 初始化段缺少 IV 属性（RFC 8216 §4.3.2.5）".into(),
+                    ));
+                }
                 segments.push(SegmentRef {
                     uri: resolve_url(base_url, &map.uri).unwrap_or(map.uri),
                     key: inherited,
@@ -1198,11 +1270,7 @@ pub fn parse_playlist(base_url: &str, content: &[u8]) -> Result<ParsedPlaylist, 
                 });
             }
 
-            for seg in mp.segments.into_iter() {
-                let key = match seg.key {
-                    Some(k) => parse_key(base_url, k)?,
-                    None => None,
-                };
+            for (seg, key) in mp.segments.into_iter().zip(effective) {
                 segments.push(SegmentRef {
                     uri: resolve_url(base_url, &seg.uri).unwrap_or(seg.uri),
                     key,
@@ -1279,7 +1347,7 @@ fn parse_iv(hexstr: &str) -> Result<[u8; 16], HlsParseError> {
 - [ ] **Step 5: 运行确认通过**
 
 Run: `cargo test --test hls_parse_test`
-Expected: 8 PASS
+Expected: 11 PASS
 
 - [ ] **Step 6: Commit**
 
@@ -1820,7 +1888,6 @@ async fn downloads_segments_and_builds_concat_plan() {
     ).await.unwrap();
 
     assert_eq!(plan.segment_files.len(), 2);
-    assert!(plan.is_ts); // is_ts = !is_fmp4，本用例 is_fmp4=false
     assert_eq!(std::fs::read(&plan.segment_files[0]).unwrap(), s0);
     assert_eq!(std::fs::read(&plan.segment_files[1]).unwrap(), s1);
     // HLS 进度以分片计数：2 个分片
@@ -1905,7 +1972,8 @@ fn init_segment_does_not_shift_media_indices() {
 }
 ```
 
-注：`is_ts` 定义为 `!is_fmp4`，容器为 TS 时才需要 `aac_adtstoasc` 比特流滤镜。
+注：`ConcatPlan` 只含 `list_file` 与 `segment_files` —— 转封装参数与容器类型无关，见 Task 9。
+分片字节数是下载时累计的（`progress.add(1)` 计数的是分片个数，故 `ProgressUnit::Segments`）。
 
 - [ ] **Step 2: 运行确认失败**
 
@@ -1936,7 +2004,6 @@ use parse::{KeyRef, MediaInfo};
 #[derive(Clone, Debug)]
 pub struct ConcatPlan {
     pub list_file: PathBuf,
-    pub is_ts: bool,
     pub segment_files: Vec<PathBuf>,
 }
 
@@ -2025,7 +2092,6 @@ pub async fn download_media(
 
     Ok(ConcatPlan {
         list_file,
-        is_ts: !media.is_fmp4,
         segment_files: files,
     })
 }
@@ -2151,21 +2217,28 @@ fn write_concat_list_format() {
 }
 
 #[test]
-fn build_remux_args_ts_and_fmp4() {
+fn build_remux_args_are_container_agnostic() {
     let ffmpeg = PathBuf::from("/usr/bin/ffmpeg");
     let list = PathBuf::from("/tmp/concat.txt");
     let out = PathBuf::from("/tmp/o.mp4");
-    let cmd = build_remux(&ffmpeg, &list, &out, true);
-    let args: Vec<String> = cmd.as_std().get_args().map(|s| s.to_string_lossy().into_owned()).collect();
+    let cmd = build_remux(&ffmpeg, &list, &out);
+    let args: Vec<String> = cmd
+        .as_std()
+        .get_args()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
     let joined = args.join(" ");
     assert!(joined.contains("-f concat"));
     assert!(joined.contains("-safe 0"));
-    assert!(joined.contains("-c copy"));
-    assert!(joined.contains("aac_adtstoasc")); // ts 输入要加 adts→asc bitstream filter
-    let cmd2 = build_remux(&ffmpeg, &list, &out, false);
-    let args2: Vec<String> = cmd2.as_std().get_args().map(|s| s.to_string_lossy().into_owned()).collect();
-    assert!(!args2.join(" ").contains("aac_adtstoasc"));
-    assert!(args2.iter().any(|a| a == "/tmp/o.mp4"));
+    assert!(joined.contains("-c copy"), "必须是无损转封装");
+    assert!(args.iter().any(|a| a == "/tmp/o.mp4"), "输出路径要作为最后一个参数");
+    assert!(args.iter().any(|a| a == "-y"), "需覆盖已存在的输出文件");
+    // 显式 aac_adtstoasc 会让非 AAC 音频（AC-3 等）的 TS 合并直接失败；
+    // 交给 ffmpeg 按需自动插入。见 build_remux 中的实测说明。
+    assert!(
+        !joined.contains("aac_adtstoasc"),
+        "不应硬编码 aac_adtstoasc，否则 AC-3 音轨的 TS 会合并失败"
+    );
 }
 ```
 
@@ -2236,7 +2309,6 @@ pub fn build_remux(
     ffmpeg: &Path,
     list: &Path,
     output: &Path,
-    is_ts: bool,
 ) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(ffmpeg);
     cmd.arg("-y")
@@ -2244,9 +2316,12 @@ pub fn build_remux(
         .arg("-safe").arg("0")
         .arg("-i").arg(list)
         .arg("-c").arg("copy");
-    if is_ts {
-        cmd.arg("-bsf:a").arg("aac_adtstoasc");
-    }
+    // 不要显式加 `-bsf:a aac_adtstoasc`。实测（ffmpeg 7.1.1）：
+    //   AAC 的 TS 不加也能正确输出 h264+aac —— ffmpeg 会按需自动插入该滤镜；
+    //   而 AC-3 的 TS 加了会直接失败："Codec 'ac3' is not supported by the bitstream
+    //   filter 'aac_adtstoasc'"，整个合并就此中断。
+    // 也就是说显式加它会让所有非 AAC 音频（AC-3/E-AC-3/MP3/Opus）的 HLS 流下载后合并失败，
+    // 而不加则两种都正常。让 ffmpeg 自己决定。
     cmd.arg(output);
     cmd
 }
@@ -2257,7 +2332,7 @@ pub async fn remux_to_mp4(
     output: &Path,
 ) -> anyhow::Result<()> {
     let out = output.to_path_buf();
-    let cmd = build_remux(ffmpeg, &plan.list_file, &out, plan.is_ts);
+    let cmd = build_remux(ffmpeg, &plan.list_file, &out);
     let output_status = cmd.output().await.context("spawn ffmpeg")?;
     if !output_status.status.success() {
         return Err(anyhow!(
