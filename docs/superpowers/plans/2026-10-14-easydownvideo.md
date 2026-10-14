@@ -2172,9 +2172,10 @@ async fn decrypts_with_derived_iv_across_an_init_offset() {
     ).await.unwrap();
 
     assert_eq!(plan.segment_files.len(), 3, "init + 两个媒体分片");
-    assert!(
-        plan.segment_files[0].to_string_lossy().contains("init"),
-        "init 段必须排在最前"
+    assert_eq!(
+        plan.segment_files[0],
+        dir.path().join("seg-00000.m4s"),
+        "init 段必须排在最前（文件按 segments 数组下标命名，所以是 seg-00000）"
     );
     for i in [1usize, 2usize] {
         assert_eq!(
@@ -2186,9 +2187,12 @@ async fn decrypts_with_derived_iv_across_an_init_offset() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn truncated_leftover_segment_is_not_treated_as_complete() {
-    // 只判 exists() 的续传会把上次中断留下的半截分片当完成，ffmpeg 之后产出损坏文件而不报错。
-    // 完成标志必须是"写临时名后原子改名"的结果。
+async fn stale_part_file_is_not_treated_as_complete() {
+    // 完成标志是"最终文件名存在"（写 .part → 原子改名）。被中断的下载留下的是 .part，
+    // 因此遗留 .part 绝不能被当成完成、更不能被直接改名为成品送进 concat 列表。
+    //
+    // 注意种子必须是 .part（而不是最终名）：最终名存在按设计就是"已完成"，
+    // 那正是 resumes_existing_segments 覆盖的行为，两者不能混为一谈。
     let server = MockServer::start().await;
     let s0 = vec![7u8; 100];
     Mock::given(method("GET")).and(path("/seg0.ts"))
@@ -2197,8 +2201,8 @@ async fn truncated_leftover_segment_is_not_treated_as_complete() {
 
     let media = media_no_crypto(&[format!("{}/seg0.ts", server.uri())]);
     let dir = tempfile::tempdir().unwrap();
-    // 预置一个同名但内容被截断的"半成品"（模拟：上次 create 之后、写满之前被杀）
-    std::fs::write(dir.path().join("seg-00000.ts"), vec![7u8; 40]).unwrap();
+    // 模拟：上次 create 之后、写满/改名之前被杀，留下半截 .part
+    std::fs::write(dir.path().join("seg-00000.ts.part"), vec![7u8; 40]).unwrap();
 
     let plan = download_media(
         &reqwest::Client::new(), &media, dir.path(), 1,
@@ -2207,7 +2211,11 @@ async fn truncated_leftover_segment_is_not_treated_as_complete() {
     assert_eq!(
         std::fs::read(&plan.segment_files[0]).unwrap(),
         s0,
-        "被截断的遗留分片必须重新下载，不能当成已完成"
+        "遗留的 .part 必须被覆盖重下，其内容绝不能进入最终分片"
+    );
+    assert!(
+        !dir.path().join("seg-00000.ts.part").exists(),
+        "成功改名后不应残留 .part"
     );
 }
 
