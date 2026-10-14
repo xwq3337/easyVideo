@@ -2991,7 +2991,8 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 **Interfaces:**
 - Produces:
-  - `pub fn find_ytdlp() -> Option<PathBuf>`（PATH 中依次找 `yt-dlp`、`yt-dlp.exe`、`youtube-dl`、`youtube-dl.exe`）
+  - `pub fn find_ytdlp() -> Option<PathBuf>`（取 `PATH` 环境变量并交 `find_ytdlp_in`；PATH 中依次找 `yt-dlp`、`yt-dlp.exe`、`youtube-dl`、`youtube-dl.exe`）
+  - `pub fn find_ytdlp_in(path_var: impl AsRef<std::ffi::OsStr>) -> Option<PathBuf>`（纯函数，扫描传入的 PATH 字符串；拆出来是为了可测，避免测试改全局环境变量）
   - `pub fn parse_formats(json: &serde_json::Value) -> Vec<YtdlpFormat>`（只保留带 `url` 且有视频流的格式，`note` 取 `format_note` 或 `resolution`）
   - `pub async fn fetch_formats(exe: &Path, page_url: &str) -> anyhow::Result<Vec<YtdlpFormat>>`（`exe -J url`，超时 120s）
 
@@ -3017,7 +3018,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 `tests/ytdlp_test.rs`：
 
 ```rust
-use easydownvideo::core::ytdlp::{find_ytdlp, parse_formats};
+use easydownvideo::core::ytdlp::{find_ytdlp_in, parse_formats};
 
 #[test]
 fn parse_formats_keeps_video_entries() {
@@ -3040,9 +3041,29 @@ fn parse_formats_tolerates_missing_fields() {
 }
 
 #[test]
-fn find_ytdlp_returns_option() {
-    // 只验证不 panic；结果取决于测试机器环境
-    let _ = find_ytdlp();
+fn find_ytdlp_scans_path_in_order() {
+    // **不能**写成 `let _ = find_ytdlp();` —— 那是断言不了任何东西的空测试。
+    // PATH 扫描必须测真行为：跳过没有该文件的目录、在后面的目录里找到、找不到返回 None。
+    // 把 PATH 字符串作为参数传入纯函数，测试才能在不改全局环境（会与并行测试打架）的前提下驱动它。
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let target = b.path().join("bin");
+    std::fs::create_dir_all(&target).unwrap();
+    let exe = if cfg!(windows) { "yt-dlp.exe" } else { "yt-dlp" };
+    std::fs::write(target.join(exe), b"stub").unwrap();
+
+    // 前面的目录里没有该文件，必须继续往后找
+    let path_var = std::env::join_paths([a.path(), &target]).unwrap();
+    let expected = target.join(exe);
+    assert_eq!(
+        find_ytdlp_in(&path_var).as_deref(),
+        Some(expected.as_path()),
+        "应跳过不含该文件的目录，在后面的目录里找到"
+    );
+
+    // 完全没有该文件 -> None（而不是 panic）
+    let none_var = std::env::join_paths([a.path()]).unwrap();
+    assert_eq!(find_ytdlp_in(&none_var), None);
 }
 ```
 
@@ -3068,13 +3089,18 @@ pub struct YtdlpFormat {
 }
 
 pub fn find_ytdlp() -> Option<PathBuf> {
+    find_ytdlp_in(std::env::var_os("PATH")?)
+}
+
+/// 纯函数：扫描给定的 PATH 字符串。拆出来是为了可测 —— 直接驱动 `find_ytdlp()` 就得改全局
+/// 环境变量，那会与并行跑的其它测试互相干扰（env 是进程级的）。
+pub fn find_ytdlp_in(path_var: impl AsRef<std::ffi::OsStr>) -> Option<PathBuf> {
     let names: &[&str] = if cfg!(windows) {
         &["yt-dlp.exe", "youtube-dl.exe", "yt-dlp", "youtube-dl"]
     } else {
         &["yt-dlp", "youtube-dl"]
     };
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
+    for dir in std::env::split_paths(path_var) {
         for name in names {
             let candidate = dir.join(name);
             if candidate.is_file() {
