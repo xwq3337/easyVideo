@@ -1041,6 +1041,57 @@ fn rejects_sample_aes_explicitly() {
     let err = parse_playlist("https://e.com/m.m3u8", content).unwrap_err();
     assert!(err.to_string().contains("SAMPLE-AES"));
 }
+
+#[test]
+fn malformed_iv_errors_instead_of_panicking() {
+    // 32 字节但含多字节 UTF-8：按字节切分不会 panic，必须返回 Err
+    let mut content = String::from("#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"https://k/x\",IV=");
+    content.push_str(&"€".repeat(10)); // 3 字节 × 10 = 30 字节，再加 2 字节
+    content.push_str("xy"); // 共 32 字节
+    content.push_str("\n#EXTINF:1,\na.ts\n");
+    let err = parse_playlist("https://e.com/m.m3u8", content.as_bytes()).unwrap_err();
+    assert!(err.to_string().contains("bad IV"), "实际错误: {err}");
+
+    // 长度不对
+    let short = b"#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"https://k/x\",IV=0x1234\n#EXTINF:1,\na.ts\n";
+    assert!(parse_playlist("https://e.com/m.m3u8", short).is_err());
+}
+
+#[test]
+fn encrypted_fmp4_init_segment_inherits_key() {
+    // fMP4 + AES-128：EXT-X-MAP 的初始化段本身也被加密，必须挂上 key 且要求有 IV。
+    // KEY 写在 MAP 之前（规范里最常见的顺序）。
+    let with_iv = b"#EXTM3U\n#EXT-X-VERSION:7\n\
+#EXT-X-KEY:METHOD=AES-128,URI=\"https://k/x\",IV=0x00000000000000000000000000000001\n\
+#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:6.0,\ns0.m4s\n#EXT-X-ENDLIST\n";
+    match parse_playlist("https://c/f/i.m3u8", with_iv).unwrap() {
+        ParsedPlaylist::Media(m) => {
+            assert!(m.is_fmp4);
+            let init = &m.segments[0];
+            assert!(init.is_init);
+            let k = init.key.as_ref().expect("init 段必须继承 key");
+            assert_eq!(k.uri, "https://k/x");
+            let mut expect_iv = [0u8; 16];
+            expect_iv[15] = 1;
+            assert_eq!(k.iv, Some(expect_iv));
+        }
+        _ => panic!("expected Media"),
+    }
+
+    // 缺 IV：按 RFC 8216 §4.3.2.5 必须明确报错，绝不能按媒体序号推导 IV 解出错的内容
+    let no_iv = b"#EXTM3U\n#EXT-X-VERSION:7\n\
+#EXT-X-KEY:METHOD=AES-128,URI=\"https://k/x\"\n\
+#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:6.0,\ns0.m4s\n#EXT-X-ENDLIST\n";
+    let err = parse_playlist("https://c/f/i.m3u8", no_iv).unwrap_err();
+    assert!(err.to_string().contains("IV"), "实际错误: {err}");
+}
+
+#[test]
+fn rejects_unknown_key_method() {
+    let content = b"#EXTM3U\n#EXT-X-KEY:METHOD=AES-256,URI=\"https://k/x\"\n#EXTINF:1,\na.ts\n";
+    let err = parse_playlist("https://e.com/m.m3u8", content).unwrap_err();
+    assert!(err.to_string().contains("AES-256"), "实际错误: {err}");
+}
 ```
 
 - [ ] **Step 3: 运行确认失败**
@@ -1121,37 +1172,35 @@ pub fn parse_playlist(base_url: &str, content: &[u8]) -> Result<ParsedPlaylist, 
             let media_sequence = mp.media_sequence;
             let is_fmp4 = mp.segments.iter().any(|s| s.map.is_some());
             let mut segments: Vec<SegmentRef> = Vec::new();
+
+            // init 段（EXT-X-MAP）：在 AES-128 + fMP4 下它同样是被加密的，必须挂上当前
+            // 生效的 key，否则下载端会跳过解密、静默产出损坏文件而不报错。
+            // RFC 8216 §4.3.2.5 规定：加密的初始化段要求 EXT-X-KEY 带 IV 属性——
+            // 缺 IV 时我们明确报错，因为按媒体序号推导 IV 对 init 段是错的。
             if let Some(map) = mp.segments.iter().find_map(|s| s.map.clone()) {
+                let inherited = match mp.segments.iter().find_map(|s| s.key.clone()) {
+                    Some(k) => {
+                        let parsed = parse_key(base_url, k)?;
+                        if parsed.as_ref().is_some_and(|kr| kr.iv.is_none()) {
+                            return Err(HlsParseError::Parse(
+                                "AES-128 加密的 fMP4 初始化段缺少 IV 属性（RFC 8216 §4.3.2.5）"
+                                    .into(),
+                            ));
+                        }
+                        parsed
+                    }
+                    None => None,
+                };
                 segments.push(SegmentRef {
                     uri: resolve_url(base_url, &map.uri).unwrap_or(map.uri),
-                    key: None,
+                    key: inherited,
                     is_init: true,
                 });
             }
+
             for seg in mp.segments.into_iter() {
                 let key = match seg.key {
-                    Some(k) => match k.method {
-                        m3u8_rs::KeyMethod::None => None,
-                        m3u8_rs::KeyMethod::AES128 => {
-                            let uri = k.uri.ok_or_else(|| {
-                                HlsParseError::Parse("AES-128 key missing URI".into())
-                            })?;
-                            let iv = match &k.iv {
-                                Some(hexstr) => Some(parse_iv(hexstr)?),
-                                None => None,
-                            };
-                            Some(KeyRef {
-                                uri: resolve_url(base_url, &uri).unwrap_or(uri),
-                                iv,
-                            })
-                        }
-                        m3u8_rs::KeyMethod::SampleAES => {
-                            return Err(HlsParseError::UnsupportedKeyMethod("SAMPLE-AES".into()))
-                        }
-                        m3u8_rs::KeyMethod::Other(s) => {
-                            return Err(HlsParseError::UnsupportedKeyMethod(s))
-                        }
-                    },
+                    Some(k) => parse_key(base_url, k)?,
                     None => None,
                 };
                 segments.push(SegmentRef {
@@ -1169,14 +1218,46 @@ pub fn parse_playlist(base_url: &str, content: &[u8]) -> Result<ParsedPlaylist, 
     }
 }
 
+/// 把 m3u8-rs 的 `Key` 转成本项目的 `KeyRef`。
+/// 不支持的方法（SAMPLE-AES、未知方法）一律返回错误——绝不静默降级为"无加密"。
+fn parse_key(base_url: &str, k: m3u8_rs::Key) -> Result<Option<KeyRef>, HlsParseError> {
+    match k.method {
+        m3u8_rs::KeyMethod::None => Ok(None),
+        m3u8_rs::KeyMethod::AES128 => {
+            let uri = k
+                .uri
+                .ok_or_else(|| HlsParseError::Parse("AES-128 key missing URI".into()))?;
+            let iv = match &k.iv {
+                Some(hexstr) => Some(parse_iv(hexstr)?),
+                None => None,
+            };
+            Ok(Some(KeyRef {
+                uri: resolve_url(base_url, &uri).unwrap_or(uri),
+                iv,
+            }))
+        }
+        m3u8_rs::KeyMethod::SampleAES => {
+            Err(HlsParseError::UnsupportedKeyMethod("SAMPLE-AES".into()))
+        }
+        m3u8_rs::KeyMethod::Other(s) => Err(HlsParseError::UnsupportedKeyMethod(s)),
+    }
+}
+
 fn parse_iv(hexstr: &str) -> Result<[u8; 16], HlsParseError> {
     let s = hexstr.strip_prefix("0x").unwrap_or(hexstr);
-    if s.len() != 32 {
-        return Err(HlsParseError::Parse(format!("bad IV length: {hexstr}")));
+    // 先按字节校验长度与字符集，再切分。
+    // 注意不能用 `s.len()` 判断"32 个十六进制字符"：`len()` 是字节数，若串里混入多字节
+    // UTF-8（畸形 playlist 可以做到），`&s[2*i..2*i+2]` 会落在字符边界之外直接 panic。
+    // 按字节遍历 chunks_exact 则完全不涉及 str 边界。
+    let bytes = s.as_bytes();
+    if bytes.len() != 32 || !bytes.iter().all(u8::is_ascii_hexdigit) {
+        return Err(HlsParseError::Parse(format!("bad IV: {hexstr}")));
     }
     let mut out = [0u8; 16];
-    for i in 0..16 {
-        out[i] = u8::from_str_radix(&s[2 * i..2 * i + 2], 16)
+    for (i, pair) in bytes.chunks_exact(2).enumerate() {
+        let hex = std::str::from_utf8(pair)
+            .map_err(|_| HlsParseError::Parse(format!("bad IV hex: {hexstr}")))?;
+        out[i] = u8::from_str_radix(hex, 16)
             .map_err(|_| HlsParseError::Parse(format!("bad IV hex: {hexstr}")))?;
     }
     Ok(out)
@@ -1198,7 +1279,7 @@ fn parse_iv(hexstr: &str) -> Result<[u8; 16], HlsParseError> {
 - [ ] **Step 5: 运行确认通过**
 
 Run: `cargo test --test hls_parse_test`
-Expected: 5 PASS
+Expected: 8 PASS
 
 - [ ] **Step 6: Commit**
 
@@ -1695,7 +1776,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ```rust
 use easydownvideo::core::events::ProgressHandle;
-use easydownvideo::core::hls::download_media;
+use easydownvideo::core::hls::{download_media, plan_segment_indices};
 use easydownvideo::core::hls::parse::{MediaInfo, SegmentRef};
 use tokio_util::sync::CancellationToken;
 use wiremock::{matchers::{method, path}, Mock, MockServer, ResponseTemplate};
@@ -1798,6 +1879,30 @@ async fn retries_failed_segment() {
     ).await.unwrap();
     assert_eq!(std::fs::read(&plan.segment_files[0]).unwrap(), s0);
 }
+
+#[test]
+fn init_segment_does_not_shift_media_indices() {
+    // IV 由 `media_sequence + 媒体序号` 推导。init 段（fMP4 的 EXT-X-MAP）不占媒体序号，
+    // 若按 segments 数组下标推导 IV，init 之后的每个分片序号都会多 1，解出乱码。
+    let segs = vec![
+        SegmentRef { uri: "init.mp4".into(), key: None, is_init: true },
+        SegmentRef { uri: "s0.m4s".into(), key: None, is_init: false },
+        SegmentRef { uri: "s1.m4s".into(), key: None, is_init: false },
+        SegmentRef { uri: "s2.m4s".into(), key: None, is_init: false },
+    ];
+    assert_eq!(
+        plan_segment_indices(&segs),
+        vec![(0, 0), (1, 0), (2, 1), (3, 2)],
+        "第一个媒体分片的媒体序号必须是 0，而不是它在数组里的下标 1"
+    );
+
+    // 无 init 段时，下标即媒体序号
+    let plain = vec![
+        SegmentRef { uri: "a.ts".into(), key: None, is_init: false },
+        SegmentRef { uri: "b.ts".into(), key: None, is_init: false },
+    ];
+    assert_eq!(plan_segment_indices(&plain), vec![(0, 0), (1, 1)]);
+}
 ```
 
 注：`is_ts` 定义为 `!is_fmp4`，容器为 TS 时才需要 `aac_adtstoasc` 比特流滤镜。
@@ -1856,7 +1961,9 @@ pub async fn download_media(
     let media_sequence = media.media_sequence;
 
     let mut handles = Vec::new();
-    for (idx, seg) in media.segments.iter().enumerate() {
+    // (segments 下标, 媒体序号偏移)：init 段不占媒体序号，见 plan_segment_indices 的说明
+    for (idx, media_index) in plan_segment_indices(&media.segments) {
+        let seg = &media.segments[idx];
         let file_path = task_dir.join(format!("seg-{idx:05}.{ext}"));
         let client = client.clone();
         let seg_uri = seg.uri.clone();
@@ -1889,7 +1996,9 @@ pub async fn download_media(
                             k
                         }
                     };
-                    let effective_iv = iv.unwrap_or_else(|| default_iv(media_sequence, idx));
+                    // 用媒体序号而非数组下标推导 IV
+                    let effective_iv = iv
+                        .unwrap_or_else(|| default_iv(media_sequence, media_index));
                     decrypt_aes128(&k, &effective_iv, &ciphertext)?
                 }
                 None => ciphertext,
@@ -1946,6 +2055,27 @@ async fn fetch_once(client: &reqwest::Client, uri: &str) -> anyhow::Result<Vec<u
     Ok(out)
 }
 
+/// 为一个 media playlist 规划每个分段的 `(segments 数组下标, 媒体序号偏移)`。
+///
+/// init 段（fMP4 的 `#EXT-X-MAP`）**不占媒体序号**，所以它之后的第一个媒体分片的媒体序号
+/// 仍是 0。若直接拿数组下标当媒体序号去推导 IV，`#EXT-X-KEY` 未显式给 IV 时每个分片都会
+/// 用错一个序号的 IV，解出乱码且不会报错。单独抽成纯函数就是为了能直接测这个不变式。
+pub fn plan_segment_indices(segments: &[SegmentRef]) -> Vec<(usize, usize)> {
+    let mut out = Vec::with_capacity(segments.len());
+    let mut media_index = 0usize;
+    for (idx, seg) in segments.iter().enumerate() {
+        let mi = if seg.is_init {
+            0 // init 段不使用 IV，占位
+        } else {
+            let v = media_index;
+            media_index += 1;
+            v
+        };
+        out.push((idx, mi));
+    }
+    out
+}
+
 fn default_iv(media_sequence: u64, segment_index: usize) -> [u8; 16] {
     let seq = media_sequence.wrapping_add(segment_index as u64);
     let mut iv = [0u8; 16];
@@ -1959,7 +2089,7 @@ fn default_iv(media_sequence: u64, segment_index: usize) -> [u8; 16] {
 - [ ] **Step 4: 运行确认通过**
 
 Run: `cargo test --test hls_download_test`
-Expected: 3 PASS
+Expected: 4 PASS
 
 - [ ] **Step 5: Commit**
 
