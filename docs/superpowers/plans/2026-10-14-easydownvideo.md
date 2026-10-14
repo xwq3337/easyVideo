@@ -18,6 +18,9 @@
 - 输出文件名冲突时自动 `name (1).ext` 递增，不覆盖已有文件
 - 下载目录默认 `~/Downloads/easydownvideo`；设置更改只影响之后新建的任务
 - 所有 git commit 末尾追加：`Co-Authored-By: Claude Code <noreply@anthropic.com>`
+- **提交时只暂存本任务改动的文件（`git add <路径...>`）。下方各步骤里写的 `git add -A` 是早期草稿，
+  一律按本条覆盖。** 多个任务/修复轮可能同时在跑，`-A` 会把别的任务的半成品一起卷进本任务的提交，
+  使提交与评审边界失效。
 - m3u8 只支持 AES-128 与 fMP4 基础变体；遇到 SAMPLE-AES 等明确报错
 - 首次编译 egui+reqwest 需 3–6 分钟属正常；迭代用 `cargo check`，跑测试用 `cargo test`
 
