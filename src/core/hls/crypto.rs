@@ -5,10 +5,15 @@ type Aes128CbcDecrypt = cbc::Decryptor<aes::Aes128>;
 
 #[derive(Error, Debug)]
 pub enum HlsCryptoError {
+    #[error("ciphertext is empty")]
+    Empty,
     #[error("ciphertext length {0} is not a multiple of 16")]
     InvalidLength(usize),
-    #[error("decrypt failed: {0}")]
-    Decrypt(String),
+    #[error(
+        "PKCS7 去填充失败：分片已损坏，或密钥/IV 不匹配。\
+HLS AES-128 不带 MAC，PKCS7 校验是它唯一的完整性信号，因此这里必须报错"
+    )]
+    BadPadding,
 }
 
 pub fn decrypt_aes128(
@@ -16,20 +21,25 @@ pub fn decrypt_aes128(
     iv: &[u8; 16],
     data: &[u8],
 ) -> Result<Vec<u8>, HlsCryptoError> {
-    if data.len() % 16 != 0 || data.is_empty() {
+    if data.is_empty() {
+        return Err(HlsCryptoError::Empty);
+    }
+    if data.len() % 16 != 0 {
         return Err(HlsCryptoError::InvalidLength(data.len()));
     }
+    // 用原地解密 API 而非 `decrypt_padded_vec_mut`：后者需要 cipher 的 `alloc` feature，
+    // 而当前解析到的 cipher v0.4.4 未启用（启用它等于改依赖）。
+    //
+    // **不做"去填充失败就按无填充返回"的宽容回退**。原因：
+    // 1) 密钥/IV 正确时，解出的最后一个分组本来就是原始 PKCS7 填充，去填充必然成功。
+    //    因此失败只可能意味着密钥/IV 错或数据损坏 —— 此时解出的**整段**都是乱码，
+    //    不只是尾部，返回它没有任何好处。
+    // 2) HLS AES-128 没有 MAC：PKCS7 校验是格式提供的**唯一**完整性信号。
+    //    把它降级成"宽容通过"，等于把每一次本可检测的损坏变成静默的坏视频。
     let mut buf = data.to_vec();
     let decryptor = Aes128CbcDecrypt::new(key.into(), iv.into());
-    if let Ok(pt) = decryptor.decrypt_padded_mut::<Pkcs7>(&mut buf) {
-        return Ok(pt.to_vec());
+    match decryptor.decrypt_padded_mut::<Pkcs7>(&mut buf) {
+        Ok(pt) => Ok(pt.to_vec()),
+        Err(_) => Err(HlsCryptoError::BadPadding),
     }
-    // decrypt_padded_mut 是原地解密：去填充失败时 buf 已被改写为明文，回退前必须还原密文。
-    buf.copy_from_slice(data);
-    // 非标准填充：按无填充解密，原样保留全部字节（TS 播放器可容忍尾部无填充）
-    let decryptor = Aes128CbcDecrypt::new(key.into(), iv.into());
-    let pt = decryptor
-        .decrypt_padded_mut::<aes::cipher::block_padding::NoPadding>(&mut buf)
-        .map_err(|e| HlsCryptoError::Decrypt(format!("{e:?}")))?;
-    Ok(pt.to_vec())
 }
