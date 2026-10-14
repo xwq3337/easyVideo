@@ -2680,6 +2680,52 @@ async fn update_settings_changes_concurrency() {
     assert_eq!(engine.current_settings().segment_concurrency, 12);
     assert!(!engine.current_settings().ytdlp_enabled);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_cleans_resume_artifacts() {
+    // 取消是"不要了"：断点目录必须清掉，否则下次启动 scan_resume 会把它复活重下
+    let server = MockServer::start().await;
+    let data: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
+    Mock::given(method("GET")).and(path("/v.mp4")).and(header("range", "bytes=0-63"))
+        .respond_with(ResponseTemplate::new(206)
+            .insert_header("content-type", "video/mp4")
+            .insert_header("content-range", "bytes 0-63/4096")
+            .set_body_bytes(data[0..64].to_vec()))
+        .mount(&server).await;
+    // 全量请求延迟返回，留出取消窗口
+    Mock::given(method("GET")).and(path("/v.mp4"))
+        .respond_with(ResponseTemplate::new(206)
+            .insert_header("content-type", "video/mp4")
+            .insert_header("content-range", "bytes 0-4095/4096")
+            .set_body_bytes(data.clone())
+            .set_delay(std::time::Duration::from_millis(1500)))
+        .mount(&server).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let engine = Engine::new(rt, settings_with(dir.path()), dir.path().join("data"));
+    let mut rx = engine.events();
+    let id = engine.add_url(format!("{}/v.mp4", server.uri()));
+
+    // 进入 Downloading 说明 manifest 已落盘
+    wait_state(&mut rx, id, TaskState::Downloading, 10).await;
+    engine.cancel(id);
+    wait_state(&mut rx, id, TaskState::Canceled, 10).await;
+
+    // 清理发生在 worker 退出路径，轮询等待（避免依赖固定 sleep 时长）
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if easydownvideo::core::task::scan_resume(dir.path()).is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "取消后仍残留可恢复的 manifest，重启会把已取消任务复活"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(!easydownvideo::core::task::task_dir(dir.path(), id).exists());
+}
 ```
 
 注：`failure_does_not_block_queue` 中 good 任务若不挂 mock 会在 probe 阶段 404 也失败——执行时补齐 good 的 mock（与 `end_to_end_direct_download` 相同的双 range mock + probe mock，文件大小取 2048）。保持两个测试独立可跑。
@@ -2975,11 +3021,16 @@ impl Engine {
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("task {id} failed: {e:#}");
-                        if let Some(s) = engine.state_of(id) {
-                            if !matches!(s, TaskState::Paused | TaskState::Canceled) {
-                                engine.set_state(id, TaskState::Failed(format!("{e:#}")));
-                            }
+                        // 用户主动取消：清掉断点目录。否则 manifest 还在，下次启动
+                        // scan_resume 会把已取消的任务当未完成任务复活并重新下载。
+                        if matches!(engine.state_of(id), Some(TaskState::Canceled)) {
+                            let root = engine.current_settings().download_dir;
+                            std::fs::remove_dir_all(task_dir(&root, id)).ok();
+                        } else if matches!(engine.state_of(id), Some(TaskState::Paused)) {
+                            // 暂停：保留断点与 manifest，等待用户继续
+                        } else {
+                            tracing::warn!("task {id} failed: {e:#}");
+                            engine.set_state(id, TaskState::Failed(format!("{e:#}")));
                         }
                     }
                 }
@@ -3107,7 +3158,7 @@ impl Engine {
 - [ ] **Step 4: 运行确认通过**
 
 Run: `cargo test --test engine_test`
-Expected: 4 PASS
+Expected: 5 PASS
 
 - [ ] **Step 5: Commit**
 
