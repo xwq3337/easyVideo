@@ -4309,6 +4309,9 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Modify: `src/app.rs`
 - Modify: `src/main.rs`（挂接 Engine、tokio Runtime、tracing）
 - Modify: `src/settings.rs`（新增 `data_dir()` —— 见下面"数据目录"一节；现状里没有这个方法）
+- Modify: `src/lib.rs`（加 `pub mod ui_font;`）
+- Create: `src/ui_font.rs`（系统中文字体安装 —— 见下面"中文字体"一节）
+- Create: `tests/ui_font_test.rs`（1 PASS）
 - Modify: `tests/settings_test.rs`（为 `data_dir()` 补测试）
 
 **数据目录（本任务新增 `Settings::data_dir()`）**
@@ -4359,6 +4362,114 @@ fn data_dir_is_app_scoped() {
         "不得退回到共享目录（config_dir 的父目录 + data）"
     );
 }
+
+**中文字体（本任务新增 `src/ui_font.rs`）**
+
+egui 自带字体（Ubuntu-Light / Hack 等）**不含任何 CJK 字形**，而本应用界面全是中文 ——
+不额外装字体，所有中文都会渲染成方框（tofu，□），界面等于不可读。实测确认：Task 14 首次
+`cargo run` 出来的窗口里中文全是方框。
+
+**选择"运行期加载系统字体"而不是内嵌字体文件**，理由：
+- 不增加仓库体积（ffmpeg 已经占了 172MB）
+- 避开再分发授权问题：PingFang、微软雅黑**都不可再分发**；Noto Sans SC 可以，但要额外下载+子集化
+- 各平台自带的中文字体都覆盖界面用到的常用字
+
+**可行性已核实**：egui 0.30 的 `FontData` 带 `index: u32` 字段，底层走
+`ab_glyph::FontVec::try_from_vec_and_index`（见 `epaint-0.30.0/src/text/fonts.rs:119,206`），
+因此**支持 `.ttc` 字体集合** —— 而这正是 macOS/Windows 上中文字体的常见打包形式
+（`PingFang.ttc`、`msyh.ttc`）。若 epaint 不支持 `.ttc`，这条路走不通，必须改为内嵌字体。
+
+`src/lib.rs` 增加一行：
+
+```rust
+pub mod ui_font;
+```
+
+`src/ui_font.rs`：
+
+```rust
+//! 中文字体安装。详见计划中"中文字体"一节的取舍说明。
+
+use eframe::egui;
+
+/// 各平台候选路径（按优先级）。都是系统自带字体，取第一个能读到的。
+/// 第二项是 `.ttc` 集合里的字体面序号（0 = 该集合的第一个面）。
+#[cfg(target_os = "macos")]
+const CANDIDATES: &[(&str, u32)] = &[
+    ("/System/Library/Fonts/PingFang.ttc", 0), // 苹方 SC
+    ("/System/Library/Fonts/Hiragino Sans GB.ttc", 0),
+    ("/Library/Fonts/Arial Unicode.ttf", 0),
+];
+
+#[cfg(target_os = "windows")]
+const CANDIDATES: &[(&str, u32)] = &[
+    ("C:\\Windows\\Fonts\\msyh.ttc", 0),   // 微软雅黑
+    ("C:\\Windows\\Fonts\\simhei.ttf", 0), // 黑体
+    ("C:\\Windows\\Fonts\\simsun.ttc", 0), // 宋体
+];
+
+#[cfg(all(unix, not(target_os = "macos")))]
+const CANDIDATES: &[(&str, u32)] = &[
+    ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
+    ("/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf", 0),
+    ("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", 0),
+];
+
+/// 把系统中文字体装进 egui 字体表，作为**后备**字体（追加在默认字体之后）。
+///
+/// 返回是否装上了 —— `false` 意味着界面上所有中文都会显示成方框。
+pub fn install_cjk_font(ctx: &egui::Context) -> bool {
+    for (path, index) in CANDIDATES {
+        let Ok(bytes) = std::fs::read(path) else { continue };
+        if bytes.is_empty() {
+            continue;
+        }
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "cjk".to_owned(),
+            egui::FontData {
+                font: bytes.into(),
+                index: *index,
+                tweak: Default::default(),
+            }
+            .into(),
+        );
+        // **追加到末尾**而不是插到最前：拉丁字母和数字继续用 egui 默认字体渲染
+        // （字形更协调），只有默认字体缺字的字符才回退到中文字体。
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .push("cjk".to_owned());
+        }
+        ctx.set_fonts(fonts);
+        tracing::info!("中文字体已加载: {path} (index {index})");
+        return true;
+    }
+    tracing::warn!(
+        "未找到系统中文字体，界面中文将显示为方框（□）。候选路径: {:?}",
+        CANDIDATES.iter().map(|(p, _)| *p).collect::<Vec<_>>()
+    );
+    false
+}
+```
+
+`tests/ui_font_test.rs`（**1 PASS**）：
+
+```rust
+#[test]
+fn cjk_font_loads_from_the_system() {
+    // 界面全是中文。这个函数返回 false，用户看到的就是满屏方框（□）。
+    // 用 Context::default() 即可 —— egui 允许在无窗口环境下建 Context。
+    let ctx = eframe::egui::Context::default();
+    assert!(
+        easydownvideo::ui_font::install_cjk_font(&ctx),
+        "本机没找到任何可用的系统中文字体 —— 界面中文会渲染成方框。\
+         这说明候选路径在本平台不对（或字体文件读不出来），不是无关紧要的失败。"
+    );
+}
+```
 ```
 
 **Interfaces:**
@@ -4423,6 +4534,9 @@ fn main() -> eframe::Result<()> {
 ```rust
 use std::time::{Duration, Instant};
 
+// 必须用 `eframe::egui`：`egui` **不是**本 crate 的直接依赖（只有 eframe），
+// 直接写 `use egui::...` 会得到 E0433。原稿漏了这一行，实测 25 处编译失败。
+use eframe::egui;
 use easydownvideo::core::engine::Engine;
 use easydownvideo::core::events::{Choice, ChoiceKind, EngineEvent, ProgressUnit, TaskId, TaskState};
 use easydownvideo::settings::Settings;
@@ -4496,6 +4610,11 @@ impl App {
         engine: Engine,
         settings: Settings,
     ) -> Self {
+        // 装中文字体：egui 自带字体没有 CJK 字形，界面全是中文，不装就是满屏方框。
+        // 放在最前面 —— 越早装，第一帧就越不会是方框。
+        if !easydownvideo::ui_font::install_cjk_font(&cc.egui_ctx) {
+            // 已经 warn 过；界面会退化成方框，但程序仍可用
+        }
         let events = engine.events();
         // 水合：把引擎中已存在的任务（含 scan_resume 恢复的）载入 UI 列表
         let tasks: Vec<UiTask> = engine
@@ -4720,6 +4839,7 @@ impl eframe::App for App {
                     if t.show_choices {
                         if let Some(kind) = t.choices.clone() {
                             let mut open = t.show_choices;
+                            let mut chosen: Option<Choice> = None;
                             egui::Window::new("选择下载格式")
                                 .collapsible(false)
                                 .resizable(false)
@@ -4727,7 +4847,6 @@ impl eframe::App for App {
                                 .show(ctx, |ui| match &kind {
                                     ChoiceKind::HlsVariants(vars) => {
                                         ui.label("选择清晰度：");
-                                        let mut chosen = None;
                                         // 默认最高码率排最前
                                         let mut order: Vec<(usize, _)> = vars.iter().enumerate().collect();
                                         order.sort_by(|a, b| b.1.bandwidth.cmp(&a.1.bandwidth));
@@ -4740,27 +4859,30 @@ impl eframe::App for App {
                                                 chosen = Some(Choice::Variant(idx));
                                             }
                                         }
-                                        if let Some(c) = chosen {
-                                            self.engine.set_choice(t.id, c);
-                                            t.show_choices = false;
-                                        }
                                     }
                                     ChoiceKind::YtdlpFormats(fmt) => {
                                         ui.label("yt-dlp 可用格式：");
-                                        let mut chosen = None;
                                         for (i, f) in fmt.iter().enumerate() {
                                             let size = f.filesize.map(format_size).unwrap_or_else(|| "未知大小".into());
                                             if ui.button(format!("[{}] {} - {}", f.id, f.note, size)).clicked() {
                                                 chosen = Some(Choice::YtdlpFormat(i));
                                             }
                                         }
-                                        if let Some(c) = chosen {
-                                            self.engine.set_choice(t.id, c);
-                                            t.show_choices = false;
-                                        }
                                     }
                                 });
-                            t.show_choices = open;
+                            // **选中后必须真正关窗，而且不能无条件采纳 `open`。**
+                            // 原稿在每个 arm 里置 `show_choices = false`，紧接着又无条件写
+                            // `t.show_choices = open` —— 而 `open` 的初值就是 `t.show_choices`（true），
+                            // 只有用户点窗口标题栏的 [x] 才会变 false。于是 arm 里刚关上的窗立刻被
+                            // 覆盖回来：模态框永远关不掉，里面的按钮点起来像是没反应。
+                            // `chosen` 提到 Window 外面也是为此 —— arm 内部的局部变量在外面看不见。
+                            if let Some(c) = chosen {
+                                self.engine.set_choice(t.id, c);
+                                t.choices = None;
+                                t.show_choices = false;
+                            } else {
+                                t.show_choices = open;
+                            }
                         }
                     }
                 }
