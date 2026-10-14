@@ -3305,6 +3305,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```rust
 use easydownvideo::core::engine::Engine;
 use easydownvideo::core::events::{EngineEvent, TaskState};
+use easydownvideo::core::task::{ManifestKind, TaskManifest};
 use easydownvideo::settings::Settings;
 use wiremock::{matchers::{header, method, path}, Mock, MockServer, ResponseTemplate};
 
@@ -3503,9 +3504,74 @@ async fn cancel_cleans_resume_artifacts() {
     }
     assert!(!easydownvideo::core::task::task_dir(dir.path(), id).exists());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_ids_do_not_collide_with_new_tasks() {
+    // 恢复的任务带着它原来的 id，而 add_url 从 1 开始分配。不抬高 next_id，
+    // 新增任务会拿到已被占用的 id，insert_entry 直接把它覆盖 —— 恢复的任务无声消失。
+    //
+    // max_active_tasks = 0 让任何 worker 都不启动：这个测试只关心 id 分配，
+    // 不该联网，也不该受下载时序影响。
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let mut s = settings_with(dir.path());
+    s.max_active_tasks = 0;
+    let engine = Engine::new(rt, s, dir.path().join("data"));
+
+    engine.resume(TaskManifest {
+        id: 7,
+        url: "https://example.com/a.mp4".into(),
+        filename: "a.mp4".into(),
+        download_dir: dir.path().to_path_buf(),
+        kind: ManifestKind::Direct { size: Some(10) },
+    });
+
+    let fresh = engine.add_url("https://example.com/b.mp4".into());
+    assert_ne!(fresh, 7, "add_url 分配到了已被恢复任务占用的 id");
+    assert_eq!(
+        engine.task_info(7).map(|(_, f)| f).as_deref(),
+        Some("a.mp4"),
+        "恢复出来的任务被新增任务覆盖了"
+    );
+    assert_eq!(engine.list_tasks().len(), 2, "两个任务都应存在");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_while_queued_is_not_resurrected() {
+    // 取消发生在"排队期间"时，id 仍留在 VecDeque 里。pump 启动任务前必须检查状态，
+    // 否则用户点了取消，任务随后自己复活并开始下载。
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let mut s0 = settings_with(dir.path());
+    s0.max_active_tasks = 0; // 先让任务停在队列里
+    let engine = Engine::new(rt, s0, dir.path().join("data"));
+
+    let id = engine.add_url("https://example.com/x.mp4".into());
+    engine.cancel(id);
+
+    // 提高并发上限触发 pump —— 这是会把它复活的那条路径
+    let mut s1 = settings_with(dir.path());
+    s1.max_active_tasks = 1;
+    engine.update_settings(s1);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let snap = engine
+        .list_tasks()
+        .into_iter()
+        .find(|t| t.id == id)
+        .expect("任务应仍在列表中");
+    assert_eq!(
+        snap.state,
+        TaskState::Canceled,
+        "被取消的排队任务被 pump 复活了（状态变成 {:?}）",
+        snap.state
+    );
+}
 ```
 
-注：`failure_does_not_block_queue` 中 good 任务若不挂 mock 会在 probe 阶段 404 也失败——执行时补齐 good 的 mock（与 `end_to_end_direct_download` 相同的双 range mock + probe mock，文件大小取 2048）。保持两个测试独立可跑。
+注（原文有误，已更正）：`failure_does_not_block_queue` 里 good 任务的双 range mock **已经在上面写好了**（文件 512 字节，`content-range: bytes 0-511/512`），不需要另行补齐；原文说"执行时补齐、大小取 2048"，与该测试实际内容矛盾，是残留草稿。
+
+**mock 必须显式匹配，不要依赖"漏网落到兜底 mock"。** wiremock 只按你声明的 matcher 匹配；某个 range 请求若没被任何 mock 命中会 404，任务就失败在 probe 上。若实测发现某个 range 请求与预期不符，**报告实际发出的 range 值**再调整 mock —— 不要放宽断言或改成"任何请求都返回全量"来让它变绿。
 
 - [ ] **Step 2: 运行确认失败**
 
@@ -3648,6 +3714,12 @@ impl Engine {
     }
 
     pub fn resume(&self, m: TaskManifest) {
+        // **必须抬高 next_id**：恢复的任务带着它原来的 id，而 `add_url` 是从 1 开始递增分配的。
+        // 不抬高的话，重启后先 resume 出 id=1..N 的任务，用户随即新增一个 URL 又拿到 id=1，
+        // `insert_entry` 的 `tasks.insert` 会把这个恢复出来的任务**直接覆盖掉** ——
+        // 用户看到的是"我刚加了个任务，上一个任务凭空消失了"。
+        // 这不是边角情况：它发生在每次重启后的第一次新增。
+        self.inner.next_id.fetch_max(m.id + 1, Ordering::SeqCst);
         self.insert_entry(m.id, m.url, m.filename, Some(m));
     }
 
@@ -3663,7 +3735,9 @@ impl Engine {
     pub fn pause(&self, id: TaskId) {
         let entry = { self.inner.tasks.lock().unwrap().get(&id).cloned() };
         if let Some(e) = entry {
-            if e.state == TaskState::Downloading {
+            // 排队中的任务也要能暂停（用户对着队列里等待的任务点暂停是正常操作）。
+            // 标记为 Paused 后，pump 的分支闸会因为状态不是 Queued 而跳过它。
+            if matches!(e.state, TaskState::Queued | TaskState::Downloading) {
                 e.cancel.cancel();
                 self.set_state(id, TaskState::Paused);
             }
@@ -3767,6 +3841,13 @@ impl Engine {
             let (url, progress) = {
                 let mut tasks = self.inner.tasks.lock().unwrap();
                 let Some(t) = tasks.get_mut(&id) else { continue };
+                // **只有仍处于 Queued 的才允许启动。** 取消/暂停发生在"排队期间"时，id 还留在
+                // 队列里；没有这道闸，pump 会把它重新拉起来 —— 用户明明点了取消，任务却自己
+                // 复活并开始下载。这正是 `cancel_cleans_resume_artifacts` 覆盖不到的那条路径
+                // （那个测试取消的是已经在下载的任务）。
+                if t.state != TaskState::Queued {
+                    continue;
+                }
                 t.cancel = CancellationToken::new();
                 (t.url.clone(), t.progress.clone())
             };
@@ -3946,12 +4027,18 @@ impl Engine {
 }
 ```
 
-注：以上为完整实现；`TaskEntry` 已派生 `Clone`，进度事件由 worker 内的 300ms 定时转发任务发出。执行时主要按编译器反馈核对 m3u8-rs 0.10 的字段名（`variants`/`segments`/`key`/`map`/`method`）。
+注：以上为完整实现；`TaskEntry` 已派生 `Clone`，进度事件由 worker 内的 300ms 定时转发任务发出。
+
+**关于 m3u8-rs（原文有误，已更正）：** 原注写"核对 m3u8-rs 0.10 的字段名"，两处都不对 ——
+本项目 pin 的是 **m3u8-rs 6.0.1**，而且**引擎根本不接触 m3u8-rs**：它只调用 `hls::parse::parse_playlist`
+和 `ParsedPlaylist`/`MediaInfo`/`VariantChoice`。这些类型在 Task 5 已实现并通过审查，形参和字段名
+（`VariantChoice.uri`、`ParsedPlaylist::{Master{variants}, Media(MediaInfo)}`）都是既成事实，直接照用。
+若此处出现编译错误，说明是计划写错了调用，而不是 m3u8-rs 版本问题 —— 报告它，不要去改 `hls/parse.rs`。
 
 - [ ] **Step 4: 运行确认通过**
 
 Run: `cargo test --test engine_test`
-Expected: 5 PASS
+Expected: 7 PASS
 
 - [ ] **Step 5: Commit**
 
