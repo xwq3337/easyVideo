@@ -40,7 +40,7 @@
 | GUI | egui / eframe | 即时模式，纯 Rust，跨平台 |
 | 异步运行时 | tokio | 下载并发基础设施 |
 | HTTP | reqwest（rustls-tls，stream） | 不用 OpenSSL，简化跨平台编译；自动走系统代理 |
-| m3u8 解析 | m3u8-rs | 支持 master / media playlist |
+| m3u8 解析 | m3u8-rs（6.x） | 支持 master / media playlist |
 | AES-128 解密 | aes + cbc crates | HLS 标准加密，纯 Rust |
 | ffmpeg | `include_bytes!` 内嵌静态二进制 | vendor 目录随仓库管理，见 §5.5 |
 | yt-dlp | 可选，检测 PATH | 子进程方式调用，不绑定 crate |

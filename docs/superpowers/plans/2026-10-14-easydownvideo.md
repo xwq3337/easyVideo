@@ -66,13 +66,13 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util
 tokio-util = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 futures-util = "0.3"
-m3u8-rs = "0.10"
+m3u8-rs = "6"
 aes = "0.8"
 cbc = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 directories = "5"
-tracing = "0.3"
+tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 url = "2"
@@ -1092,7 +1092,7 @@ fn parse_iv(hexstr: &str) -> Result<[u8; 16], HlsParseError> {
 }
 ```
 
-注：m3u8-rs 0.10 的字段名（如 `mp.variants`、`seg.map`、`seg.key`、`k.method` 为 String）若与实际 crate 有出入，以编译器提示为准微调。
+注（重要）：`m3u8-rs` 锁定 **6.x**（当前 6.0.1）。上面代码里的字段名（`mp.variants`、`seg.map`、`seg.key`、`k.method` 是否为 String、`resolution.width` 是否为 u32 等）是按记忆写的，**未必与 6.x 实际 API 一致**。实现时先读已解析的 crate 源码（`~/.cargo/registry/src/*/m3u8-rs-6.0.1/src/`）确认真实类型与字段名，再按其调整本文件。**不要为了迁就示例代码而降级 crate 版本。** 若 6.x 的 `key.method` 是枚举而非 String，`SAMPLE-AES` 的显式拒绝逻辑要相应改为匹配枚举变体。
 
 - [ ] **Step 5: 运行确认通过**
 
