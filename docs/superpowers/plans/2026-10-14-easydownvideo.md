@@ -1247,10 +1247,13 @@ pub fn resolve_url(base: &str, relative: &str) -> Option<String> {
 /// **实测确认（m3u8-rs 6.0.1）**：`Key::from_hashmap`（playlist.rs:979）的守卫写反了——
 /// 它在 `method == None && iv.is_none()` 时报错，而错误信息自述的语义是
 /// "IV is required unless METHOD is NONE"。结果是不带 IV 的 `METHOD=NONE` 整行被丢弃：
-/// ```
+/// ```text
 /// #EXT-X-KEY:METHOD=NONE            ->  seg.key = None, 且标签落入 seg.unknown_tags
-/// #EXT-X-KEY:METHOD=NONE,IV=0x00..  ->  seg.key = Some(Key{method: None})  ✓
+/// #EXT-X-KEY:METHOD=NONE,IV=0x00..  ->  seg.key = Some(Key{method: None})  成功
 /// ```
+/// 注意这个围栏必须标注语言（`text`）：裸 ``` 会被 rustdoc 当成 Rust doctest 去编译，
+/// 上面这些内容不是合法 Rust，`cargo test` 会连带 doctest 一起失败。
+///
 /// 被丢弃后我们既不知道"这里曾经有过一个 NONE"、也不知道它出现在哪个分片之前，于是
 /// `METHOD=NONE` 之后的分片会被错误地继续解密——又是一次静默产出乱码。
 ///
