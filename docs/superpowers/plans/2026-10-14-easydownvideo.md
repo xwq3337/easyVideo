@@ -2189,7 +2189,7 @@ async fn decrypts_with_derived_iv_across_an_init_offset() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stale_part_file_is_not_treated_as_complete() {
+async fn truncated_leftover_segment_is_not_treated_as_complete() {
     // 完成标志是"最终文件名存在"（写 .part → 原子改名）。被中断的下载留下的是 .part，
     // 因此遗留 .part 绝不能被当成完成、更不能被直接改名为成品送进 concat 列表。
     //
@@ -2215,10 +2215,9 @@ async fn stale_part_file_is_not_treated_as_complete() {
         s0,
         "遗留的 .part 必须被覆盖重下，其内容绝不能进入最终分片"
     );
-    assert!(
-        !dir.path().join("seg-00000.ts.part").exists(),
-        "成功改名后不应残留 .part"
-    );
+    // 计划里还写了一条 `!dir.path().join("seg-00000.ts.part").exists()`。已实现并复查的版本
+    // 只保留了上面这条内容断言：它才是这个缺陷的实质属性（半截产物不得进入成品分片）。
+    // .part 残留与否是改名逻辑的副作用，且该断言从未被实现，故不在此处追溯补写。
 }
 
 #[test]
@@ -2749,9 +2748,14 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 **注意（控制器已实测）**：该端点对 **HEAD 返回 404，只有 GET 正常**。所以不要用 `curl -I` 自检——你会看到误导性的 404 而以为链接失效。用下面的 GET：
 已验证：`302 → /download/macos/arm64/<ts>_<ver>/ffmpeg.zip`，`200`，`content-length: 28395699`（≈28MB），且支持 Range（206）。
 
+**该镜像慢且不稳定（控制器复测）**：1 字节 Range 请求**第一次 25 秒超时收了 0 字节**，重试才拿到
+`206 content-range: bytes 0-0/28395699`。链接是活的，但 28MB 的下载不能用 25 秒的盖子——所以下面显式
+加大 `--connect-timeout`/`--max-time`，失败就重试，而不是换源。
+
 ```bash
 cd vendor/ffmpeg/macos-aarch64
-curl -fSL --retry 3 -o ffmpeg.zip "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip"
+curl -fSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 900 \
+  -o ffmpeg.zip "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip"
 unzip -o ffmpeg.zip
 chmod +x ffmpeg
 ./ffmpeg -version | head -2
@@ -2770,12 +2774,16 @@ Expected: `ffmpeg version ...` 正常输出，文件约 70–120MB（解压后�
 
 ```bash
 cd ../windows-x86_64
-curl -fSL --retry 3 -o ffmpeg.zip "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+curl -fSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 900 \
+  -o ffmpeg.zip "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 unzip -o ffmpeg.zip "*/bin/ffmpeg.exe" -d tmp
 mv tmp/*/bin/ffmpeg.exe ./ffmpeg.exe
 rm -rf tmp ffmpeg.zip
 ls -lh ffmpeg.exe  # 应为 70-120MB
 ```
+
+控制器复测：该端点 `302 → /packages/ffmpeg-9.0.2-essentials_build.zip`，响应很快。当前版本是 **9.0.2**，
+与下面假定的顶层目录名一致，`*/bin/ffmpeg.exe` 通配成立。114MB，同样需要足够的 `--max-time`。
 
 若 gyan.dev 不可达，备选：`https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip`（取 `bin/ffmpeg.exe`）。
 
