@@ -3279,6 +3279,8 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 **Files:**
 - Create: `tests/engine_test.rs`
+- Create: `tests/fixtures/seg.ts`（真实 MPEG-TS 小分片，160x120 h264 1 秒约 10KB；
+  `tests/fixtures/` 下已有 Task 5 的 m3u8 fixture。生成命令见 Step 1 末尾）
 - Modify: `src/core/engine.rs`
 
 **Interfaces:**
@@ -3305,7 +3307,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ```rust
 use easydownvideo::core::engine::Engine;
-use easydownvideo::core::events::{EngineEvent, TaskState};
+use easydownvideo::core::events::{Choice, EngineEvent, TaskState};
 use easydownvideo::core::task::{ManifestKind, TaskManifest};
 use easydownvideo::settings::Settings;
 use wiremock::{matchers::{header, method, path}, Mock, MockServer, ResponseTemplate};
@@ -3606,11 +3608,149 @@ async fn retry_requeues_a_failed_task() {
     engine.retry(id);
     wait_failed(&mut rx, id, 30).await; // 重试后第二次失败 —— 证明它真的重跑了
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_queued_resumed_task_removes_its_manifest() {
+    // `resume()` 会**立刻**把 manifest 写盘（insert_entry 的 eager write）。若这个任务因为并发
+    // 槽位已满一直排队（max_active=0），就没有任何 worker 会跑收尾清理 —— 清理原先只写在
+    // worker 的错误路径里。cancel 自己不删目录的话，manifest 留在盘上，下次启动就被复活。
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let mut s = settings_with(dir.path());
+    s.max_active_tasks = 0;
+    let engine = Engine::new(rt, s, dir.path().join("data"));
+
+    let id = 5u64;
+    engine.resume(TaskManifest {
+        id,
+        url: "https://example.com/a.mp4".into(),
+        filename: "a.mp4".into(),
+        download_dir: dir.path().to_path_buf(),
+        kind: ManifestKind::Direct { size: Some(10) },
+    });
+    // **前提断言**：manifest 确实已经落盘。没有这一条，下面的断言可能因为"压根没写过"而假通过。
+    assert_eq!(
+        easydownvideo::core::task::scan_resume(dir.path()).len(),
+        1,
+        "resume 应当立刻写盘；否则这个测试不成立"
+    );
+
+    engine.cancel(id);
+
+    assert!(
+        easydownvideo::core::task::scan_resume(dir.path()).is_empty(),
+        "取消排队中的恢复任务后 manifest 仍在盘上，下次启动会被 scan_resume 复活"
+    );
+    assert!(!easydownvideo::core::task::task_dir(dir.path(), id).exists());
+}
+
+/// 引擎的 HLS 接线（playlist → 分片 → ffmpeg 合并 → Done → 清目录）此前**完全没有测试**，
+/// 只做到"能编译"。假 `.ts` 字节不行：ffmpeg 的 concat 解复用器会拒绝非法 TS，合并直接失败。
+/// 所以用 `tests/fixtures/seg.ts` —— 一个真实的小分片（160x120 h264，1 秒，约 10KB）。
+fn ts_fixture() -> Vec<u8> {
+    std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/seg.ts"))
+        .expect("缺少 tests/fixtures/seg.ts")
+}
+
+const MEDIA_PLAYLIST: &str = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n\
+#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\nseg0.ts\n#EXTINF:1.0,\nseg1.ts\n#EXT-X-ENDLIST\n";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hls_media_playlist_end_to_end() {
+    let ts = ts_fixture();
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/media.m3u8"))
+        .respond_with(ResponseTemplate::new(200)
+            .insert_header("content-type", "application/vnd.apple.mpegurl")
+            .set_body_string(MEDIA_PLAYLIST))
+        .mount(&server).await;
+    for seg in ["/seg0.ts", "/seg1.ts"] {
+        Mock::given(method("GET")).and(path(seg))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("content-type", "video/mp2t")
+                .set_body_bytes(ts.clone()))
+            .mount(&server).await;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let engine = Engine::new(rt, settings_with(dir.path()), dir.path().join("data"));
+    let mut rx = engine.events();
+    let id = engine.add_url(format!("{}/media.m3u8", server.uri()));
+
+    // 合并要跑真实 ffmpeg（首次会把内嵌二进制释放到 data_dir），给足时间
+    wait_state(&mut rx, id, TaskState::Done, 120).await;
+
+    let out = dir.path().join("media.mp4");
+    let meta = std::fs::metadata(&out)
+        .unwrap_or_else(|e| panic!("合并产物 {} 应当存在: {e}", out.display()));
+    assert!(meta.len() > 0, "合并产物不应为空");
+    assert!(
+        !easydownvideo::core::task::task_dir(dir.path(), id).exists(),
+        "完成后任务目录（manifest/分片/concat 列表）必须清掉，否则会被 scan_resume 复活"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hls_master_playlist_offers_choice_then_completes() {
+    // 真实世界的 m3u8 大多是 master playlist：先停在 AwaitingChoice 等用户选码率，
+    // 再经 set_choice 换 URL 重新入队。这条接线（含 set_choice）同样没有测试。
+    let ts = ts_fixture();
+    let server = MockServer::start().await;
+    let master = "#EXTM3U\n#EXT-X-VERSION:3\n\
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=160x120\nmedia.m3u8\n";
+    let media = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n\
+#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\nseg0.ts\n#EXT-X-ENDLIST\n";
+    Mock::given(method("GET")).and(path("/master.m3u8"))
+        .respond_with(ResponseTemplate::new(200)
+            .insert_header("content-type", "application/vnd.apple.mpegurl")
+            .set_body_string(master))
+        .mount(&server).await;
+    Mock::given(method("GET")).and(path("/media.m3u8"))
+        .respond_with(ResponseTemplate::new(200)
+            .insert_header("content-type", "application/vnd.apple.mpegurl")
+            .set_body_string(media))
+        .mount(&server).await;
+    Mock::given(method("GET")).and(path("/seg0.ts"))
+        .respond_with(ResponseTemplate::new(200)
+            .insert_header("content-type", "video/mp2t")
+            .set_body_bytes(ts.clone()))
+        .mount(&server).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let engine = Engine::new(rt, settings_with(dir.path()), dir.path().join("data"));
+    let mut rx = engine.events();
+    let id = engine.add_url(format!("{}/master.m3u8", server.uri()));
+
+    // 先停在等待选择
+    wait_state(&mut rx, id, TaskState::AwaitingChoice, 30).await;
+    // 选 0 号（唯一的）码率 —— 这一步走 set_choice 的重新入队
+    engine.set_choice(id, Choice::Variant(0));
+    wait_state(&mut rx, id, TaskState::Done, 120).await;
+
+    assert!(
+        dir.path().join("master.mp4").exists(),
+        "选择码率后应当合并出 master.mp4"
+    );
+}
 ```
 
 注（原文有误，已更正）：`failure_does_not_block_queue` 里 good 任务的双 range mock **已经在上面写好了**（文件 512 字节，`content-range: bytes 0-511/512`），不需要另行补齐；原文说"执行时补齐、大小取 2048"，与该测试实际内容矛盾，是残留草稿。
 
 **mock 必须显式匹配，不要依赖"漏网落到兜底 mock"。** wiremock 只按你声明的 matcher 匹配；某个 range 请求若没被任何 mock 命中会 404，任务就失败在 probe 上。若实测发现某个 range 请求与预期不符，**报告实际发出的 range 值**再调整 mock —— 不要放宽断言或改成"任何请求都返回全量"来让它变绿。
+
+**`tests/fixtures/seg.ts` 的生成命令**（控制器已用 vendor 的 ffmpeg 生成并入库，正常无需重跑；
+只有在缺少该文件时才需要）：
+
+```bash
+./vendor/ffmpeg/macos-aarch64/ffmpeg -hide_banner -loglevel error \
+  -f lavfi -i testsrc=duration=1:size=160x120:rate=10 \
+  -c:v libx264 -pix_fmt yuv420p -f mpegts tests/fixtures/seg.ts -y
+```
+
+实测产物 10.1KB、h264 High 160x120 10fps、时长 1 秒 —— 既能被 ffmpeg 正常 concat + `-c copy` 进 mp4，
+又小到可以入库。
 
 - [ ] **Step 2: 运行确认失败**
 
@@ -3833,9 +3973,26 @@ impl Engine {
 
     pub fn cancel(&self, id: TaskId) {
         let entry = { self.inner.tasks.lock().unwrap().get(&id).cloned() };
-        if let Some(e) = entry {
-            e.cancel.cancel();
-            self.set_state(id, TaskState::Canceled);
+        let Some(e) = entry else { return };
+        e.cancel.cancel();
+        // 是否有 worker 正在跑这个任务？只有 `run_task` 还在途中的三个状态才算。
+        // `AwaitingChoice` **不算** —— 那时 `run_task` 已经返回 Ok，不会再有收尾逻辑执行。
+        let worker_running = matches!(
+            e.state,
+            TaskState::Probing | TaskState::Downloading | TaskState::Merging
+        );
+        self.set_state(id, TaskState::Canceled);
+        // **没有 worker 就必须在这里自己清目录。**
+        //
+        // 清理原先只写在 worker 的错误收尾路径里，于是"没有 worker 的任务"被取消后，
+        // manifest 会留在盘上，下次启动 scan_resume 把它复活并重新下载 —— 正是全局约束
+        // 明令禁止的那件事。最容易踩到的就是 `resume()` 恢复出来的任务：它在 insert_entry
+        // 里**立刻**写盘，若因为并发槽位已满而一直排队，用户取消时压根没有任何 worker 见过它。
+        // （`cancel_while_queued_is_not_resurrected` 覆盖不到这一条：它取消的任务来自
+        //   `add_url`，manifest 是 None，盘上本来就没有东西可泄漏。）
+        if !worker_running {
+            let root = self.current_settings().download_dir;
+            std::fs::remove_dir_all(task_dir(&root, id)).ok();
         }
     }
 
@@ -3898,29 +4055,39 @@ impl Engine {
     fn pump(&self) {
         let settings = self.inner.settings.lock().unwrap().clone();
         loop {
-            let active = {
-                let tasks = self.inner.tasks.lock().unwrap();
-                tasks.values().filter(|t| t.is_active()).count()
-            };
-            if active >= settings.max_active_tasks {
-                return;
-            }
-            let next = { self.inner.queue.lock().unwrap().pop_front() };
-            let Some(id) = next else { return };
-            let (url, progress) = {
+            // **"读活跃数 → 判定上限 → 把 Queued 置为 Probing"必须在同一个锁里完成。**
+            // 拆成两个锁会有两个真实后果：
+            //  a) 两个线程同时 pump（worker 在 runtime 线程上收尾，GUI 同时在 add_url /
+            //     update_settings）会同时读到 active = max-1，于是都启动任务，**超出并发上限**；
+            //  b) 在释放锁到置 Probing 之间，cancel() 可以把任务置成 Canceled，随后又被
+            //     Probing 覆盖 —— 刚被取消的任务原地复活，并且因为 token 已被换掉，
+            //     收尾路径看到的不是 Canceled 而是 Failed，于是 manifest 目录也留下不走。
+            // 这里是全局唯一一处 tasks 与 queue 的嵌套取锁，顺序固定 tasks → queue，不会反向。
+            let started = {
                 let mut tasks = self.inner.tasks.lock().unwrap();
-                let Some(t) = tasks.get_mut(&id) else { continue };
-                // **只有仍处于 Queued 的才允许启动。** 取消/暂停发生在"排队期间"时，id 还留在
-                // 队列里；没有这道闸，pump 会把它重新拉起来 —— 用户明明点了取消，任务却自己
-                // 复活并开始下载。这正是 `cancel_cleans_resume_artifacts` 覆盖不到的那条路径
-                // （那个测试取消的是已经在下载的任务）。
-                if t.state != TaskState::Queued {
-                    continue;
+                let active = tasks.values().filter(|t| t.is_active()).count();
+                if active >= settings.max_active_tasks {
+                    return;
                 }
-                t.cancel = CancellationToken::new();
-                (t.url.clone(), t.progress.clone())
+                let next = { self.inner.queue.lock().unwrap().pop_front() };
+                let Some(id) = next else { return };
+                match tasks.get_mut(&id) {
+                    // **只有仍处于 Queued 的才允许启动。** 取消/暂停发生在"排队期间"时，id 还留在
+                    // 队列里；没有这道闸，pump 会把它重新拉起来 —— 用户明明点了取消，任务却自己复活。
+                    Some(t) if t.state == TaskState::Queued => {
+                        t.cancel = CancellationToken::new();
+                        t.state = TaskState::Probing; // 与上面的判定同锁，关掉 (b) 的窗口
+                        Some((id, t.url.clone(), t.progress.clone()))
+                    }
+                    _ => None,
+                }
             };
-            self.set_state(id, TaskState::Probing);
+            let Some((id, url, progress)) = started else { continue };
+            // 状态事件在锁外发。这里**不调 set_state**：它会再次进入 pump，把这条路径变成递归。
+            let _ = self
+                .inner
+                .tx
+                .send(EngineEvent::StateChanged { id, state: TaskState::Probing });
             let engine = self.clone();
             let tx = self.inner.tx.clone();
             self.inner.rt.spawn(async move {
@@ -4123,7 +4290,7 @@ impl Engine {
 - [ ] **Step 4: 运行确认通过**
 
 Run: `cargo test --test engine_test`
-Expected: 8 PASS
+Expected: 11 PASS
 
 - [ ] **Step 5: Commit**
 
