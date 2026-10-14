@@ -972,7 +972,9 @@ s2.m4s
 `tests/hls_parse_test.rs`：
 
 ```rust
-use easydownvideo::core::hls::parse::{parse_playlist, resolve_url, ParsedPlaylist};
+use easydownvideo::core::hls::parse::{
+    parse_playlist, patch_iv_less_method_none, resolve_url, ParsedPlaylist,
+};
 
 fn fixture(name: &str) -> String {
     std::fs::read_to_string(format!("{}/tests/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name)).unwrap()
@@ -1057,7 +1059,9 @@ fn new_key_replaces_previous_for_later_segments() {
 
 #[test]
 fn method_none_clears_the_key_for_later_segments() {
-    // METHOD=NONE 表示"自此不再加密"，不能被当成"沿用上一个 key"
+    // METHOD=NONE 表示"自此不再加密"，不能被当成"沿用上一个 key"。
+    // 这条 playlist 的 NONE 行不带 IV —— 实测 m3u8-rs 会把不带 IV 的 METHOD=NONE
+    // 整行丢弃（其守卫写反），所以才需要 patch_iv_less_method_none 先补占位 IV。
     let content = b"#EXTM3U\n#EXT-X-VERSION:3\n\
 #EXT-X-KEY:METHOD=AES-128,URI=\"https://k/x\"\n#EXTINF:9.9,\na.ts\n\
 #EXT-X-KEY:METHOD=NONE\n#EXTINF:9.9,\nb.ts\n#EXT-X-ENDLIST\n";
@@ -1068,6 +1072,33 @@ fn method_none_clears_the_key_for_later_segments() {
         }
         _ => panic!("expected Media"),
     }
+}
+
+#[test]
+fn patch_leaves_normal_encrypted_playlists_untouched() {
+    // 改写只允许命中"含 METHOD=NONE 且不含 IV=" 的 KEY 行。
+    // 真实加密播放列表的 KEY 行不该被碰：给 AES-128 行补个 IV 会误导解密。
+    let content = b"#EXTM3U\n#EXT-X-VERSION:3\n\
+#EXT-X-KEY:METHOD=AES-128,URI=\"https://k/x\",IV=0x00000000000000000000000000000007\n\
+#EXTINF:9.9,\na.ts\n#EXT-X-ENDLIST\n";
+    let patched = String::from_utf8(patch_iv_less_method_none(content)).unwrap();
+    assert_eq!(patched, String::from_utf8_lossy(content), "正常的 AES KEY 行不应被改写");
+
+    // 不带 IV 的 AES KEY 行同样不该被改写（它本来就能被 m3u8-rs 正常解析）
+    let aes_no_iv = b"#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"https://k/x\"\n#EXTINF:9.9,\na.ts\n";
+    let p2 = String::from_utf8(patch_iv_less_method_none(aes_no_iv)).unwrap();
+    assert_eq!(p2, String::from_utf8_lossy(aes_no_iv), "AES 缺 IV 的行不应被加 IV");
+
+    // 带 IV 的 METHOD=NONE 已是合法行，不该被重复追加
+    let none_with_iv =
+        b"#EXTM3U\n#EXT-X-KEY:METHOD=NONE,IV=0x00000000000000000000000000000000\n#EXTINF:1,\na.ts\n";
+    let p3 = String::from_utf8(patch_iv_less_method_none(none_with_iv)).unwrap();
+    assert_eq!(p3, String::from_utf8_lossy(none_with_iv));
+
+    // 保留末行无换行符的形态
+    let no_trailing_nl = b"#EXTM3U\n#EXT-X-KEY:METHOD=NONE\nseg.ts";
+    let p4 = String::from_utf8(patch_iv_less_method_none(no_trailing_nl)).unwrap();
+    assert_eq!(p4, "#EXTM3U\n#EXT-X-KEY:METHOD=NONE,IV=0x00000000000000000000000000000000\nseg.ts");
 }
 
 #[test]
@@ -1211,8 +1242,52 @@ pub fn resolve_url(base: &str, relative: &str) -> Option<String> {
     base_url.join(relative).ok().map(|u| u.to_string())
 }
 
+/// 给不带 IV 的 `#EXT-X-KEY:METHOD=NONE` 补一个占位 IV，仅用于越过 m3u8-rs 的一处缺陷。
+///
+/// **实测确认（m3u8-rs 6.0.1）**：`Key::from_hashmap`（playlist.rs:979）的守卫写反了——
+/// 它在 `method == None && iv.is_none()` 时报错，而错误信息自述的语义是
+/// "IV is required unless METHOD is NONE"。结果是不带 IV 的 `METHOD=NONE` 整行被丢弃：
+/// ```
+/// #EXT-X-KEY:METHOD=NONE            ->  seg.key = None, 且标签落入 seg.unknown_tags
+/// #EXT-X-KEY:METHOD=NONE,IV=0x00..  ->  seg.key = Some(Key{method: None})  ✓
+/// ```
+/// 被丢弃后我们既不知道"这里曾经有过一个 NONE"、也不知道它出现在哪个分片之前，于是
+/// `METHOD=NONE` 之后的分片会被错误地继续解密——又是一次静默产出乱码。
+///
+/// 之所以敢直接改文本：占位 IV 对我们是**可证无用**的——`parse_key` 对
+/// `KeyMethod::None` 立刻返回 `None`，从不读 iv；URI 等其余属性也不受影响。
+/// 且该改写只命中"含 METHOD=NONE 且不含 IV=" 的 `#EXT-X-KEY:` 行：真实加密播放列表的
+/// KEY 行是 `METHOD=AES-128,...,IV=0x..`，一次都不会被碰到（空转）。
+///
+/// 设为 `pub` 仅为让集成测试能直接验证"改写范围足够窄"这一性质。
+pub fn patch_iv_less_method_none(content: &[u8]) -> Vec<u8> {
+    // 只按行处理；非 UTF-8 内容原样返回（m3u8 是文本格式，实际不会走到）
+    let Ok(text) = std::str::from_utf8(content) else {
+        return content.to_vec();
+    };
+    let mut out = String::with_capacity(text.len() + 64);
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\n', '\r']);
+        let needs = body.starts_with("#EXT-X-KEY:")
+            && body.contains("METHOD=NONE")
+            && !body.contains("IV=");
+        if needs {
+            out.push_str(body);
+            out.push_str(",IV=0x00000000000000000000000000000000");
+            // 保留原行的换行（如果有）
+            if line.len() > body.len() {
+                out.push_str(&line[body.len()..]);
+            }
+        } else {
+            out.push_str(line);
+        }
+    }
+    out.into_bytes()
+}
+
 pub fn parse_playlist(base_url: &str, content: &[u8]) -> Result<ParsedPlaylist, HlsParseError> {
-    let playlist = m3u8_rs::parse_playlist_res(content)
+    let patched = patch_iv_less_method_none(content);
+    let playlist = m3u8_rs::parse_playlist_res(&patched)
         .map_err(|e| HlsParseError::Parse(format!("{e:?}")))?;
     match playlist {
         m3u8_rs::Playlist::MasterPlaylist(mp) => {
@@ -1347,7 +1422,7 @@ fn parse_iv(hexstr: &str) -> Result<[u8; 16], HlsParseError> {
 - [ ] **Step 5: 运行确认通过**
 
 Run: `cargo test --test hls_parse_test`
-Expected: 11 PASS
+Expected: 12 PASS
 
 - [ ] **Step 6: Commit**
 
