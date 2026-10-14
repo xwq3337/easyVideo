@@ -1536,7 +1536,7 @@ Expected: FAIL（函数未实现）
 `src/core/hls/crypto.rs`：
 
 ```rust
-use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
+use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use thiserror::Error;
 
 type Aes128CbcDecrypt = cbc::Decryptor<aes::Aes128>;
@@ -1557,17 +1557,22 @@ pub fn decrypt_aes128(
     if data.len() % 16 != 0 || data.is_empty() {
         return Err(HlsCryptoError::InvalidLength(data.len()));
     }
+    // 用原地解密 API 而非 `decrypt_padded_vec_mut`：后者需要 cipher 的 `alloc` feature，
+    // 而当前解析到的 cipher v0.4.4 未启用该 feature（启用它等于改依赖）。
+    let mut buf = data.to_vec();
     let decryptor = Aes128CbcDecrypt::new(key.into(), iv.into());
-    match decryptor.decrypt_padded_vec_mut::<Pkcs7>(data) {
-        Ok(pt) => Ok(pt),
-        Err(_) => {
-            // 非标准填充：按无填充解密，原样保留全部字节（TS 播放器可容忍尾部无填充）
-            let decryptor = Aes128CbcDecrypt::new(key.into(), iv.into());
-            decryptor
-                .decrypt_padded_vec_mut::<aes::cipher::block_padding::NoPadding>(data)
-                .map_err(|e| HlsCryptoError::Decrypt(format!("{e:?}")))
-        }
+    if let Ok(pt) = decryptor.decrypt_padded_mut::<Pkcs7>(&mut buf) {
+        return Ok(pt.to_vec());
     }
+    // 关键：`decrypt_padded_mut` 原地解密，去填充失败时 buf 已经被改写成明文。
+    // 不还原就重试等于把明文再解密一次，产出稳定的错误数据（且不报错）。
+    buf.copy_from_slice(data);
+    // 非标准填充：按无填充解密，原样保留全部字节（TS 播放器可容忍尾部无填充）
+    let decryptor = Aes128CbcDecrypt::new(key.into(), iv.into());
+    let pt = decryptor
+        .decrypt_padded_mut::<aes::cipher::block_padding::NoPadding>(&mut buf)
+        .map_err(|e| HlsCryptoError::Decrypt(format!("{e:?}")))?;
+    Ok(pt.to_vec())
 }
 ```
 
