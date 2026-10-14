@@ -2690,6 +2690,15 @@ pub fn build_remux(
     // 也就是说显式加它会让所有非 AAC 音频（AC-3/E-AC-3/MP3/Opus）的 HLS 流下载后合并失败，
     // 而不加则两种都正常。让 ffmpeg 自己决定。
     cmd.arg(output);
+    // 用户取消任务时，`remux_to_mp4` 的 future 会被 drop，而 `cmd.output()` 内部持有的 Child
+    // 一并被 drop。**必须开 `kill_on_drop`**：否则 ffmpeg 子进程会变成孤儿继续跑，而引擎在取消路径上
+    // 会清掉任务目录（"取消是不要了"），于是孤儿进程还在往一个已被删除的目录里写。
+    // 设置在 `build_remux` 而不是调用点：Task 13 调的是高层 `remux_to_mp4`，拿不到 Command，
+    // 没有别的地方能设置它 —— 这是唯一正确的归属点。
+    //
+    // 故意不写测试：`tokio::process::Command` 没有读取该标志的 getter，无法断言。
+    // 这是有据可查的"未测试"而非"忘了测"。
+    cmd.kill_on_drop(true);
     cmd
 }
 
