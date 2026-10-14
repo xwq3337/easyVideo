@@ -15,20 +15,41 @@ pub enum ProbeOutcome {
     WebPage,
 }
 
-fn filename_from_url(url: &str) -> String {
-    let parsed = url::Url::parse(url).ok();
-    let last = parsed
+/// 从 URL 提取下载文件名。这是本项目内该逻辑的唯一实现:
+/// engine(Task 13 的 `add_url`)与 GUI(Task 14 的 `add_task`)都调用本函数,
+/// 不要各自复制一份。
+pub fn filename_from_url(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
         .as_ref()
         .and_then(|u| u.path_segments())
         .and_then(|mut segs| segs.next_back())
-        .map(|s| s.trim().to_string())
+        .map(|s| percent_decode(s).trim().to_string())
         .filter(|s| !s.is_empty() && s.contains('.'))
-        .unwrap_or_else(|| "video.mp4".to_string());
-    if last.contains('.') {
-        last
-    } else {
-        format!("{last}.mp4")
+        .unwrap_or_else(|| "video.mp4".to_string())
+}
+
+/// 将 `%XX` 十六进制转义还原为字节,其余字符原样通过。
+/// 非法转义(如 `%ZZ`、结尾被截断的 `%A`)原样保留,不报错也不 panic。
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
     }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 pub async fn probe(client: &reqwest::Client, url: &str) -> anyhow::Result<ProbeOutcome> {

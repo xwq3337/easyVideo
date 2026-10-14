@@ -106,3 +106,21 @@ async fn url_without_filename_uses_default() {
         other => panic!("expected Direct, got {:?}", other),
     }
 }
+
+#[test]
+fn filename_from_url_decodes_and_falls_back() {
+    use easydownvideo::core::probe::filename_from_url;
+    // 百分号解码:URL 里带空格的文件名很常见
+    assert_eq!(filename_from_url("https://host/a/My%20Video.mp4"), "My Video.mp4");
+    // 查询串不参与文件名
+    assert_eq!(filename_from_url("https://host/a/video.mp4?token=abc"), "video.mp4");
+    // 无可用文件名 → 回退
+    assert_eq!(filename_from_url("https://host/download?id=123"), "video.mp4");
+    assert_eq!(filename_from_url("https://host/video"), "video.mp4");
+    assert_eq!(filename_from_url("https://host/"), "video.mp4");
+    assert_eq!(filename_from_url("not a url"), "video.mp4");
+    // 非法转义原样保留,不 panic
+    assert_eq!(filename_from_url("https://h/a%ZZb.mp4"), "a%ZZb.mp4");
+    // 大写扩展名保留原样
+    assert_eq!(filename_from_url("https://h/VIDEO.MP4"), "VIDEO.MP4");
+}
