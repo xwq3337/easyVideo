@@ -1326,11 +1326,10 @@ pub fn decrypt_aes128(
     match decryptor.decrypt_padded_vec_mut::<Pkcs7>(data) {
         Ok(pt) => Ok(pt),
         Err(_) => {
-            // 非标准填充：按无填充解密，保留尾部字节（TS 播放器可容忍）
+            // 非标准填充：按无填充解密，原样保留全部字节（TS 播放器可容忍尾部无填充）
             let decryptor = Aes128CbcDecrypt::new(key.into(), iv.into());
-            let mut buf = data.to_vec();
             decryptor
-                .decrypt_padded_vec_mut::<aes::cipher::block_padding::NoPadding>(&mut buf[..])
+                .decrypt_padded_vec_mut::<aes::cipher::block_padding::NoPadding>(data)
                 .map_err(|e| HlsCryptoError::Decrypt(format!("{e:?}")))
         }
     }
