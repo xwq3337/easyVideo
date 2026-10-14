@@ -184,9 +184,26 @@ impl Engine {
 
     pub fn cancel(&self, id: TaskId) {
         let entry = { self.inner.tasks.lock().unwrap().get(&id).cloned() };
-        if let Some(e) = entry {
-            e.cancel.cancel();
-            self.set_state(id, TaskState::Canceled);
+        let Some(e) = entry else { return };
+        e.cancel.cancel();
+        // 是否有 worker 正在跑这个任务？只有 `run_task` 还在途中的三个状态才算。
+        // `AwaitingChoice` **不算** —— 那时 `run_task` 已经返回 Ok，不会再有收尾逻辑执行。
+        let worker_running = matches!(
+            e.state,
+            TaskState::Probing | TaskState::Downloading | TaskState::Merging
+        );
+        self.set_state(id, TaskState::Canceled);
+        // **没有 worker 就必须在这里自己清目录。**
+        //
+        // 清理原先只写在 worker 的错误收尾路径里，于是"没有 worker 的任务"被取消后，
+        // manifest 会留在盘上，下次启动 scan_resume 把它复活并重新下载 —— 正是全局约束
+        // 明令禁止的那件事。最容易踩到的就是 `resume()` 恢复出来的任务：它在 insert_entry
+        // 里**立刻**写盘，若因为并发槽位已满而一直排队，用户取消时压根没有任何 worker 见过它。
+        // （`cancel_while_queued_is_not_resurrected` 覆盖不到这一条：它取消的任务来自
+        //   `add_url`，manifest 是 None，盘上本来就没有东西可泄漏。）
+        if !worker_running {
+            let root = self.current_settings().download_dir;
+            std::fs::remove_dir_all(task_dir(&root, id)).ok();
         }
     }
 
@@ -300,29 +317,39 @@ impl Engine {
     fn pump(&self) {
         let settings = self.inner.settings.lock().unwrap().clone();
         loop {
-            let active = {
-                let tasks = self.inner.tasks.lock().unwrap();
-                tasks.values().filter(|t| t.is_active()).count()
-            };
-            if active >= settings.max_active_tasks {
-                return;
-            }
-            let next = { self.inner.queue.lock().unwrap().pop_front() };
-            let Some(id) = next else { return };
-            let (url, progress) = {
+            // **"读活跃数 → 判定上限 → 把 Queued 置为 Probing"必须在同一个锁里完成。**
+            // 拆成两个锁会有两个真实后果：
+            //  a) 两个线程同时 pump（worker 在 runtime 线程上收尾，GUI 同时在 add_url /
+            //     update_settings）会同时读到 active = max-1，于是都启动任务，**超出并发上限**；
+            //  b) 在释放锁到置 Probing 之间，cancel() 可以把任务置成 Canceled，随后又被
+            //     Probing 覆盖 —— 刚被取消的任务原地复活，并且因为 token 已被换掉，
+            //     收尾路径看到的不是 Canceled 而是 Failed，于是 manifest 目录也留下不走。
+            // 这里是全局唯一一处 tasks 与 queue 的嵌套取锁，顺序固定 tasks → queue，不会反向。
+            let started = {
                 let mut tasks = self.inner.tasks.lock().unwrap();
-                let Some(t) = tasks.get_mut(&id) else { continue };
-                // **只有仍处于 Queued 的才允许启动。** 取消/暂停发生在"排队期间"时，id 还留在
-                // 队列里；没有这道闸，pump 会把它重新拉起来 —— 用户明明点了取消，任务却自己
-                // 复活并开始下载。这正是 `cancel_cleans_resume_artifacts` 覆盖不到的那条路径
-                // （那个测试取消的是已经在下载的任务）。
-                if t.state != TaskState::Queued {
-                    continue;
+                let active = tasks.values().filter(|t| t.is_active()).count();
+                if active >= settings.max_active_tasks {
+                    return;
                 }
-                t.cancel = CancellationToken::new();
-                (t.url.clone(), t.progress.clone())
+                let next = { self.inner.queue.lock().unwrap().pop_front() };
+                let Some(id) = next else { return };
+                match tasks.get_mut(&id) {
+                    // **只有仍处于 Queued 的才允许启动。** 取消/暂停发生在"排队期间"时，id 还留在
+                    // 队列里；没有这道闸，pump 会把它重新拉起来 —— 用户明明点了取消，任务却自己复活。
+                    Some(t) if t.state == TaskState::Queued => {
+                        t.cancel = CancellationToken::new();
+                        t.state = TaskState::Probing; // 与上面的判定同锁，关掉 (b) 的窗口
+                        Some((id, t.url.clone(), t.progress.clone()))
+                    }
+                    _ => None,
+                }
             };
-            self.set_state(id, TaskState::Probing);
+            let Some((id, url, progress)) = started else { continue };
+            // 状态事件在锁外发。这里**不调 set_state**：它会再次进入 pump，把这条路径变成递归。
+            let _ = self
+                .inner
+                .tx
+                .send(EngineEvent::StateChanged { id, state: TaskState::Probing });
             let engine = self.clone();
             let tx = self.inner.tx.clone();
             self.inner.rt.spawn(async move {
