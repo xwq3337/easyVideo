@@ -329,7 +329,7 @@ fn main() -> eframe::Result<()> {
 - [ ] **Step 4: 运行确认通过**
 
 Run: `cargo test --test settings_test`
-Expected: 3 PASS
+Expected: 4 PASS
 
 - [ ] **Step 5: Commit**
 
