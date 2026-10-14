@@ -369,7 +369,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
   - `pub enum Choice { Variant(usize), YtdlpFormat(usize) }`
   - `pub struct ProgressHandle`：`new()`、`add(u64)`、`set_total(u64)`、`set_unit(ProgressUnit)`、`unit() -> ProgressUnit`、`snapshot() -> (u64, u64)`、`reset()`
   - `pub enum ProgressUnit { Bytes, Segments }`（HLS 任务按分片计数，GUI 据此决定格式化方式）
-  - `pub struct VariantChoice { pub uri: String, pub bandwidth: u32, pub resolution: Option<(u32, u32)> }`
+  - `pub struct VariantChoice { pub uri: String, pub bandwidth: u64, pub resolution: Option<(u64, u64)> }`
   - `pub struct YtdlpFormat { pub id: String, pub ext: String, pub note: String, pub filesize: Option<u64>, pub url: String }`
 
 - [ ] **Step 1: 写失败测试**
@@ -523,8 +523,8 @@ impl ProgressHandle {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VariantChoice {
     pub uri: String,
-    pub bandwidth: u32,
-    pub resolution: Option<(u32, u32)>,
+    pub bandwidth: u64,
+    pub resolution: Option<(u64, u64)>,
 }
 ```
 
@@ -914,7 +914,9 @@ fn parses_media_with_aes_key() {
             assert_eq!(m.segments.len(), 2);
             let key = m.segments[0].key.as_ref().unwrap();
             assert_eq!(key.uri, "https://keys.example.com/k.bin");
-            assert_eq!(key.iv, Some([0u8; 15].into_iter().chain([5u8]).collect::<Vec<u8>>().try_into().unwrap()));
+            let mut expected_iv = [0u8; 16];
+            expected_iv[15] = 5; // IV=0x...0005
+            assert_eq!(key.iv, Some(expected_iv));
             assert!(!m.segments[0].is_init);
         }
         _ => panic!("expected Media"),
@@ -968,8 +970,8 @@ use thiserror::Error;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VariantChoice {
     pub uri: String,
-    pub bandwidth: u32,
-    pub resolution: Option<(u32, u32)>,
+    pub bandwidth: u64,
+    pub resolution: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1016,7 +1018,7 @@ pub fn parse_playlist(base_url: &str, content: &[u8]) -> Result<ParsedPlaylist, 
     let playlist = m3u8_rs::parse_playlist_res(content)
         .map_err(|e| HlsParseError::Parse(format!("{e:?}")))?;
     match playlist {
-        m3u8_rs::Playlist::Master(mp) => {
+        m3u8_rs::Playlist::MasterPlaylist(mp) => {
             let variants = mp
                 .variants
                 .into_iter()
@@ -1028,9 +1030,11 @@ pub fn parse_playlist(base_url: &str, content: &[u8]) -> Result<ParsedPlaylist, 
                 .collect();
             Ok(ParsedPlaylist::Master { variants })
         }
-        m3u8_rs::Playlist::Media(mp) => {
+        m3u8_rs::Playlist::MediaPlaylist(mp) => {
             let media_sequence = mp.media_sequence;
             let is_fmp4 = mp.segments.iter().any(|s| s.map.is_some());
+            // m3u8-rs 的 MediaPlaylist 没有节目级 title 字段；最接近的是首个分片 EXTINF 的 title
+            let title = mp.segments.first().and_then(|s| s.title.clone());
             let mut segments: Vec<SegmentRef> = Vec::new();
             if let Some(map) = mp.segments.iter().find_map(|s| s.map.clone()) {
                 segments.push(SegmentRef {
@@ -1041,25 +1045,28 @@ pub fn parse_playlist(base_url: &str, content: &[u8]) -> Result<ParsedPlaylist, 
             }
             for seg in mp.segments.into_iter() {
                 let key = match seg.key {
-                    Some(k) => {
-                        if k.method == "NONE" {
-                            None
-                        } else if k.method == "AES-128" {
+                    Some(k) => match k.method {
+                        m3u8_rs::KeyMethod::None => None,
+                        m3u8_rs::KeyMethod::AES128 => {
                             let uri = k.uri.ok_or_else(|| {
                                 HlsParseError::Parse("AES-128 key missing URI".into())
                             })?;
-                            let iv = match k.iv {
-                                Some(hexstr) => Some(parse_iv(&hexstr)?),
+                            let iv = match &k.iv {
+                                Some(hexstr) => Some(parse_iv(hexstr)?),
                                 None => None,
                             };
                             Some(KeyRef {
                                 uri: resolve_url(base_url, &uri).unwrap_or(uri),
                                 iv,
                             })
-                        } else {
-                            return Err(HlsParseError::UnsupportedKeyMethod(k.method));
                         }
-                    }
+                        m3u8_rs::KeyMethod::SampleAES => {
+                            return Err(HlsParseError::UnsupportedKeyMethod("SAMPLE-AES".into()))
+                        }
+                        m3u8_rs::KeyMethod::Other(s) => {
+                            return Err(HlsParseError::UnsupportedKeyMethod(s))
+                        }
+                    },
                     None => None,
                 };
                 segments.push(SegmentRef {
@@ -1072,7 +1079,7 @@ pub fn parse_playlist(base_url: &str, content: &[u8]) -> Result<ParsedPlaylist, 
                 segments,
                 media_sequence,
                 is_fmp4,
-                title: mp.title,
+                title,
             }))
         }
     }
@@ -1092,7 +1099,17 @@ fn parse_iv(hexstr: &str) -> Result<[u8; 16], HlsParseError> {
 }
 ```
 
-注（重要）：`m3u8-rs` 锁定 **6.x**（当前 6.0.1）。上面代码里的字段名（`mp.variants`、`seg.map`、`seg.key`、`k.method` 是否为 String、`resolution.width` 是否为 u32 等）是按记忆写的，**未必与 6.x 实际 API 一致**。实现时先读已解析的 crate 源码（`~/.cargo/registry/src/*/m3u8-rs-6.0.1/src/`）确认真实类型与字段名，再按其调整本文件。**不要为了迁就示例代码而降级 crate 版本。** 若 6.x 的 `key.method` 是枚举而非 String，`SAMPLE-AES` 的显式拒绝逻辑要相应改为匹配枚举变体。
+注（重要）：`m3u8-rs` 锁定 **6.x**（当前 6.0.1），上面的代码已按 6.0.1 的真实 API 核对过（源码见 `~/.cargo/registry/src/*/m3u8-rs-6.0.1/src/playlist.rs`）。已确认的事实：
+
+- 顶层枚举是 `Playlist::MasterPlaylist(MasterPlaylist)` / `Playlist::MediaPlaylist(MediaPlaylist)`（**不是** `Master`/`Media`）。
+- `MasterPlaylist.variants: Vec<VariantStream>`；`VariantStream { uri: String, bandwidth: u64, average_bandwidth: Option<u64>, resolution: Option<Resolution>, frame_rate: Option<f64> }`；`Resolution { width: u64, height: u64 }` —— 故 `VariantChoice` 的 `bandwidth`/`resolution` 用 `u64`，不要用 u32。
+- `MediaPlaylist { version, target_duration, media_sequence, segments: Vec<MediaSegment>, .. }`，**没有** `title` 字段。
+- `MediaSegment { uri: String, duration: f32, title: Option<String>, byte_range, discontinuity, key: Option<Key>, map: Option<Map>, .. }`。
+- `Key { method: KeyMethod, uri: Option<String>, iv: Option<String>, keyformat, keyformatversions }`，其中 **`KeyMethod` 是枚举 `{ None, AES128, SampleAES, Other(String) }`，不是 String**，必须按变体匹配（`KeyMethod::SampleAES` 的 Debug 名是 `SampleAES`，直接 `format!("{k:?}")` 得不到测试期望的 `SAMPLE-AES`，所以要像上面那样显式写成字符串）。
+- `Map { uri: String, byte_range: Option<ByteRange>, .. }`。
+- 用 `parse_playlist_res` 拿 `Result`，不要引入 nom 去解 `IResult`。
+
+**不要为了迁就示例代码而降级 crate 版本。** 若实际 API 与此处描述仍有出入，以 crate 源码为准并记录差异。
 
 - [ ] **Step 5: 运行确认通过**
 
