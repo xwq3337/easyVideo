@@ -74,6 +74,11 @@ impl App {
         engine: Engine,
         settings: Settings,
     ) -> Self {
+        // 装中文字体：egui 自带字体没有 CJK 字形，界面全是中文，不装就是满屏方框。
+        // 放在最前面 —— 越早装，第一帧就越不会是方框。
+        if !easydownvideo::ui_font::install_cjk_font(&cc.egui_ctx) {
+            // 已经 warn 过；界面会退化成方框，但程序仍可用
+        }
         let events = engine.events();
         // 水合：把引擎中已存在的任务（含 scan_resume 恢复的）载入 UI 列表
         let tasks: Vec<UiTask> = engine
@@ -210,9 +215,13 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
+                // **这里不能用 `desired_width(f32::INFINITY)`**：水平布局里输入框会把整行
+                // 一次吃光，紧随其后的「下载」「设置」被排到裁剪矩形之外 —— 屏幕上**完全看不到**
+                // 这两个按钮（实测截图确认：整行只有输入框，右侧空白，设置窗口因此无从打开）。
+                // 给后面两个按钮留出固定宽度，输入框只占剩余部分。
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.input_url)
-                        .desired_width(f32::INFINITY)
+                        .desired_width(ui.available_width() - 150.0)
                         .hint_text("粘贴视频链接（mp4 / m3u8 / 网页）后回车"),
                 );
                 let submit = ui.button("下载").clicked()
