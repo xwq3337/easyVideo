@@ -3144,9 +3144,8 @@ impl Engine {
                     size, accepts_ranges, settings.segment_concurrency, MIN_BLOCK_SIZE,
                     &progress, cancel,
                 ).await?;
-                // 完成后清理 manifest 与任务目录（避免重启后误恢复已完成任务）
-                std::fs::remove_file(tdir.join("manifest.json")).ok();
-                std::fs::remove_dir(&tdir).ok();
+                // 完成后整个任务目录一起清掉（含 manifest），避免重启时误恢复已完成任务
+                std::fs::remove_dir_all(&tdir).ok();
                 Ok(())
             }
         }
@@ -3177,6 +3176,21 @@ impl Engine {
         };
         self.set_state(id, TaskState::Downloading);
         let (final_path, tdir) = self.paths(id, settings);
+        // HLS 任务同样要落 manifest：否则中途退出后无法续传，违反 spec §6。
+        // 记的是 media playlist 的 URL（master 已在上面转成具体码率的 media）。
+        let _ = write_manifest(
+            &tdir,
+            &TaskManifest {
+                id,
+                url: playlist_url.to_string(),
+                filename: final_path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                download_dir: settings.download_dir.clone(),
+                kind: ManifestKind::Hls { playlist_url: playlist_url.to_string() },
+            },
+        );
         let cancel = self.inner.tasks.lock().unwrap().get(&id).unwrap().cancel.clone();
         let plan = download_media(
             &self.inner.client, &media, &tdir, settings.segment_concurrency, progress, cancel,
@@ -3188,6 +3202,8 @@ impl Engine {
         };
         let out_mp4 = final_path.with_extension("mp4");
         remux_to_mp4(&ffmpeg, &plan, &out_mp4).await?;
+        // 合并成功后整个任务目录（含 manifest、分片、concat 列表）一起清掉，
+        // 避免重启时 scan_resume 把已完成任务复活
         std::fs::remove_dir_all(&tdir).ok();
         Ok(())
     }
