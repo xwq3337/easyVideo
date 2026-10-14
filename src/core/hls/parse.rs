@@ -47,7 +47,8 @@ pub fn resolve_url(base: &str, relative: &str) -> Option<String> {
 }
 
 pub fn parse_playlist(base_url: &str, content: &[u8]) -> Result<ParsedPlaylist, HlsParseError> {
-    let playlist = m3u8_rs::parse_playlist_res(content)
+    let normalized = normalize_none_keys(content);
+    let playlist = m3u8_rs::parse_playlist_res(&normalized)
         .map_err(|e| HlsParseError::Parse(format!("{e:?}")))?;
     match playlist {
         m3u8_rs::Playlist::MasterPlaylist(mp) => {
@@ -65,26 +66,39 @@ pub fn parse_playlist(base_url: &str, content: &[u8]) -> Result<ParsedPlaylist, 
         m3u8_rs::Playlist::MediaPlaylist(mp) => {
             let media_sequence = mp.media_sequence;
             let is_fmp4 = mp.segments.iter().any(|s| s.map.is_some());
+
+            // 按 RFC 8216 §4.3.2.4 实现 EXT-X-KEY 的作用域：一个 KEY 标签对其后**所有**
+            // 分片生效，直到出现下一个 KEY 标签。
+            //
+            // 这件事必须自己做，不能直接用 m3u8-rs 给出的 `segment.key`。**实测确认**：
+            // m3u8-rs 6.0.1 只把 key 挂在紧随其后的那一个分片上（它的 parser 在每个 media
+            // URI 之后会把 encryption_key 重置为 None）：
+            //     一个 KEY + 3 个分片 → 只有 seg[0] 带 key，seg[1]/seg[2] 都是 None
+            // 若不在这里补齐，真实播放列表（一个 KEY + 几百个分片）里除第一个分片外全部
+            // 不会被解密——下载"成功"，产出的 mp4 却从约第 10 秒起全是乱码，且不报任何错误。
+            let mut effective: Vec<Option<KeyRef>> = Vec::with_capacity(mp.segments.len());
+            let mut current: Option<KeyRef> = None;
+            for seg in mp.segments.iter() {
+                if let Some(k) = seg.key.clone() {
+                    // 显式设置：METHOD=NONE 经 parse_key 得到 None，表示"自此不再加密"
+                    current = parse_key(base_url, k)?;
+                }
+                // seg.key 为 None 表示沿用上一个 KEY（而非"无加密"）
+                effective.push(current.clone());
+            }
+
             let mut segments: Vec<SegmentRef> = Vec::new();
 
-            // init 段（EXT-X-MAP）：在 AES-128 + fMP4 下它同样是被加密的，必须挂上当前
-            // 生效的 key，否则下载端会跳过解密、静默产出损坏文件而不报错。
-            // RFC 8216 §4.3.2.5 规定：加密的初始化段要求 EXT-X-KEY 带 IV 属性——
-            // 缺 IV 时我们明确报错，因为按媒体序号推导 IV 对 init 段是错的。
+            // init 段（EXT-X-MAP）：AES-128 + fMP4 下初始化段本身也被加密，必须挂上生效的
+            // key，否则下载端跳过解密、静默产出损坏文件。RFC 8216 §4.3.2.5 规定加密的初始
+            // 化段要求 EXT-X-KEY 带 IV——缺 IV 明确报错，因为按媒体序号推导 IV 对 init 段是错的。
             if let Some(map) = mp.segments.iter().find_map(|s| s.map.clone()) {
-                let inherited = match mp.segments.iter().find_map(|s| s.key.clone()) {
-                    Some(k) => {
-                        let parsed = parse_key(base_url, k)?;
-                        if parsed.as_ref().is_some_and(|kr| kr.iv.is_none()) {
-                            return Err(HlsParseError::Parse(
-                                "AES-128 加密的 fMP4 初始化段缺少 IV 属性（RFC 8216 §4.3.2.5）"
-                                    .into(),
-                            ));
-                        }
-                        parsed
-                    }
-                    None => None,
-                };
+                let inherited = effective.iter().find_map(|k| k.clone());
+                if inherited.as_ref().is_some_and(|kr| kr.iv.is_none()) {
+                    return Err(HlsParseError::Parse(
+                        "AES-128 加密的 fMP4 初始化段缺少 IV 属性（RFC 8216 §4.3.2.5）".into(),
+                    ));
+                }
                 segments.push(SegmentRef {
                     uri: resolve_url(base_url, &map.uri).unwrap_or(map.uri),
                     key: inherited,
@@ -92,11 +106,7 @@ pub fn parse_playlist(base_url: &str, content: &[u8]) -> Result<ParsedPlaylist, 
                 });
             }
 
-            for seg in mp.segments.into_iter() {
-                let key = match seg.key {
-                    Some(k) => parse_key(base_url, k)?,
-                    None => None,
-                };
+            for (seg, key) in mp.segments.into_iter().zip(effective) {
                 segments.push(SegmentRef {
                     uri: resolve_url(base_url, &seg.uri).unwrap_or(seg.uri),
                     key,
@@ -155,4 +165,47 @@ fn parse_iv(hexstr: &str) -> Result<[u8; 16], HlsParseError> {
             .map_err(|_| HlsParseError::Parse(format!("bad IV hex: {hexstr}")))?;
     }
     Ok(out)
+}
+
+/// 给"缺 IV 的 METHOD=NONE"这个 m3u8-rs 缺陷打补丁。
+///
+/// 实测（m3u8-rs 6.0.1）：`Key::from_hashmap`（playlist.rs:979）在 `METHOD=NONE` 未带
+/// `IV` 时返回 Err，`map_res` 于是把整条 `#EXT-X-KEY:METHOD=NONE` 降级成 Unknown tag
+/// 塞进 `segment.unknown_tags`，`segment.key` 里再也看不到它。后果是"自此不再加密"
+/// 无法表达——我们的作用域逻辑会把上一个 key 继续往后套，导致本不该解密的分片被解密。
+/// 更糟的是 `#EXT-X-KEY:METHOD=NONE` 与 `#EXT-X-KEY:METHOD=AES-128` 相邻时，m3u8-rs
+/// 输出的 `(key, unknown_tags)` 组合完全一样，靠 unknown_tags 无法还原先后顺序。
+///
+/// RFC 8216 中 METHOD=NONE 本就不需要 IV。这里给这类标签补一个会被忽略的占位 IV，
+/// 让 m3u8-rs 正常解析成 `Key { method: None }`，从而按行序保留 EXT-X-KEY 的作用域信息。
+/// 该占位 IV 不会被使用：`parse_key` 对 `KeyMethod::None` 直接返回 `None`。
+fn normalize_none_keys(content: &[u8]) -> Vec<u8> {
+    const PLACEHOLDER_IV: &[u8] = b",IV=0x00000000000000000000000000000000";
+    let mut out: Vec<u8> = Vec::with_capacity(content.len());
+    for (i, raw_line) in content.split(|&b| b == b'\n').enumerate() {
+        if i > 0 {
+            out.push(b'\n');
+        }
+        let line = trim_trailing_cr(raw_line);
+        out.extend_from_slice(line);
+        let is_iv_less_none_key = line.starts_with(b"#EXT-X-KEY:")
+            && contains_subslice(line, b"METHOD=NONE")
+            && !contains_subslice(line, b"IV=");
+        if is_iv_less_none_key {
+            out.extend_from_slice(PLACEHOLDER_IV);
+        }
+    }
+    out
+}
+
+fn trim_trailing_cr(line: &[u8]) -> &[u8] {
+    let mut end = line.len();
+    while end > 0 && line[end - 1] == b'\r' {
+        end -= 1;
+    }
+    &line[..end]
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
 }
