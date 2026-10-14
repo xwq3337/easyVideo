@@ -540,7 +540,7 @@ pub mod parse;
 - [ ] **Step 4: 运行确认通过**
 
 Run: `cargo test --test events_test`
-Expected: 2 PASS
+Expected: 3 PASS
 
 - [ ] **Step 5: Commit**
 
@@ -1241,7 +1241,7 @@ pub fn decrypt_aes128(
 - [ ] **Step 4: 运行确认通过**
 
 Run: `cargo test --test hls_crypto_test`
-Expected: 3 PASS
+Expected: 4 PASS
 
 - [ ] **Step 5: Commit**
 
@@ -1861,7 +1861,7 @@ fn default_iv(media_sequence: u64, segment_index: usize) -> [u8; 16] {
 - [ ] **Step 4: 运行确认通过**
 
 Run: `cargo test --test hls_download_test`
-Expected: 2 PASS
+Expected: 3 PASS
 
 - [ ] **Step 5: Commit**
 
@@ -3062,7 +3062,7 @@ impl Engine {
 - [ ] **Step 4: 运行确认通过**
 
 Run: `cargo test --test engine_test`
-Expected: 3 PASS
+Expected: 4 PASS
 
 - [ ] **Step 5: Commit**
 
