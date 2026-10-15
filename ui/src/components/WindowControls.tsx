@@ -1,4 +1,5 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { Minus, Square, X } from "lucide-react";
 
 /** 仅 Windows/Linux 渲染：macOS 用 titleBarStyle: Overlay，红绿灯由系统画。 */
 export default function WindowControls() {
@@ -13,21 +14,21 @@ export default function WindowControls() {
         className="w-11 h-8 hover:bg-[var(--bg-inset)] transition-colors"
         onClick={() => void w.minimize()}
       >
-        ─
+        <Minus size={14} strokeWidth={1.75} />
       </button>
       <button
         aria-label="最大化"
         className="w-11 h-8 hover:bg-[var(--bg-inset)] transition-colors"
         onClick={() => void w.toggleMaximize()}
       >
-        ☐
+        <Square size={12} strokeWidth={1.75} />
       </button>
       <button
         aria-label="关闭"
         className="w-11 h-8 text-[var(--accent-err)] hover:bg-[var(--accent-err)] hover:text-white transition-colors"
         onClick={() => void w.close()}
       >
-        ✕
+        <X size={14} strokeWidth={1.75} />
       </button>
     </div>
   );

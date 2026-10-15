@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { ListChecks, Pause, Play, RotateCcw, X } from "lucide-react";
 import type { TaskView } from "../lib/types";
 import { formatSize, formatSpeed } from "../lib/format";
 import * as ipc from "../lib/ipc";
@@ -116,24 +117,54 @@ export default function TaskRow({ task }: { task: TaskView }) {
           {task.speedBps ? ` · ${formatSpeed(task.speedBps)}` : ""}
           {task.etaText ? ` · ${task.etaText}` : ""}
         </span>
-        <span className="shrink-0 flex gap-3">
+        <span className="shrink-0 flex gap-1">
           {task.state.kind === "awaitingChoice" && (
             // 等待选择的行可以把选择框重新叫回来（「稍后再说」把它压下去之后的出口）。
-            <button onClick={() => dispatch({ kind: "openChoice", id: task.id })}>选择格式</button>
+            <button
+              className="flex items-center gap-1 text-[12px]"
+              onClick={() => dispatch({ kind: "openChoice", id: task.id })}
+            >
+              <ListChecks size={14} strokeWidth={1.75} />
+              选择格式
+            </button>
           )}
           {task.state.kind === "paused" && (
-            <button onClick={() => void run(ipc.unpause(task.id))}>继续</button>
+            <button
+              className="flex items-center gap-1 text-[12px]"
+              onClick={() => void run(ipc.unpause(task.id))}
+            >
+              <Play size={14} strokeWidth={1.75} />
+              继续
+            </button>
           )}
           {task.state.kind === "failed" && (
-            <button onClick={() => void run(ipc.retry(task.id))}>重试</button>
+            <button
+              className="flex items-center gap-1 text-[12px]"
+              onClick={() => void run(ipc.retry(task.id))}
+            >
+              <RotateCcw size={14} strokeWidth={1.75} />
+              重试
+            </button>
           )}
           {/* 暂停按钮覆盖的正是 core 里 pause 接受的那四个状态 —— 否则就是死按钮 */}
           {["queued", "probing", "downloading", "merging"].includes(task.state.kind) && (
-            <button onClick={() => void run(ipc.pause(task.id))}>暂停</button>
+            <button
+              className="flex items-center gap-1 text-[12px]"
+              onClick={() => void run(ipc.pause(task.id))}
+            >
+              <Pause size={14} strokeWidth={1.75} />
+              暂停
+            </button>
           )}
           {/* 按钮的叫法与调用的命令必须一致 —— 之前这里写着「从列表移除」却调 cancel()，
               对已取消的行连状态都不变，是个纯零反应的假按钮。见 lib/taskAction.ts。 */}
-          <button onClick={() => void run(action.invoke(task.id))}>{action.label}</button>
+          <button
+            className="flex items-center gap-1 text-[12px]"
+            onClick={() => void run(action.invoke(task.id))}
+          >
+            <X size={14} strokeWidth={1.75} />
+            {action.label}
+          </button>
         </span>
       </div>
 
