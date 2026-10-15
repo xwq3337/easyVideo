@@ -381,14 +381,12 @@ guard 那次释放会落空。所以必须自己做完。"
 - Modify: `src-tauri/src/commands.rs`
 - Modify: `src-tauri/src/main.rs:67-79`
 - Modify: `ui/src/lib/ipc.ts`
-- Modify: `ui/src/lib/types.ts`
 
 **Interfaces:**
 - Consumes: `Engine::remove_task(id) -> bool`（Task 1）
 - Produces:
   - Tauri 命令 `remove_task(id: u64) -> Result<(), String>`
   - `ipc.removeTask(id: number): Promise<void>`
-  - `EventDto` 新增成员 `{ type: "taskRemoved"; id: number }`
 
 - [ ] **Step 1: 加命令**
 
@@ -431,9 +429,40 @@ Expected: 全绿（`commands.rs` 无单测，这一条覆盖的是"编译得过�
 export const removeTask = (id: number) => invoke<void>("remove_task", { id });
 ```
 
-- [ ] **Step 5: 加事件类型**
+- [ ] **Step 5: 确认前端构建仍是绿的**
 
-`ui/src/lib/types.ts`，`EventDto` 联合类型末尾加一个成员（注意末尾分号改成分号，保持既有的联合写法）：
+Run: `npm --prefix ui test && npm --prefix ui run build`
+Expected: 全绿
+
+**注意：本任务不动 `ui/src/lib/types.ts`。** `EventDto` 的 `taskRemoved` 成员挪到 Task 3 与 reducer 一起加 —— 在这里单独加会让 `applyEvent` 的 `switch` 不再穷尽、`tsc` 直接报错，于是这个任务以红收场，违反 Global Constraints 里"每个任务结束时三者全绿"。
+
+- [ ] **Step 6: 提交**
+
+```bash
+git add src-tauri/src/commands.rs src-tauri/src/main.rs ui/src/lib/ipc.ts
+git commit -m "feat(ipc): 注册 remove_task 命令并加前端 ipc.removeTask
+
+只做命令与 IPC 的接线,事件类型留给下一个任务和 reducer 一起加 ——
+单独加会让 applyEvent 的 switch 不再穷尽、tsc 报错,
+这个任务就会以红收场。"
+```
+
+---
+
+## Task 3: reducer 处理 `taskRemoved`
+
+**Files:**
+- Modify: `ui/src/lib/types.ts`（`EventDto` 加成员）
+- Modify: `ui/src/store/reducer.ts`
+- Test: `ui/src/store/reducer.test.ts`
+
+**Interfaces:**
+- Consumes: `EventDto`（Task 2 未改动它，本任务自己加）
+- Produces: 无新导出
+
+- [ ] **Step 1: 给 `EventDto` 加事件成员**
+
+`ui/src/lib/types.ts`，`EventDto` 联合类型末尾加一个成员：
 
 ```ts
 export type EventDto =
@@ -443,39 +472,11 @@ export type EventDto =
   | { type: "taskRemoved"; id: number };
 ```
 
-- [ ] **Step 6: 确认前端类型检查通过**
+改完先跑一次 `npm --prefix ui run build`，此时**应当报错**：`reducer.ts` 的 `applyEvent` 里那个 `switch (event.type)` 不再穷尽，`tsc` 会在函数末尾报「并非所有代码路径都有返回值」。
 
-Run: `npm --prefix ui run build`
-Expected: FAIL —— 因为 `reducer.ts` 的 `applyEvent` 里那个 `switch (event.type)` 现在不再穷尽，`tsc` 会在函数末尾报「并非所有代码路径都有返回值」。
+这是**想要的**——类型系统正把这个新事件推到 reducer 面前，而不是让它在 `default` 分支里被静默吞掉。下一步就修它。
 
-这是**想要的**：类型系统正把这个新事件推给 reducer，逼我们在下一任务里处理它。若这里没有报错，说明 `EventDto` 没改对。
-
-- [ ] **Step 7: 提交**
-
-先确认工作区只有这一步的改动（reducer 尚未处理新事件，构建暂时是红的），提交时在信息里写明这一点：
-
-```bash
-git add src-tauri/src/commands.rs src-tauri/src/main.rs ui/src/lib/ipc.ts ui/src/lib/types.ts
-git commit -m "feat(ipc): 注册 remove_task 命令并加 taskRemoved 事件类型
-
-前端构建此刻是红的 —— tsc 会指出 reducer 的 applyEvent 里
-switch 不再穷尽。这是有意的:让类型系统把新事件推到下一个任务的
-面前,而不是让它在 default 分支里被静默吞掉。"
-```
-
----
-
-## Task 3: reducer 处理 `taskRemoved`
-
-**Files:**
-- Modify: `ui/src/store/reducer.ts`
-- Test: `ui/src/store/reducer.test.ts`
-
-**Interfaces:**
-- Consumes: `EventDto` 的 `taskRemoved` 成员（Task 2）
-- Produces: `Action` 新增 `{ kind: "taskRemoved"; id: number }`
-
-- [ ] **Step 1: 写失败测试**
+- [ ] **Step 2: 写失败测试**
 
 `ui/src/store/reducer.test.ts` 末尾追加。先看该文件顶部已有的辅助函数（`reduce`、`initialState`、构造 `TaskView` 的写法），沿用它的风格。若没有现成的行构造器，就照下面这样内联：
 
@@ -515,12 +516,12 @@ describe("taskRemoved", () => {
 });
 ```
 
-- [ ] **Step 2: 运行确认失败**
+- [ ] **Step 3: 运行确认失败**
 
 Run: `npm --prefix ui test`
 Expected: FAIL —— `taskRemoved` 事件落进 `applyEvent` 的 switch 后没有匹配的分支。
 
-- [ ] **Step 3: 实现**
+- [ ] **Step 4: 实现**
 
 `ui/src/store/reducer.ts`，`Action` 联合类型加一个自有用处不大的成员是不必要的——`taskRemoved` 只从事件流来。直接在 `applyEvent` 里处理：
 
@@ -546,23 +547,26 @@ Expected: FAIL —— `taskRemoved` 事件落进 `applyEvent` 的 switch 后没�
   }
 ```
 
-- [ ] **Step 4: 运行确认通过**
+- [ ] **Step 5: 运行确认通过**
 
 Run: `npm --prefix ui test`
 Expected: 全绿
 
-- [ ] **Step 5: 确认构建恢复**
+- [ ] **Step 6: 确认构建恢复**
 
 Run: `npm --prefix ui run build`
-Expected: 绿（Task 2 留下的红在这里消掉）
+Expected: 绿（Step 1 引进的那个 `switch` 不穷尽报错在这里消掉）
 
-- [ ] **Step 6: 提交**
+- [ ] **Step 7: 提交**
 
 ```bash
-git add ui/src/store/reducer.ts ui/src/store/reducer.test.ts
+git add ui/src/lib/types.ts ui/src/store/reducer.ts ui/src/store/reducer.test.ts
 git commit -m "feat(ui): reducer 处理 taskRemoved 事件
 
-放在 known 检查之前处理:已移除的 id 本来就不在 tasks 里,
+事件类型和 reducer 一起加:单独加类型会让 applyEvent 的 switch
+不再穷尽、tsc 直接报错,中间那一版就是红的。
+
+处理放在 known 检查之前:已移除的 id 本来就不在 tasks 里,
 走未知 id 那条路会白拉一次全量。但真的是未知 id 时仍然要重同步 ——
 静默忽略会让列表和 core 永久不一致。"
 ```
@@ -1529,49 +1533,48 @@ git commit -m "feat(ui): 设置改为整页,删掉 SettingsDialog
 
 - [ ] **Step 1: 换掉整套灰阶与字号**
 
-`ui/src/index.css` 的 `:root` 块替换成：
+⚠️ **只改配色变量，不要整块覆盖。** Task 5 已经往 `:root` 里加了 `--nav-sel` / `--nav-hover`，并**另起了一个** `:root` 块放 shadcn 的变量。把 `:root` 整块替换掉会连 `--nav-sel` 一起删掉，而 `Sidebar.tsx` 正依赖它——后果是侧边栏选中态在浅色下变成纯黑底、深色下完全看不见。
+
+所以：**逐个改下面列出的变量，其余原样保留**（包括 `--nav-sel`、`--nav-hover`，以及那个独立的 shadcn 映射块）。
+
+浅色（`ui/src/index.css` 第一个 `:root` 块里改这些值）：
 
 ```css
-:root {
-  --bg: #ffffff;
   --bg-subtle: #f5f5f7;   /* 官网经典灰；原来的 #fcfcfc 太接近白色，撑不起侧边栏 */
-  --bg-inset: #fafafa;
   --fg: #1d1d1f;          /* 官网正文色，比纯黑柔和 */
   --fg-muted: #6e6e73;    /* 官网副标题 */
   --fg-faint: #86868b;    /* 官网页脚 */
   --line: #d2d2d7;        /* 官网分隔线 */
   --line-strong: #d2d2d7;
-  --track: #f0f0f0;
   --fill: #1d1d1f;
-  --accent-ok: #0a8f5b;
-  --accent-warn: #b26a00;
-  --accent-err: #c0392b;
-  --accent-blue: #0071e3;
-  --btn-fg: #ffffff;
-}
 ```
 
-`:root[data-theme="dark"]` 替换成：
+再在同一个块里**新增**一行：
 
 ```css
-:root[data-theme="dark"] {
+  --accent-blue: #0071e3;
+```
+
+深色（`[data-theme="dark"]` 那块）同理，逐个改：
+
+```css
   --bg: #000000;
   --bg-subtle: #1d1d1f;
-  --bg-inset: #141414;
   --fg: #f5f5f7;
   --fg-muted: #86868b;
   --fg-faint: #6e6e73;
   --line: #424245;
   --line-strong: #424245;
-  --track: #1f1f1f;
   --fill: #f5f5f7;
-  --accent-ok: #4ad295;
-  --accent-warn: #f0b45e;
-  --accent-err: #ff6b5e;
-  --accent-blue: #2997ff;
-  --btn-fg: #000000;
-}
 ```
+
+并新增：
+
+```css
+  --accent-blue: #2997ff;
+```
+
+`--bg`（浅色 `#ffffff`）、`--bg-inset`、`--track`、`--accent-ok`、`--accent-warn`、`--accent-err`、`--btn-fg` **不动**。
 
 `body` 块里 `font-size: 13px;` 之后加一行：
 
@@ -1676,7 +1679,7 @@ git commit -m "style(ui): 换成 apple.com 的灰阶、字号与形状
 import { ListChecks, Pause, Play, RotateCcw, X } from "lucide-react";
 ```
 
-按钮区改成图标 + 文字（图标 `size={14} strokeWidth={1.75}`），并统一用 `Button` 的 `ghost` / `danger` 变体：
+按钮区改成图标 + 文字（图标 `size={14} strokeWidth={1.75}`）。**这里继续用裸 `<button>`，不换成 `Button` 组件**：这几个是行内的轻量文字按钮，`Button` 的 `h-7/h-8` 固定高度和 `px-3` 会破坏行高节奏，而它们的样式本来就只有字号和颜色两件事。
 
 ```tsx
         <span className="shrink-0 flex gap-1">
