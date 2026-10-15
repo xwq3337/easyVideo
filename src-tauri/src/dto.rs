@@ -227,7 +227,9 @@ pub fn settings_from(s: SettingsDto) -> Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use easydownvideo::core::events::{EngineEvent, ProgressUnit, TaskState};
+    use easydownvideo::core::events::{ChoiceKind, EngineEvent, ProgressUnit, TaskState};
+    use easydownvideo::core::hls::parse::VariantChoice;
+    use easydownvideo::core::ytdlp::YtdlpFormat;
 
     fn snap(state: TaskState) -> easydownvideo::core::engine::TaskSnapshot {
         easydownvideo::core::engine::TaskSnapshot {
@@ -283,5 +285,56 @@ mod tests {
         assert_eq!(j["downloadDir"], "/tmp/x");
         assert_eq!(j["segmentConcurrency"], 6);
         assert_eq!(settings_from(d), s, "往返之后必须与原来完全一致");
+    }
+
+    /// 守卫 `ChoicesOffered` 这条**事件**路径的 wire 形状——前端真正收到的东西。
+    ///
+    /// 为什么它必须单独存在：上面四条测试没有一条序列化 `ChoicesOffered`，而
+    /// `ChoiceKindDto` 一度是**新类型变体**(`HlsVariants(Vec<..>)`)——那种写法**编译得过**，
+    /// 只在序列化时炸：`cannot serialize tagged newtype variant ... containing a sequence`。
+    /// 也就是说，有人把结构体变体"顺手简化"回新类型变体时，**没有任何一条别的测试会变红**，
+    /// 只有真实运行时才会崩。想动这个枚举，先看这条测试为什么这么写。
+    ///
+    /// 这里刻意走 `event_dto(...)` 而不是直接构造 `ChoiceKindDto`：要钉的是事件路径。
+    /// 断言分三层——事件标签、枚举的内部标签、以及内层数组的字段名
+    /// (后者正是 `rename_all_fields = "camelCase"` 买来的、TS 镜像要读的那个名字)。
+    #[test]
+    fn choices_offered_pins_the_internal_tag_and_inner_field_names() {
+        let hls = event_dto(EngineEvent::ChoicesOffered {
+            id: 3,
+            kind: ChoiceKind::HlsVariants(vec![VariantChoice {
+                uri: "https://example.com/1080.m3u8".into(),
+                bandwidth: 5_000_000,
+                resolution: Some((1920, 1080)),
+            }]),
+        });
+        let j = serde_json::to_value(&hls).unwrap();
+        assert_eq!(j["type"], "choicesOffered");
+        assert_eq!(j["id"], 3);
+        assert_eq!(j["kind"]["kind"], "hlsVariants");
+        // 内层数组的字段名必须是 camelCase 的 `hlsVariants`，
+        // 而不是 Rust 侧的 `hls_variants`——这正是 rename_all_fields 的作用。
+        assert_eq!(
+            j["kind"]["hlsVariants"][0]["uri"],
+            "https://example.com/1080.m3u8"
+        );
+        // 字段级重命名要能穿透到 payload 里面：`resolution` 是元组，序列化成数组。
+        assert_eq!(j["kind"]["hlsVariants"][0]["resolution"], serde_json::json!([1920, 1080]));
+
+        let ytdlp = event_dto(EngineEvent::ChoicesOffered {
+            id: 3,
+            kind: ChoiceKind::YtdlpFormats(vec![YtdlpFormat {
+                id: "137".into(),
+                ext: "mp4".into(),
+                note: "1080p video only".into(),
+                filesize: Some(123_456_789),
+                url: "https://example.com/v".into(),
+            }]),
+        });
+        let j = serde_json::to_value(&ytdlp).unwrap();
+        assert_eq!(j["type"], "choicesOffered");
+        assert_eq!(j["kind"]["kind"], "ytdlpFormats");
+        assert_eq!(j["kind"]["ytdlpFormats"][0]["id"], "137");
+        assert_eq!(j["kind"]["ytdlpFormats"][0]["filesize"], 123_456_789u64);
     }
 }
