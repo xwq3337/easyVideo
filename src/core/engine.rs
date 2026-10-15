@@ -284,27 +284,38 @@ impl Engine {
             .map(|t| t.state.clone())
     }
 
+    /// 应用用户的格式/码率选择，把任务重新入队。
+    ///
+    /// **只有这次选择有效时才把候选列表取走。** 原先是先 `take()` 再校验：索引越界、或
+    /// 类型与候选不符时提前返回，而候选列表已经被丢弃 —— 任务从此永久卡在 `AwaitingChoice`：
+    /// 界面上「选择格式」还能点，点了弹出同样的对话框，再点仍然毫无反应，任务再也下不完。
+    ///
+    /// 引擎是公开 API，越界索引不是只有手滑才造得出来；一个坏调用不应该把任务变成不可恢复。
+    /// 选择无效时任务**保持原样**，候选列表还在，可以用正确的选择再调一次。
     pub fn set_choice(&self, id: TaskId, choice: Choice) {
-        let pending = {
-            let mut tasks = self.inner.tasks.lock().unwrap();
-            let Some(t) = tasks.get_mut(&id) else { return };
-            t.pending_choice.take()
-        };
-        let Some(kind) = pending else { return };
-        let url = match (kind, choice) {
-            (ChoiceKind::HlsVariants(v), Choice::Variant(i)) => v.get(i).map(|v| v.uri.clone()),
-            (ChoiceKind::YtdlpFormats(f), Choice::YtdlpFormat(i)) => {
-                f.get(i).map(|f| f.url.clone())
-            }
-            _ => None,
-        };
-        let Some(url) = url else { return };
         {
             let mut tasks = self.inner.tasks.lock().unwrap();
-            if let Some(t) = tasks.get_mut(&id) {
-                t.url = url;
-                t.state = TaskState::Queued;
-            }
+            let Some(t) = tasks.get_mut(&id) else { return };
+            let url = {
+                let Some(kind) = t.pending_choice.as_ref() else {
+                    return;
+                };
+                match (kind, choice) {
+                    (ChoiceKind::HlsVariants(v), Choice::Variant(i)) => {
+                        v.get(i).map(|c| c.uri.clone())
+                    }
+                    (ChoiceKind::YtdlpFormats(f), Choice::YtdlpFormat(i)) => {
+                        f.get(i).map(|c| c.url.clone())
+                    }
+                    _ => None,
+                }
+            };
+            let Some(url) = url else {
+                return; // 无效选择：什么都不动，候选列表留给下一次正确的调用
+            };
+            t.pending_choice = None;
+            t.url = url;
+            t.state = TaskState::Queued;
         }
         self.inner.queue.lock().unwrap().push_back(id);
         self.pump();

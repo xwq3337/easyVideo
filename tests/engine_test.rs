@@ -1081,3 +1081,63 @@ async fn hls_master_playlist_offers_choice_then_completes() {
         "选择码率后应当合并出 master.mp4"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invalid_choice_does_not_strand_the_task() {
+    // `set_choice` 先 `take()` 再校验：索引越界、或类型与候选不符时提前返回，而候选列表
+    // **已经被取走**。任务从此永久卡在 `AwaitingChoice` —— 界面上「选择格式」还能点，
+    // 点了弹出同样的对话框，再点仍然毫无反应，而这个任务再也下不完，只能删掉重加。
+    // 引擎是公开 API，越界索引不是只有手滑才造得出来。
+    let ts = ts_fixture();
+    let server = MockServer::start().await;
+    let master = "#EXTM3U\n#EXT-X-VERSION:3\n\
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=160x120\nmedia.m3u8\n";
+    let media = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n\
+#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\nseg0.ts\n#EXT-X-ENDLIST\n";
+    Mock::given(method("GET"))
+        .and(path("/master.m3u8"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.apple.mpegurl")
+                .set_body_string(master),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/media.m3u8"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.apple.mpegurl")
+                .set_body_string(media),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/seg0.ts"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "video/mp2t")
+                .set_body_bytes(ts.clone()),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let engine = Engine::new(rt, settings_with(dir.path()), dir.path().join("data"));
+    let mut rx = engine.events();
+    let id = engine.add_url(format!("{}/master.m3u8", server.uri()));
+
+    wait_state(&mut rx, id, TaskState::AwaitingChoice, 30).await;
+
+    // 两次无效调用：索引越界、以及类型与候选不符。之后那次**有效**的选择必须仍然管用。
+    engine.set_choice(id, Choice::Variant(7));
+    engine.set_choice(id, Choice::YtdlpFormat(0));
+    engine.set_choice(id, Choice::Variant(0));
+
+    wait_state(&mut rx, id, TaskState::Done, 120).await;
+    assert!(
+        dir.path().join("master.mp4").exists(),
+        "无效选择之后，正确的选择应当照常完成下载"
+    );
+}
