@@ -1,3 +1,10 @@
 /target
 .DS_Store
 .superpowers/
+
+# 前端依赖与构建产物(ui/ 与根 package.json 各自一份 node_modules)
+node_modules/
+ui/dist/
+
+# tauri-build 生成的 ACL schema
+src-tauri/gen/schemas/

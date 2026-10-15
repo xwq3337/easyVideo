@@ -1,0 +1,12 @@
+{
+  "name": "easydownvideo-workspace",
+  "private": true,
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  },
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  }
+}

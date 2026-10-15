@@ -1,0 +1,49 @@
+@import "tailwindcss";
+
+/* 浅色极简：白底、发丝线、几乎只有黑白两色。
+   深色版是"墨与纸对调"，不引入彩色，两套共用这一组变量名。 */
+:root {
+  --bg: #ffffff;
+  --bg-subtle: #fcfcfc;
+  --bg-inset: #fafafa;
+  --fg: #0a0a0a;
+  --fg-muted: #8a8a8a;
+  --fg-faint: #b0b0b0;
+  --line: #ededed;
+  --line-strong: #e2e2e2;
+  --track: #f0f0f0;
+  --fill: #0a0a0a;
+  --accent-ok: #0a8f5b;
+  --accent-warn: #b26a00;
+  --accent-err: #c0392b;
+  --btn-fg: #ffffff;
+}
+
+:root[data-theme="dark"] {
+  --bg: #0a0a0a;
+  --bg-subtle: #0e0e0e;
+  --bg-inset: #141414;
+  --fg: #ededed;
+  --fg-muted: #8a8a8a;
+  --fg-faint: #6e6e6e;
+  --line: #1c1c1c;
+  --line-strong: #262626;
+  --track: #1f1f1f;
+  --fill: #ededed;
+  --accent-ok: #4ad295;
+  --accent-warn: #f0b45e;
+  --accent-err: #ff6b5e;
+  --btn-fg: #0a0a0a;
+}
+
+html, body, #root { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, "SF Pro Text", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+/* 数字等宽对齐：进度/速度/剩余时间逐帧变化时不抖动 */
+.tnum { font-variant-numeric: tabular-nums; }

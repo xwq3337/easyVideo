@@ -1,0 +1,32 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "EasyDownVideo",
+  "version": "0.1.0",
+  "identifier": "dev.easydownvideo.easydownvideo",
+  "build": {
+    "beforeDevCommand": "npm --prefix ui run dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm --prefix ui run build",
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "EasyDownVideo",
+        "width": 900,
+        "height": 620,
+        "minWidth": 720,
+        "minHeight": 480,
+        "decorations": false,
+        "titleBarStyle": "Overlay"
+      }
+    ],
+    "security": { "csp": null }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.png"]
+  }
+}
