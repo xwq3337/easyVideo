@@ -159,20 +159,25 @@ lucide，`stroke-width: 1.75`（默认 2 偏粗像描边图标，1.5 偏细发�
 
 ### 6.1 引入的 shadcn 组件
 
-拷入 `ui/src/components/ui/`，只挑用得上的：
+拷入 `ui/src/components/ui/`。**只拷真正需要的**——每一份拷进来的组件都是此后要自己维护的代码：
 
 | 组件 | 用在哪 |
 |---|---|
 | `button` | 胶囊主按钮 + 次级按钮 |
 | `input` | URL 框、设置页输入 |
-| `dialog` | `ChoiceDialog` 继续用模态 |
 | `tabs` | 设置页「外观」三选一，改样式为 Apple 分段控件 |
-| `select` | 线程数 / 并发数 / 保存位置 |
-| `progress` | 任务进度条 |
-| `tooltip` | 侧边栏与行内按钮的 hover 说明 |
-| `separator` | 发丝线 |
 
-**不拷**：`form`、`table`、`navigation-menu` 等桌面 App 用不上的组件。
+以下原本列在计划里，核对后**决定不拷**，理由逐条记录：
+
+| 组件 | 不拷的理由 |
+|---|---|
+| `dialog` | 现有 `ChoiceDialog` 是手写的，而且带着"同一时刻只弹一个、Esc 只压下不取消"这类精心处理过的语义（注释里写明了不这么做的后果）。换 shadcn 的 Dialog 等于把这些逻辑重写一遍。 |
+| `progress` | 现有进度条对 `merging` 状态有特殊表现（填满且转绿），shadcn 的 `Progress` 没有这个概念。 |
+| `select` | 唯一需要下拉的是「外观」，而它改用 `tabs` 了；其余数值输入本来就是原生 `<input type="number">`。 |
+| `tooltip` | 侧边栏与行内按钮的文字标签本来就可见，加提示是多余的。 |
+| `separator` | 一行 `<div style={{borderTop}}>` 就够，不值一份组件。 |
+
+`form`、`table`、`navigation-menu` 等桌面 App 用不上的，自然更不拷。
 
 ### 6.2 图标映射（lucide）
 
@@ -197,7 +202,7 @@ pub fn remove_task(&self, id: TaskId) -> bool
 
 1. **只接受终态**（`Done` / `Failed` / `Canceled`）。其余状态返回 `false`。「移除一个正在下载的任务」语义含糊（盘上 `.part` 分片删不删？），不该让它存在。
 2. **删除任务目录** `actual_task_dir(id)`。**对 `Failed` 是必需的**——见下方说明；对 `Done` / `Canceled` 该目录本已为空，删了无害。
-3. **`release_reserved_path(id)`**。不释放则 `reserved_paths` 中的占位随该 id 泄漏，之后下载同名文件会被判定为冲突、莫名变成 `xxx (1).mp4`。
+3. **`release_reserved_path(id)`**。理由与本条直觉相反，值得写清楚：`WorkerGuard::drop`（`engine.rs:80-88`）**本来就会**无条件释放占位。但 `cancel()` 让状态**立刻**变成 `Canceled`，而 worker 可能还挂在网络请求上没退出。此时移除会先删掉条目，worker 随后退出的那次释放便在 `get_mut(&id)` 上落空——占位反而**因为这个**才泄漏。所以释放必须由 `remove_task` 自己**在移除条目之前**完成。
 4. 从 `inner.tasks` 移除，并广播新事件 `EngineEvent::TaskRemoved { id }`。
 
 ### 7.1 「重启也不回来」的约束来源
@@ -222,7 +227,7 @@ UI 层仍会把非终态按钮渲染成「取消」而非「移除」，所以�
 
 1. `remove_terminal_task_but_reject_active`——终态可移除，`Queued` / `Downloading` 被拒。
 2. **`removed_failed_task_is_not_resurrected_by_scan_resume`**——最有价值的一条。造一个失败任务（有 manifest 落盘）→ 移除 → 断言 `scan_resume` 扫不到它。这是防「重启又回来」的回归测试，**没有它第 7.1 节那个坑随时会被改回去**。
-3. `remove_releases_reserved_path`——移除后同名文件能重新用原名下载，不会变成 `xxx (1).mp4`。
+3. `remove_releases_reserved_path_while_the_worker_is_still_exiting`——钉住第 7 节第 3 条那个窄窗口：先 `cancel()` 让状态立刻变 `Canceled`，在 worker 仍被延迟响应卡住时移除，随后下同名文件应得到原名。**注意不能写成"移除后再等 worker 退出"**——那样 `WorkerGuard` 已经把占位释放干净，测试会变成空跑。
 
 ### 前端（`npm --prefix ui test`）—— 新增 2 条
 
