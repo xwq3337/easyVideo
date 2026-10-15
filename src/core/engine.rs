@@ -88,13 +88,19 @@ impl Drop for WorkerGuard {
 }
 
 impl TaskEntry {
+    /// 这个任务是否正**占着一个并发槽** —— 也就是是否有 worker 在它身上跑。
+    ///
+    /// **`AwaitingChoice` 不算。** 该状态下 `run_task` 已经返回 Ok、没有任何 worker 存在，
+    /// 把它算作活跃会让它白占一个槽：默认 `max_active_tasks = 2` 时，连续两个 master
+    /// playlist 任务都停在"等待选择"就足以把并发数占满，队列里其他任务**永远不会开始** ——
+    /// 用户再加一个普通直链也没反应。真实世界的 m3u8 大多是 master playlist，很容易走到。
+    ///
+    /// 这与 `cancel` 里"有没有 worker 在跑"的判据保持一致（那里同样把 `AwaitingChoice`
+    /// 排除在外，理由是同一个：这个状态没有 worker 会执行收尾逻辑）。
     fn is_active(&self) -> bool {
         matches!(
             self.state,
-            TaskState::Probing
-                | TaskState::Downloading
-                | TaskState::Merging
-                | TaskState::AwaitingChoice
+            TaskState::Probing | TaskState::Downloading | TaskState::Merging
         )
     }
 }

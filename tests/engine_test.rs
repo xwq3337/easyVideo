@@ -947,6 +947,86 @@ async fn hls_output_does_not_overwrite_an_existing_file() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn awaiting_choice_does_not_starve_the_queue() {
+    // `AwaitingChoice` 没有 worker 在跑，却算作"活跃"、占着并发槽。默认 max_active_tasks = 2，
+    // 于是连续两个 master playlist 任务都停在"等待选择"时，队列里其他任务**永远不会开始** ——
+    // 用户再加一个普通直链也没用，界面上看就是"点了下载什么也没发生"。
+    // 真实世界的 m3u8 大多是 master playlist，这条路很容易走到。
+    let server = MockServer::start().await;
+    let master = "#EXTM3U\n#EXT-X-VERSION:3\n\
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=160x120\nmedia.m3u8\n";
+    for p in ["/m1.m3u8", "/m2.m3u8"] {
+        Mock::given(method("GET"))
+            .and(path(p))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/vnd.apple.mpegurl")
+                    .set_body_string(master),
+            )
+            .mount(&server)
+            .await;
+    }
+    let data: Vec<u8> = (0..2048u32).map(|i| (i % 223) as u8).collect();
+    Mock::given(method("GET"))
+        .and(path("/v.mp4"))
+        .and(header("range", "bytes=0-63"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "video/mp4")
+                .insert_header("content-range", "bytes 0-63/2048")
+                .set_body_bytes(data[0..64].to_vec()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v.mp4"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "video/mp4")
+                .insert_header("content-range", "bytes 0-2047/2048")
+                .set_body_bytes(data.clone()),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let mut s = settings_with(dir.path());
+    s.max_active_tasks = 2; // 默认值：两个"等待选择"就足以把队列占满
+    let engine = Engine::new(rt, s, dir.path().join("data"));
+
+    engine.add_url(format!("{}/m1.m3u8", server.uri()));
+    engine.add_url(format!("{}/m2.m3u8", server.uri()));
+
+    // 两个任务都要停到 AwaitingChoice。**不能**按 id 分别 wait_state：broadcast 每个事件只
+    // 投递一次，先到的那个 id 的事件会在等另一个 id 时被消费掉。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let snaps = engine.list_tasks();
+        if let Some(bad) = snaps
+            .iter()
+            .find(|t| matches!(t.state, TaskState::Failed(_) | TaskState::Canceled))
+        {
+            panic!("任务没有停在等待选择：{:?}", bad.state);
+        }
+        if snaps.iter().filter(|t| t.state == TaskState::AwaitingChoice).count() == 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "两个 master playlist 任务没有停到 AwaitingChoice"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // 两个任务都在等选择、**没有任何 worker 在跑**。现在加一个普通直链，它必须能开始。
+    let mut rx = engine.events();
+    let c = engine.add_url(format!("{}/v.mp4", server.uri()));
+    wait_state(&mut rx, c, TaskState::Done, 30).await;
+    assert_eq!(std::fs::read(dir.path().join("v.mp4")).unwrap(), data);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hls_master_playlist_offers_choice_then_completes() {
     // 真实世界的 m3u8 大多是 master playlist：先停在 AwaitingChoice 等用户选码率，
     // 再经 set_choice 换 URL 重新入队。这条接线（含 set_choice）同样没有测试。
