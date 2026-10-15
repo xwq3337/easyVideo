@@ -318,3 +318,20 @@ describe("humanizeSeconds", () => {
     expect(humanizeSeconds(7175)).toBe("2 小时");
   });
 });
+
+describe("taskRemoved", () => {
+  it("把已知 id 从列表里删掉", () => {
+    const s = { ...initialState, tasks: [task(1), task(2)] };
+    const next = reduce(s, { kind: "event", event: { type: "taskRemoved", id: 1 } });
+    expect(next.tasks.map((t) => t.id)).toEqual([2]);
+  });
+
+  it("未知 id 触发重同步，而不是静默忽略", () => {
+    // 静默忽略会让列表与 core 永久不一致：core 里已经没有这条了，
+    // 界面上却还挂着一个再也点不动的行。
+    const s = { ...initialState, tasks: [task(1)] };
+    const next = reduce(s, { kind: "event", event: { type: "taskRemoved", id: 99 } });
+    expect(next.tasks.map((t) => t.id)).toEqual([1]);
+    expect(next.needsResync).toBe(true);
+  });
+});

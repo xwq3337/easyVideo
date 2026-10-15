@@ -27,7 +27,8 @@ export interface TaskDto {
 export type EventDto =
   | { type: "stateChanged"; id: number; state: StateDto }
   | { type: "progress"; id: number; downloaded: number; total: number; unit: UnitDto }
-  | { type: "choicesOffered"; id: number; kind: ChoiceKindDto };
+  | { type: "choicesOffered"; id: number; kind: ChoiceKindDto }
+  | { type: "taskRemoved"; id: number };
 
 export interface VariantDto {
   uri: string;
