@@ -14,8 +14,12 @@ const MAX_ACTIVE_TASKS = { min: 1, max: 8 } as const;
  * 把输入框的原始字符串夹进 [lo, hi]，与 core 的接受范围一致。
  *
  * `<input type="number" min max>` 挡不住任何东西 —— 程序化设值、粘贴、科学计数法都能
- * 绕过去，而 `save()` 是直接把 draft 发给 core 的。不夹的话 `99999` 会落在 serde 的
- * 原始英文报错上，`-5` / `1e30` 同理，那些英文会原样变成 toast 文案。
+ * 绕过去，而 `save()` 是直接把 draft 发给 core 的。不夹的话有两种坏结果：
+ *
+ * - `-5` / `1e30` 这类值**收不下**（core 那边是 `usize`），会落在 serde 的原始英文
+ *   报错上，那些英文会原样变成 toast 文案；
+ * - `99999` 这种**收得下但荒谬**的值会真的生效 —— 十万个并发分块。
+ *
  * 非法/空值退回 fallback（等价于 egui 滑块拖不动的那一格）。
  */
 function clampInt(raw: string, lo: number, hi: number, fallback: number): number {
@@ -24,6 +28,16 @@ function clampInt(raw: string, lo: number, hi: number, fallback: number): number
   return Math.min(hi, Math.max(lo, Math.round(n)));
 }
 
+/**
+ * 设置**页**（原先是模态对话框）。
+ *
+ * **只有点「保存」才写盘** —— 控件变化一律只落在本地 `draft` 上，不碰 core。
+ * 写盘失败时保留 draft、把 core 回的原文显示出来，用户改一改还能再存一次。
+ * （egui 版每帧落盘的教训。）
+ *
+ * 对话框时代的「取消」/ Esc / 点遮罩丢弃 draft 一并消失：页面没有"取消"这个动作，
+ * 改错了再改回来就是。
+ */
 export default function SettingsPage() {
   const current = useSettings();
   const [draft, setDraft] = useState<SettingsDto | null>(null);
@@ -83,9 +97,13 @@ export default function SettingsPage() {
 
   if (!draft) return null;
 
-  // **不要再加 px-6。** App 的滚动容器已经提供了左右内边距（见 App.tsx 里
-  // "左右内边距放在滚动容器上"那段），这里再加一层，设置页的内容就会比其它页
-  // 多缩进 24px —— 切过去时整块右移，还跟自己的页面标题对不齐。
+  // **不要再给下面的根元素加 px-6。** App 的滚动容器已经提供了左右内边距
+  // （见 App.tsx 里"左右内边距放在滚动容器上"那段），这里再加一层，设置页的
+  // 内容就会比其它页多缩进 24px —— 切过去时整块右移，还跟自己的页面标题对不齐。
+  //
+  // 这条注释写在 `return (` **之上**、用 `//`，不能写成 `{/* … */}` 塞在
+  // `return (` 与根元素之间 —— 那是表达式位置，`{…}` 会被当成空对象字面量，
+  // 后面再跟一个元素就是语法错误（实测 `tsc` 报 TS1005/TS2657/TS1128/TS1109）。
   return (
     <div className="max-w-[520px] pb-8">
       <label className="block mb-5">
