@@ -302,6 +302,20 @@ impl Engine {
             .map(|t| t.state.clone())
     }
 
+    /// 该任务当前的候选列表（`AwaitingChoice` 才有）。
+    ///
+    /// `ChoicesOffered` 是一次性事件：界面一旦错过（广播通道 `Lagged`）或者重连后本地没有副本，
+    /// 就再也弹不出那个模态框 —— 任务会永远停在 `AwaitingChoice`，界面上没有任何按钮可点。
+    /// 这个方法让界面能**重新问一次**，而不必给每个任务都塞一份候选。
+    pub fn pending_choice(&self, id: TaskId) -> Option<ChoiceKind> {
+        self.inner
+            .tasks
+            .lock()
+            .unwrap()
+            .get(&id)
+            .and_then(|t| t.pending_choice.clone())
+    }
+
     /// 应用用户的格式/码率选择，把任务重新入队。
     ///
     /// **只有这次选择有效时才把候选列表取走。** 原先是先 `take()` 再校验：索引越界、或

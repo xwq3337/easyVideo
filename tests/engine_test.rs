@@ -1,5 +1,5 @@
 use easydownvideo::core::engine::Engine;
-use easydownvideo::core::events::{Choice, EngineEvent, TaskState};
+use easydownvideo::core::events::{Choice, ChoiceKind, EngineEvent, TaskState};
 use easydownvideo::core::task::{ManifestKind, TaskManifest};
 use easydownvideo::settings::Settings;
 use wiremock::{
@@ -1323,4 +1323,48 @@ printf 'MERGED-BY-FAKE-FFMPEG' > \"$out\"\nsleep 2\nexit 0\n",
         b"MERGED-BY-FAKE-FFMPEG".to_vec()
     );
     assert!(!tdir.exists(), "完成后任务目录应当清掉");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_choice_survives_a_frontend_that_missed_the_event() {
+    // `ChoicesOffered` 是一次性事件。前端一旦错过它（广播通道 Lagged），
+    // 就必须能**重新问一次**候选列表，否则那个任务永远弹不出模态框、
+    // 界面上也没有任何按钮可点，只能删掉重加。
+    let server = MockServer::start().await;
+    let master = "#EXTM3U\n#EXT-X-VERSION:3\n\
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=160x120\nmedia.m3u8\n";
+    Mock::given(method("GET"))
+        .and(path("/master.m3u8"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.apple.mpegurl")
+                .set_body_string(master),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let engine = Engine::new(rt, settings_with(dir.path()), dir.path().join("data"));
+    let mut rx = engine.events();
+    let id = engine.add_url(format!("{}/master.m3u8", server.uri()));
+
+    wait_state(&mut rx, id, TaskState::AwaitingChoice, 30).await;
+
+    match engine.pending_choice(id) {
+        Some(ChoiceKind::HlsVariants(v)) => {
+            assert_eq!(v.len(), 1, "应当拿到 master playlist 里的那一路码率");
+            assert_eq!(v[0].resolution, Some((160, 120)));
+        }
+        other => panic!("应当拿到 HlsVariants，实际是 {other:?}"),
+    }
+
+    // 没在等选择的任务必须返回 None —— 否则前端会对每个任务都去问一遍
+    let plain = engine.add_url("https://example.com/never-probed.mp4".into());
+    assert!(
+        engine.pending_choice(plain).is_none(),
+        "非 AwaitingChoice 的任务不应有候选列表"
+    );
+    // 不存在的 id 也不能 panic
+    assert!(engine.pending_choice(9999).is_none());
 }
