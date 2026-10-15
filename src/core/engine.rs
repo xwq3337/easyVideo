@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -546,7 +546,7 @@ impl Engine {
                         }
                     }
                 }
-                let (final_path, tdir) = self.paths(id, &settings);
+                let (final_path, tdir) = self.paths(id, &settings, None);
                 // 任务一开始就写 manifest：中途退出应用可据扫描恢复。
                 //
                 // **必须在状态切到 Downloading 之前落盘。** Downloading 对外承诺
@@ -628,7 +628,8 @@ impl Engine {
             }
             ParsedPlaylist::Media(m) => m,
         };
-        let (final_path, tdir) = self.paths(id, settings);
+        // 产物是 mp4，所以唯一性也必须按 mp4 判（见 `paths` 的说明）
+        let (final_path, tdir) = self.paths(id, settings, Some("mp4"));
         // HLS 任务同样要落 manifest：否则中途退出后无法续传，违反 spec §6。
         // 记的是 media playlist 的 URL（master 已在上面转成具体码率的 media）。
         // 与 Direct 分支同理：manifest 先落盘，再切 Downloading 状态。
@@ -668,18 +669,29 @@ impl Engine {
             Some(p) => p.clone(),
             None => ensure_ffmpeg(&self.inner.data_dir)?,
         };
-        let out_mp4 = final_path.with_extension("mp4");
-        remux_to_mp4(&ffmpeg, &plan, &out_mp4).await?;
+        remux_to_mp4(&ffmpeg, &plan, &final_path).await?;
         // 合并成功后整个任务目录（含 manifest、分片、concat 列表）一起清掉，
         // 避免重启时 scan_resume 把已完成任务复活
         std::fs::remove_dir_all(&tdir).ok();
         Ok(())
     }
 
-    fn paths(&self, id: TaskId, settings: &Settings) -> (PathBuf, PathBuf) {
+    /// 定下任务实际使用的任务目录与最终文件路径。
+    ///
+    /// `output_ext` 是**最终产物**的扩展名：Direct 传 `None`（直接用 entry 上当前的文件名），
+    /// HLS 必须传 `Some("mp4")`。唯一性检查必须针对**最终产物**的名字 —— HLS 的入口是
+    /// `master.m3u8` 而产物是 `master.mp4`：拿 `.m3u8` 去查当然查不到冲突（那个文件根本
+    /// 不会被创建），`unique_path` 于是放行，接着 ffmpeg 带着 `-y` 把用户已存在的
+    /// `master.mp4` 直接覆盖掉，**用户的文件永久丢失且全程没有任何提示**。
+    fn paths(
+        &self,
+        id: TaskId,
+        settings: &Settings,
+        output_ext: Option<&str>,
+    ) -> (PathBuf, PathBuf) {
         let root = &settings.download_dir;
         let tdir = task_dir(root, id);
-        let filename = self
+        let current = self
             .inner
             .tasks
             .lock()
@@ -688,6 +700,13 @@ impl Engine {
             .expect("task entry present")
             .filename
             .clone();
+        let filename = match output_ext {
+            Some(ext) => Path::new(&current)
+                .with_extension(ext)
+                .to_string_lossy()
+                .into_owned(),
+            None => current,
+        };
         let final_path = unique_path(root, &filename);
         (final_path, tdir)
     }

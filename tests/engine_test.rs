@@ -672,6 +672,59 @@ async fn hls_media_playlist_end_to_end() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hls_output_does_not_overwrite_an_existing_file() {
+    // HLS 的最终产物是 `.mp4`，但唯一性检查用的是**入口的扩展名**（`master.m3u8`）。
+    // `master.m3u8` 当然不存在，于是 `unique_path` 放行，而产物 `master.mp4` 被交给
+    // ffmpeg 的 `-y` 直接覆盖 —— 用户自己的同名文件**永久丢失**，全程没有任何提示。
+    // 重复下载同一个 m3u8（很常见）、或下载目录里本来就有个同名 mp4，都会踩到。
+    let ts = ts_fixture();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/master.m3u8"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.apple.mpegurl")
+                .set_body_string(MEDIA_PLAYLIST),
+        )
+        .mount(&server)
+        .await;
+    for seg in ["/seg0.ts", "/seg1.ts"] {
+        Mock::given(method("GET"))
+            .and(path(seg))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "video/mp2t")
+                    .set_body_bytes(ts.clone()),
+            )
+            .mount(&server)
+            .await;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    // 用户自己的、与将要产出的成品同名的文件
+    let existing = dir.path().join("master.mp4");
+    let sentinel = b"USER-OWNED-FILE-DO-NOT-TOUCH".to_vec();
+    std::fs::write(&existing, &sentinel).unwrap();
+
+    let rt = tokio::runtime::Handle::current();
+    let engine = Engine::new(rt, settings_with(dir.path()), dir.path().join("data"));
+    let mut rx = engine.events();
+    let id = engine.add_url(format!("{}/master.m3u8", server.uri()));
+
+    wait_state(&mut rx, id, TaskState::Done, 120).await;
+
+    assert_eq!(
+        std::fs::read(&existing).unwrap(),
+        sentinel,
+        "已存在的 master.mp4 被静默覆盖了 —— 用户的文件就这么丢了"
+    );
+    let renamed = dir.path().join("master (1).mp4");
+    let meta = std::fs::metadata(&renamed)
+        .unwrap_or_else(|e| panic!("新产物应当落到 {}：{e}", renamed.display()));
+    assert!(meta.len() > 0, "改名后的产物不应为空");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hls_master_playlist_offers_choice_then_completes() {
     // 真实世界的 m3u8 大多是 master playlist：先停在 AwaitingChoice 等用户选码率，
     // 再经 set_choice 换 URL 重新入队。这条接线（含 set_choice）同样没有测试。
