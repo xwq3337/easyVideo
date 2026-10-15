@@ -1367,4 +1367,12 @@ async fn pending_choice_survives_a_frontend_that_missed_the_event() {
     );
     // 不存在的 id 也不能 panic
     assert!(engine.pending_choice(9999).is_none());
+
+    // 候选被消费掉之后必须返回 None。前端在用户选完之后会清掉本地副本，
+    // 若这里还留着，重同步会把一个已经开始下载的任务又弹回"等待选择"。
+    engine.set_choice(id, Choice::Variant(0));
+    assert!(
+        engine.pending_choice(id).is_none(),
+        "选择已被消费，候选列表不该还在"
+    );
 }

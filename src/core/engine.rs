@@ -302,11 +302,16 @@ impl Engine {
             .map(|t| t.state.clone())
     }
 
-    /// 该任务当前的候选列表（`AwaitingChoice` 才有）。
+    /// 该任务当前保存的候选列表。
     ///
     /// `ChoicesOffered` 是一次性事件：界面一旦错过（广播通道 `Lagged`）或者重连后本地没有副本，
     /// 就再也弹不出那个模态框 —— 任务会永远停在 `AwaitingChoice`，界面上没有任何按钮可点。
     /// 这个方法让界面能**重新问一次**，而不必给每个任务都塞一份候选。
+    ///
+    /// 读的是候选字段本身，**不看状态**。所以：一个在 `AwaitingChoice` 时被 `cancel()` 掉的
+    /// 任务仍会返回 `Some(..)`（`cancel` 不清这个字段，只有 `retry` 与 `set_choice` 清）。
+    /// 调用方应当先按状态过滤 —— 当前唯一的调用方（前端 `ChoiceDialog` 与 `store.hydrate()`）
+    /// 正是这么做的。
     pub fn pending_choice(&self, id: TaskId) -> Option<ChoiceKind> {
         self.inner
             .tasks
