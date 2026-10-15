@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { humanizeSeconds, initialState, reduce } from "./reducer";
+import { humanizeSeconds, initialState, reduce, selectPendingChoice } from "./reducer";
 import type { ChoiceKindDto, SettingsDto, TaskView } from "../lib/types";
 
 function task(id: number, over: Partial<TaskView> = {}): TaskView {
@@ -224,6 +224,75 @@ describe("reduce", () => {
     const after = reduce(before, { kind: "choices", id: 1, choices: cached });
     expect(after.tasks[0].choices).toEqual(cached);
     expect(after.tasks[1].choices).toBeNull();
+  });
+
+  // 「稍后再说」：任务停在 awaitingChoice 时可以暂时压下选择框而不取消下载。
+  // 下面是这套抑制逻辑的四条不变量，也是 ChoiceDialog 取谁的关键。
+  const waiting = (id: number) => task(id, { state: { kind: "awaitingChoice" } });
+
+  it("dismissChoice 压住它，openChoice 又放出来", () => {
+    const before = { ...initialState, tasks: [waiting(1), waiting(2)] };
+    const dismissed = reduce(before, { kind: "dismissChoice", id: 1 });
+    expect(dismissed.dismissedChoices).toEqual([1]);
+    // 压住 id 1 之后，该弹的就是 id 2。
+    expect(selectPendingChoice(dismissed.tasks, dismissed.dismissedChoices)?.id).toBe(2);
+
+    const reopened = reduce(dismissed, { kind: "openChoice", id: 1 });
+    expect(reopened.dismissedChoices).toEqual([]);
+    expect(selectPendingChoice(reopened.tasks, reopened.dismissedChoices)?.id).toBe(1);
+  });
+
+  it("dismissChoice 不动任务本身：只是「先不弹」，不是取消", () => {
+    const before = { ...initialState, tasks: [waiting(1)] };
+    const after = reduce(before, { kind: "dismissChoice", id: 1 });
+    expect(after.tasks).toEqual(before.tasks);
+    expect(after.tasks[0].state.kind).toBe("awaitingChoice");
+  });
+
+  it("两条等待任务、只压住 id 大的那条：仍然弹 id 小的那条", () => {
+    // 最低 id 优先 —— 与数组顺序无关，压住 7 不影响"该弹 3"这条规则。
+    const before = { ...initialState, tasks: [waiting(3), waiting(7)] };
+    const after = reduce(before, { kind: "dismissChoice", id: 7 });
+    expect(selectPendingChoice(after.tasks, after.dismissedChoices)?.id).toBe(3);
+
+    // 两条都被压住 → 不弹（ChoiceDialog 此时渲染 null）。
+    const both = reduce(after, { kind: "dismissChoice", id: 3 });
+    expect(selectPendingChoice(both.tasks, both.dismissedChoices)).toBeNull();
+  });
+
+  it("任务离开 awaitingChoice 就放掉抑制记录：重新进入时会再弹", () => {
+    const before = { ...initialState, tasks: [waiting(1)], dismissedChoices: [1] };
+    const left = reduce(before, {
+      kind: "event",
+      event: { type: "stateChanged", id: 1, state: { kind: "downloading" } },
+    });
+    expect(left.dismissedChoices).toEqual([]);
+
+    // 以后若再次进入等待选择（例如又一次 choicesOffered），不再被旧记录压住。
+    const back = reduce(left, {
+      kind: "event",
+      event: {
+        type: "choicesOffered",
+        id: 1,
+        kind: { kind: "hlsVariants", hlsVariants: [] },
+      },
+    });
+    expect(selectPendingChoice(back.tasks, back.dismissedChoices)?.id).toBe(1);
+  });
+
+  it("hydrate 保住仍等待选择者的抑制记录，放掉已离开者的", () => {
+    // 重同步整体替换任务列表。仍然 awaitingChoice 的 id 要保住（否则"稍后再说"被重同步
+    // 抹掉、模态框立刻又弹回来）；已经被 core 报成别的状态的 id 要放掉（哪怕中途的事件丢过）。
+    const before = {
+      ...initialState,
+      tasks: [waiting(1), waiting(2)],
+      dismissedChoices: [1, 2],
+    };
+    const after = reduce(before, {
+      kind: "hydrate",
+      tasks: [waiting(1), task(2, { state: { kind: "downloading" } })],
+    });
+    expect(after.dismissedChoices).toEqual([1]);
   });
 });
 

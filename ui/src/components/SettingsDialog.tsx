@@ -9,6 +9,22 @@ interface Props {
   onClose: () => void;
 }
 
+/** 线程数/并发任务数的上界，与 core 的接受范围一致（egui 版是这两个取值的滑块）。 */
+const SEGMENT_CONCURRENCY = { min: 1, max: 16 } as const;
+const MAX_ACTIVE_TASKS = { min: 1, max: 8 } as const;
+
+/**
+ * 把输入框的原始字符串夹进 [lo, hi]。`<input type="number" min max>` 挡不住任何东西 ——
+ * 程序化设值、粘贴、科学计数法都能绕过去，而 save() 是直接把 draft 发给 core 的。
+ * 不夹的话 `99999` 会落在 serde 的原始英文报错上、`-5`/`1e30` 同理，那些英文会原样变成
+ * toast 文案。非法/空值退回 fallback（等价于 egui 滑块拖不动的那一格）。
+ */
+function clampInt(raw: string, lo: number, hi: number, fallback: number): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(hi, Math.max(lo, Math.round(n)));
+}
+
 /**
  * 设置对话框。**只有点"保存"才写盘** —— 控件变化一律只落在本地 `draft` 上，
  * 不碰 core。（egui 版每帧落盘的教训。）"取消"、Esc、点遮罩都直接丢弃 draft。
@@ -57,8 +73,25 @@ export default function SettingsDialog({ open, onClose }: Props) {
   }
 
   async function save() {
+    // 提交前再夹一次：onChange 已夹过，但"onChange 一定跑过"这件事不该由 save 来假设
+    // （draft 若被别的路径设成越界值，这里就是唯一还站着的闸）。
+    const toSave = {
+      ...d,
+      segmentConcurrency: clampInt(
+        String(d.segmentConcurrency),
+        SEGMENT_CONCURRENCY.min,
+        SEGMENT_CONCURRENCY.max,
+        SEGMENT_CONCURRENCY.min
+      ),
+      maxActiveTasks: clampInt(
+        String(d.maxActiveTasks),
+        MAX_ACTIVE_TASKS.min,
+        MAX_ACTIVE_TASKS.max,
+        MAX_ACTIVE_TASKS.min
+      ),
+    };
     try {
-      await ipc.updateSettings(d);
+      await ipc.updateSettings(toSave);
     } catch (e) {
       setError(String(e));
       return;
@@ -125,7 +158,17 @@ export default function SettingsDialog({ open, onClose }: Props) {
             value={d.segmentConcurrency}
             onChange={(e) =>
               setDraft((prev) =>
-                prev ? { ...prev, segmentConcurrency: Number(e.target.value) || 1 } : prev
+                prev
+                  ? {
+                      ...prev,
+                      segmentConcurrency: clampInt(
+                        e.target.value,
+                        SEGMENT_CONCURRENCY.min,
+                        SEGMENT_CONCURRENCY.max,
+                        SEGMENT_CONCURRENCY.min
+                      ),
+                    }
+                  : prev
               )
             }
             className="w-24 rounded-md px-2.5 py-1.5 border mt-1"
@@ -142,7 +185,17 @@ export default function SettingsDialog({ open, onClose }: Props) {
             value={d.maxActiveTasks}
             onChange={(e) =>
               setDraft((prev) =>
-                prev ? { ...prev, maxActiveTasks: Number(e.target.value) || 1 } : prev
+                prev
+                  ? {
+                      ...prev,
+                      maxActiveTasks: clampInt(
+                        e.target.value,
+                        MAX_ACTIVE_TASKS.min,
+                        MAX_ACTIVE_TASKS.max,
+                        MAX_ACTIVE_TASKS.min
+                      ),
+                    }
+                  : prev
               )
             }
             className="w-24 rounded-md px-2.5 py-1.5 border mt-1"

@@ -1,6 +1,8 @@
+import { useEffect } from "react";
 import * as ipc from "../lib/ipc";
 import { formatSize } from "../lib/format";
-import { run, useTaskList } from "../store/store";
+import { dispatch, run, useDismissedChoices, useTaskList } from "../store/store";
+import { selectPendingChoice } from "../store/reducer";
 
 /**
  * "选清晰度"与"选格式"是同一个组件的两种数据。
@@ -14,15 +16,31 @@ import { run, useTaskList } from "../store/store";
  * 后面那层会盖住并吞掉点击，前面那个任务的按钮就永远点不到（egui 版"两个模态框、
  * 有一个是死的"就是这个毛病）。所以这里只取一个来显示，解决掉或取消掉它，
  * 下一个自然出现。
+ *
+ * **可以关掉而不取消**：这个 fixed inset-0 遮罩没有点击穿透，过去唯一的出口是选一个格式
+ * 或者「取消下载」—— 于是某个任务一直在等选择时，整个界面就被它冻住了，别的 URL 粘不进来、
+ * 设置也打不开（egui 版是可关闭的浮动窗 + 每行一个「选择格式」按钮，这是对齐它）。
+ * 现在「稍后再说」/Esc 只把这一条压下去（dispatch dismissChoice，不碰下载），
+ * 由 TaskRow 的「选择格式」再把它放回来（openChoice）。
  */
 export default function ChoiceDialog() {
   const tasks = useTaskList();
-  const waiting = tasks.filter((t) => t.state.kind === "awaitingChoice");
-  if (waiting.length === 0) return null;
+  const dismissed = useDismissedChoices();
+  // id 最小的、且没被「稍后再说」压住的那条；全被压住时返回 null。
+  const task = selectPendingChoice(tasks, dismissed);
+  const taskId = task?.id ?? null;
 
-  // "第一个"取 id 最小的那个：id 由 core 单调分配，等价于"最早排队的先答"，
-  // 与数组顺序、对象身份都无关 —— 重同步整体替换数组时也不会换人。
-  const task = waiting.reduce((a, b) => (b.id < a.id ? b : a));
+  // Esc 与「稍后再说」同义：压下去，绝不取消下载。
+  useEffect(() => {
+    if (taskId === null) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") dispatch({ kind: "dismissChoice", id: taskId });
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [taskId]);
+
+  if (task === null) return null;
 
   return (
     <div
@@ -82,7 +100,14 @@ export default function ChoiceDialog() {
           </div>
         )}
 
-        <div className="flex justify-end mt-4">
+        <div className="flex justify-end gap-2 mt-4">
+          <button
+            onClick={() => dispatch({ kind: "dismissChoice", id: task.id })}
+            className="rounded-md px-3 py-1.5 border"
+            style={{ borderColor: "var(--line-strong)" }}
+          >
+            稍后再说
+          </button>
           <button onClick={() => void run(ipc.cancel(task.id))}>取消下载</button>
         </div>
       </div>

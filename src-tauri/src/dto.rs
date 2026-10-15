@@ -258,17 +258,25 @@ mod tests {
     }
 
     #[test]
-    fn progress_event_maps_field_by_field() {
+    fn progress_event_pins_every_key() {
+        // 走**整个对象相等**：id/total 与 type/unit/downloaded 同属这一份契约，
+        // 任何一个键改名或漏掉都要在这里变红，而不是静默地只在 TS 镜像里错位。
         let d = event_dto(EngineEvent::Progress {
             id: 3,
             downloaded: 100,
             total: 400,
             unit: ProgressUnit::Segments,
         });
-        let j = serde_json::to_value(&d).unwrap();
-        assert_eq!(j["type"], "progress");
-        assert_eq!(j["unit"], "segments");
-        assert_eq!(j["downloaded"], 100);
+        assert_eq!(
+            serde_json::to_value(&d).unwrap(),
+            serde_json::json!({
+                "type": "progress",
+                "id": 3,
+                "downloaded": 100,
+                "total": 400,
+                "unit": "segments"
+            })
+        );
     }
 
     #[test]

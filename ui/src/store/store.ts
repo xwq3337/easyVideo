@@ -30,17 +30,47 @@ export function dispatch(action: Action) {
 }
 
 let resyncInFlight = false;
+
+/**
+ * 拉全量（get_tasks / get_settings）失败后是否已经报过一次。
+ *
+ * 为什么要这个闩：未知 id 的事件是**每个进度 tick 都来一条**的。若每次失败都各报一条
+ * toast、各重试一次，用户会被同一件坏消息刷屏，而且每个 tick 都白打一次必然失败的 IPC。
+ * 于是规定：一次失败只报一次、只重试一次；直到下一次拉取**成功**才解锁。
+ */
+let reloadFailureReported = false;
+
+function reportReloadFailure(e: unknown) {
+  if (reloadFailureReported) return;
+  reloadFailureReported = true;
+  dispatch({ kind: "pushToast", text: typeof e === "string" ? e : String(e) });
+}
+
 function scheduleResyncIfNeeded() {
-  if (!state.needsResync || resyncInFlight) return;
+  // 上次就失败了：别再每个 tick 都重试 + 报错。needsResync 留着，等下次成功后再恢复调度。
+  if (!state.needsResync || resyncInFlight || reloadFailureReported) return;
   resyncInFlight = true;
   // 不在这里清 needsResync：hydrate 会清。这样连续来几个未知 id 也只拉一次。
+  // hydrate 自带 catch，永远不会 reject，所以这里没有未处理的 rejection。
   void hydrate().finally(() => {
     resyncInFlight = false;
   });
 }
 
+/**
+ * 拉一次全量任务。**自带显式 catch**：失败时只报一次 toast 就收手，绝不向外抛 ——
+ * 每个调用点（每个 tick 的重同步、startBridge、addUrl）都不必再接 rejection。
+ * 见 item 2 的说明与 final-fix-wave 报告。
+ */
 export async function hydrate() {
-  const dtos = await ipc.getTasks();
+  let dtos: Awaited<ReturnType<typeof ipc.getTasks>>;
+  try {
+    dtos = await ipc.getTasks();
+  } catch (e) {
+    reportReloadFailure(e);
+    return;
+  }
+  reloadFailureReported = false;
   dispatch({
     kind: "hydrate",
     // 速度/剩余时间是"两次事件之间"的量，全量刷新时无从谈起 —— 一律归零，
@@ -58,14 +88,22 @@ export async function hydrate() {
   // 这一步就是"丢掉 ChoicesOffered 之后模态框还能弹出来"的唯一保证。
   for (const t of state.tasks) {
     if (t.state.kind === "awaitingChoice" && t.choices === null) {
-      const c = await ipc.pendingChoice(t.id);
+      // 单条补齐失败只落一条 toast（run()），不带崩整次重同步。
+      const c = await run(ipc.pendingChoice(t.id));
       if (c) dispatch({ kind: "choices", id: t.id, choices: c });
     }
   }
 }
 
+/** 拉一次设置。与 hydrate 同理：自带 catch，失败只报一次 toast，不向外抛。 */
 export async function loadSettings() {
-  dispatch({ kind: "settings", settings: await ipc.getSettings() });
+  try {
+    const settings = await ipc.getSettings();
+    reloadFailureReported = false;
+    dispatch({ kind: "settings", settings });
+  } catch (e) {
+    reportReloadFailure(e);
+  }
 }
 
 /**
@@ -92,13 +130,20 @@ export function useToasts(): string[] {
 
 /** 由 <App> 在挂载时调用一次。 */
 export async function startBridge() {
-  await ipc.onEngineEvent((event) => dispatch({ kind: "event", event }));
-  await ipc.onResync((dropped) => dispatch({ kind: "resyncRequested", dropped }));
+  // startBridge 是 `void startBridge()` 调起来的，任何漏出的 rejection 都没人接。
+  // 监听注册失败（webview 权限之类）也只报一条 toast；hydrate 自带 catch。
+  await run(ipc.onEngineEvent((event) => dispatch({ kind: "event", event })));
+  await run(ipc.onResync((dropped) => dispatch({ kind: "resyncRequested", dropped })));
   await hydrate();
 }
 
 export function useTaskList(): TaskView[] {
   return useSyncExternalStore(store.subscribe, store.getSnapshot).tasks;
+}
+
+/** 被「稍后再说」压住、暂不弹选择框的任务 id。 */
+export function useDismissedChoices(): number[] {
+  return useSyncExternalStore(store.subscribe, store.getSnapshot).dismissedChoices;
 }
 
 export function useSettings() {

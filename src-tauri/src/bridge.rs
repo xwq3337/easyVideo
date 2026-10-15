@@ -125,7 +125,11 @@ mod tests {
         assert_eq!(got[0].1["state"]["kind"], "done");
     }
 
-    #[tokio::test]
+    // 显式钉住 current_thread：这条测试的确定性依赖"单线程运行时"——桥的循环与
+    // `tx.send(..)` 在同一线程上交错推进，`resyncs.len() == 1` 才稳定。
+    // 默认 flavour 恰好是 current_thread，但那是个**未言明的**依赖：有人给 crate
+    // 配了 multi_thread、或把这条测试搬到别的 runtime 上，它就会开始随机变红。
+    #[tokio::test(flavor = "current_thread")]
     async fn lagged_turns_into_a_resync_signal_instead_of_silence() {
         // 这是整个桥存在的理由：广播通道容量有限，跟不上的时候**丢掉的是最旧的消息**。
         // 把 Lagged 当成"队列空"（egui 版就是这么写的），界面会永久停在一个错误状态：

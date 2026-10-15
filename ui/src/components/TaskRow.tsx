@@ -4,7 +4,9 @@ import { formatSize, formatSpeed } from "../lib/format";
 import * as ipc from "../lib/ipc";
 import { dispatch, run } from "../store/store";
 
-const LABELS: Record<string, string> = {
+// 类型钉在 StateDto 的联合上：以后 core 加了新状态而这里漏了，**编译就红**，
+// 而不是渲染出一个空白的状态格（Record<string, string> 是绝不会报错的）。
+const LABELS: Record<TaskView["state"]["kind"], string> = {
   queued: "排队中",
   probing: "解析中",
   awaitingChoice: "等待选择",
@@ -16,8 +18,12 @@ const LABELS: Record<string, string> = {
   canceled: "已取消",
 };
 
+/** 已经走到头、不会再产出下载的状态。对这些行，按钮只是把它移出列表，并不删任何文件。 */
+const TERMINAL: ReadonlyArray<TaskView["state"]["kind"]> = ["done", "failed", "canceled"];
+
 export default function TaskRow({ task }: { task: TaskView }) {
   const [draft, setDraft] = useState(task.filename);
+  const isTerminal = TERMINAL.includes(task.state.kind);
   const pct =
     task.total > 0 ? Math.min(100, Math.round((task.downloaded / task.total) * 100)) : 0;
   // 只用来取色；中文取词统一走 LABELS。纯展示，不进 reducer。
@@ -85,6 +91,11 @@ export default function TaskRow({ task }: { task: TaskView }) {
         </span>
       </div>
 
+      {/* 源地址：文件名不透明时（m3u8 / yt-dlp 起的名）靠它认人。egui 版也是把它摆在名字底下。 */}
+      <div className="truncate text-[12px]" style={{ color: "var(--fg-muted)" }} title={task.url}>
+        {task.url}
+      </div>
+
       <div
         className="h-1 rounded-full my-1.5 overflow-hidden"
         style={{ background: "var(--track)" }}
@@ -108,6 +119,10 @@ export default function TaskRow({ task }: { task: TaskView }) {
           {task.etaText ? ` · ${task.etaText}` : ""}
         </span>
         <span className="shrink-0 flex gap-3">
+          {task.state.kind === "awaitingChoice" && (
+            // 等待选择的行可以把选择框重新叫回来（「稍后再说」把它压下去之后的出口）。
+            <button onClick={() => dispatch({ kind: "openChoice", id: task.id })}>选择格式</button>
+          )}
           {task.state.kind === "paused" && (
             <button onClick={() => void run(ipc.unpause(task.id))}>继续</button>
           )}
@@ -118,7 +133,12 @@ export default function TaskRow({ task }: { task: TaskView }) {
           {["queued", "probing", "downloading", "merging"].includes(task.state.kind) && (
             <button onClick={() => void run(ipc.pause(task.id))}>暂停</button>
           )}
-          <button onClick={() => void run(ipc.cancel(task.id))}>删除</button>
+          {/* 标签按状态说实话：对已结束的行，cancel 不删盘上的任何东西、只是把它移出列表
+              （core 永远是唯一真相源，不做删除），此时叫「删除」是假话，而且紧接着的
+              「已取消」还会跟「已完成」自相矛盾。取消中的行才是真的在取消。 */}
+          <button onClick={() => void run(ipc.cancel(task.id))}>
+            {isTerminal ? "从列表移除" : "删除"}
+          </button>
         </span>
       </div>
 

@@ -1,20 +1,34 @@
 import { useState } from "react";
 import WindowControls from "./WindowControls";
+import { normalizeUrl } from "../lib/url";
+import { dispatch } from "../store/store";
 
 interface Props {
-  onAdd: (url: string) => Promise<void>;
+  /** 返回是否真的建了任务 —— 决定清不清输入框（失败时留住，用户能改一改再试）。 */
+  onAdd: (url: string) => Promise<boolean>;
   onOpenSettings: () => void;
-  busy?: boolean;
 }
 
-export default function Toolbar({ onAdd, onOpenSettings, busy }: Props) {
+export default function Toolbar({ onAdd, onOpenSettings }: Props) {
   const [url, setUrl] = useState("");
+  const [adding, setAdding] = useState(false);
 
   async function submit() {
-    const v = url.trim();
-    if (!v) return;
-    await onAdd(v);
-    setUrl("");
+    if (adding) return; // 防连点：一次只提交一个，否则双击会拿同一条 URL 建两个任务
+    const normalized = normalizeUrl(url);
+    if (normalized === null) {
+      // 空输入按旧行为静默忽略；非空但不是 http(s)（egui 版原话）才提示，且**不建任务**。
+      if (url.trim() !== "") dispatch({ kind: "pushToast", text: "请输入 http(s) 链接" });
+      return;
+    }
+    setAdding(true);
+    try {
+      // 失败（add_url 走 run，失败只落一条 toast）时把 URL 留在框里：
+      // 用户要重试/改的就是它，清掉等于逼他重新粘贴一次。成功才清空。
+      if (await onAdd(normalized)) setUrl("");
+    } finally {
+      setAdding(false);
+    }
   }
 
   return (
@@ -44,7 +58,7 @@ export default function Toolbar({ onAdd, onOpenSettings, busy }: Props) {
       />
       <button
         onClick={() => void submit()}
-        disabled={busy || url.trim() === ""}
+        disabled={adding || url.trim() === ""}
         className="rounded-md px-3 py-1.5 font-medium disabled:opacity-40 transition-opacity"
         style={{ background: "var(--fill)", color: "var(--btn-fg)" }}
       >
