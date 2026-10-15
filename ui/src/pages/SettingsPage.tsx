@@ -3,30 +3,13 @@ import type { SettingsDto } from "../lib/types";
 import * as ipc from "../lib/ipc";
 import { loadSettings, run, useSettings } from "../store/store";
 import { readThemeMode, setThemeMode, type ThemeMode } from "../lib/theme";
+import { clampInt } from "../lib/clampInt";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 const SEGMENT_CONCURRENCY = { min: 1, max: 16 } as const;
 const MAX_ACTIVE_TASKS = { min: 1, max: 8 } as const;
-
-/**
- * 把输入框的原始字符串夹进 [lo, hi]，与 core 的接受范围一致。
- *
- * `<input type="number" min max>` 挡不住任何东西 —— 程序化设值、粘贴、科学计数法都能
- * 绕过去，而 `save()` 是直接把 draft 发给 core 的。不夹的话有两种坏结果：
- *
- * - `-5` / `1e30` 这类值**收不下**（core 那边是 `usize`），会落在 serde 的原始英文
- *   报错上，那些英文会原样变成 toast 文案；
- * - `99999` 这种**收得下但荒谬**的值会真的生效 —— 十万个并发分块。
- *
- * 非法/空值退回 fallback（等价于 egui 滑块拖不动的那一格）。
- */
-function clampInt(raw: string, lo: number, hi: number, fallback: number): number {
-  const n = Number(raw);
-  if (!Number.isFinite(n)) return fallback;
-  return Math.min(hi, Math.max(lo, Math.round(n)));
-}
 
 /**
  * 设置**页**（原先是模态对话框）。

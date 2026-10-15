@@ -66,8 +66,9 @@ struct TaskEntry {
     dir: Option<PathBuf>,
 }
 
-/// worker 生命周期守卫：退出时把该任务的 worker 计数减回去、释放最终路径的占用，并再
-/// `pump` 一次。
+/// worker 生命周期守卫：退出时**先释放最终路径的占用、再把该任务的 worker 计数减回去**，
+/// 最后再 `pump` 一次。这三步的先后顺序本身是有约束的（`remove_task` 的 `workers == 0`
+/// 准入闸依赖它），逐条理由见下面 `drop` 里的行内注释。
 ///
 /// 用 `Drop` 而不是在收尾处手写一次减法：收尾路径里有早退、有 `?`、也有 panic 的可能，
 /// 而计数一旦泄漏（没有减回去），这个任务就**永远不会再被启动** —— 比它要修的缺陷更糟。
@@ -894,7 +895,12 @@ impl Engine {
         }
         // 这里**不需要**碰 `reserved_paths`：`workers == 0` 意味着 `WorkerGuard::drop`
         // 已经跑完 `release_reserved_path`（上面刚把它排到 `fetch_sub` 之前）。
-        std::fs::remove_dir_all(&tdir).ok();
+        if let Err(e) = std::fs::remove_dir_all(&tdir) {
+            // **不能吞掉。** 目录还在，manifest 就还在，重启时 `scan_resume` 会把用户
+            // 刚"移除"的任务原样捞回来 —— 正是这个功能承诺不会发生的事。
+            // 内存条目此刻已经删了，界面不会再显示它，所以这条日志是唯一的线索。
+            tracing::warn!("remove_task {id}: 删除任务目录 {tdir:?} 失败: {e}");
+        }
         let _ = self.inner.tx.send(EngineEvent::TaskRemoved { id });
         true
     }

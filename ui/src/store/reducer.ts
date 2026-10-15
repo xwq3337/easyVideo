@@ -159,19 +159,22 @@ export function reduce(state: UiState, action: Action): UiState {
 }
 
 function applyEvent(state: UiState, event: EventDto, now: number): UiState {
-  // 移除是唯一一条"任务会从列表里消失"的事件,它必须在 `known` 检查之前处理:
-  // 已移除的 id 本来就不在 tasks 里,走下面那条路会被当成"未知 id"而触发一次
-  // 毫无必要的重同步。
+  // 移除单独处理，**不是**因为它必须抢在 `known` 检查之前 —— 真放到后面去，
+  // 未知 id 也只会走那条 `!known` 早返回，置出完全相同的 `needsResync: true`。
+  // 真正的理由是结构：移除不是一次"更新"，套不进下面那台"按 id 找到那一行、
+  // 就地改字段"的机器 —— 它改的是列表本身的长度。
   if (event.type === "taskRemoved") {
     const exists = state.tasks.some((t) => t.id === event.id);
     if (!exists) {
-      // 没这个 id:可能事件先于 hydrate 到达。与其它事件同义 —— 拉一次全量对齐。
+      // 没这个 id：可能事件先于 hydrate 到达。与其它事件同义 —— 拉一次全量对齐。
       return { ...state, needsResync: true };
     }
     return {
       ...state,
       tasks: state.tasks.filter((t) => t.id !== event.id),
-      // 顺手把"稍后再说"的抑制记录里那条也放掉,否则 id 若被复用会残留。
+      // 顺手把"稍后再说"的抑制记录里那条也放掉。**这条是防御性的**：id 在一次会话内
+      // 不会被复用（core 的 `next_id` 单调递增，`resume()` 用 `fetch_max`），而
+      // dismissedChoices 本来就只活在内存里。留着它，只是让这份名单始终只装活着的 id。
       dismissedChoices: state.dismissedChoices.filter((id) => id !== event.id),
       needsResync: false,
     };

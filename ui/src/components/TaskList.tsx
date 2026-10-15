@@ -14,9 +14,18 @@ export default function TaskList() {
     );
   }
   return (
-    // 区块之间改用背景色差而不是分隔线。列表行之间仍保留发丝线 ——
-    // 列表需要它来对齐视线，区块不需要。
-    <div className="rounded-xl overflow-hidden" style={{ background: "var(--bg-subtle)" }}>
+    // 列表这块靠背景色差（--bg-subtle）与页面底色区分，不画外框；行与行之间仍保留发丝线 ——
+    // 列表需要它来对齐视线。**这只说列表**：侧边栏的上下两块之间仍然是 borderRight /
+    // borderTop 的实线，不受这句话约束。
+    <div
+      // 末行自己那条 borderBottom 正好压在容器的底边上，会被 rounded-xl + overflow-hidden
+      // 的两个圆角切掉两端，看着像断了一截。去掉它，让列表以圆角收口。
+      //
+      // 末尾那个 `!` 不是多余：TaskRow 的边框写在**行内 style** 上，而行内样式
+      // 压得过任何普通 class —— 没有 `!` 的话这条规则会被静默吃掉，看着就像没写。
+      className="rounded-xl overflow-hidden [&>div:last-child]:border-b-0!"
+      style={{ background: "var(--bg-subtle)" }}
+    >
       {tasks.map((t) => (
         <TaskRow key={t.id} task={t} />
       ))}

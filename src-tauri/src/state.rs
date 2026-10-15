@@ -1,7 +1,7 @@
 //! 应用级共享状态：引擎句柄 + 设置副本。
 //!
 //! 这是把 Task 1–5 的零件装起来的那一层：`main` 建好 runtime、装好 `AppState` 交给 Tauri
-//! `manage`，12 个命令从 `State<'_, AppState>` 里取。
+//! `manage`，命令层从 `State<'_, AppState>` 里取。
 
 use std::path::PathBuf;
 use std::sync::Mutex;

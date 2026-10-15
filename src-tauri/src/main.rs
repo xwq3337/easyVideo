@@ -1,4 +1,4 @@
-//! 组装层:把 core 引擎、自建 tokio runtime、事件桥和 12 个命令接成一个能跑的应用。
+//! 组装层:把 core 引擎、自建 tokio runtime、事件桥和命令层接成一个能跑的应用。
 //!
 //! **这里是另一个 crate root。** 所有模块都通过 `easydownvideo_tauri::...` 访问,
 //! 绝不在这里重复 `mod dto;` / `mod bridge;` —— 两个 root 各声明一次会得到两套

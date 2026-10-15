@@ -31,6 +31,8 @@ export default function Sidebar({
       //
       // 导航项不受影响：drag.js:58 规定"可点击元素且自身没有该属性"直接返回 false。
       data-tauri-drag-region="deep"
+      // 屏幕阅读器要靠它把这块与页面里别的 nav/列表区分开（页面只有这一处导航）。
+      aria-label="主导航"
       className="w-[200px] shrink-0 flex flex-col select-none"
       style={{
         background: "var(--bg-subtle)",
@@ -45,6 +47,8 @@ export default function Sidebar({
           <button
             key={p}
             onClick={() => onNavigate(p)}
+            // 选中态不能只靠颜色说：浅灰底对读屏软件不存在，得给语义。
+            aria-current={p === page ? "page" : undefined}
             className={cn(
               "flex items-center gap-2 h-8 px-2 rounded-md text-[13px] transition-colors",
               // 选中态用浅灰底 + 文字转深，**不用品牌色填充** ——

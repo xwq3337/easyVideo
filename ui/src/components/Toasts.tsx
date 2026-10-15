@@ -5,7 +5,7 @@ export default function Toasts() {
   const toasts = useToasts();
   if (toasts.length === 0) return null;
   return (
-    <div className="fixed right-4 bottom-12 flex flex-col gap-2 max-w-[420px]">
+    <div className="fixed right-4 bottom-4 flex flex-col gap-2 max-w-[420px]">
       {toasts.map((text, i) => (
         <button
           key={`${i}-${text}`}

@@ -8,7 +8,10 @@ export function TabsList({ className, ...props }: TabsPrimitive.TabsListProps) {
   return (
     <TabsPrimitive.List
       className={cn("inline-flex items-center gap-0.5 rounded-lg p-0.5", className)}
-      style={{ background: "var(--bg-inset)" }}
+      // 槽底必须与 `--bg` 有可见的差：之前的 `--bg-inset` 浅色下只差 1.04:1，
+      // 选中项（`--bg`）压上去后整块读起来就是三个普通文字标签，分段控件没了。
+      // 复用 `--track`（进度条轨道那支），不新开变量。
+      style={{ background: "var(--track)" }}
       {...props}
     />
   );

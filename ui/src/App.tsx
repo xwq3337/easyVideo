@@ -21,6 +21,12 @@ export default function App() {
   // 三个页面用 useState 切就够了，不引 react-router —— 桌面 App 没有 URL 的需求。
   const [page, setPage] = useState<Page>("download");
 
+  // 输入框的内容**放在这里，不放 DownloadPage 里**：三个页面是条件渲染的，
+  // 切去设置页会让下载页整棵子树卸载，写了一半、还没提交的链接就跟着没了
+  // （旧版工具条常驻，所以这是这次改版引入的行为回退）。拿到 App 上之后，
+  // 切页只是换渲染的子树，输入框里的字原样还在。
+  const [url, setUrl] = useState("");
+
   useEffect(() => {
     setThemeMode(readThemeMode());
     void startBridge();
@@ -29,7 +35,11 @@ export default function App() {
 
   /** 返回是否真的建了任务，DownloadPage 据此决定清不清输入框。 */
   async function addUrl(url: string): Promise<boolean> {
+    // run() 失败时只加一条提示，不抛出去（命令级失败不打断操作）
     if ((await run(ipc.addUrl(url))) === undefined) return false;
+    // 立刻拉一次：add_url 返回 id 之前 core 已经在发这个任务的事件，
+    // 只靠事件的话第一帧会晚到（store 里那条"未知 id 触发重同步"是兜底，不是主路径）。
+    // hydrate 自带 catch，失败也只落一条 toast，不会把 rejection 抛回这里。
     await hydrate();
     return true;
   }
@@ -59,7 +69,7 @@ export default function App() {
             而百分比高度需要一个**确定高度**的父级；中间多包一层 auto 高的 div，
             h-full 就退化成 auto，那句"粘贴一个视频链接"会贴着输入行而不是居中。 */}
         <div className="flex-1 overflow-y-auto px-6">
-          {page === "download" && <DownloadPage onAdd={addUrl} />}
+          {page === "download" && <DownloadPage url={url} onUrlChange={setUrl} onAdd={addUrl} />}
           {page === "videoOps" && <VideoOpsPage />}
           {page === "settings" && <SettingsPage />}
         </div>

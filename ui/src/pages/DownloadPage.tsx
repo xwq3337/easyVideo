@@ -5,8 +5,16 @@ import { Input } from "@/components/ui/input";
 import { normalizeUrl } from "../lib/url";
 import { dispatch } from "../store/store";
 
-export default function DownloadPage({ onAdd }: { onAdd: (url: string) => Promise<boolean> }) {
-  const [url, setUrl] = useState("");
+export default function DownloadPage({
+  url,
+  onUrlChange,
+  onAdd,
+}: {
+  /** 输入框的值由 App 持有 —— 它得活过"切到设置页再切回来"（页面是条件渲染的）。 */
+  url: string;
+  onUrlChange: (url: string) => void;
+  onAdd: (url: string) => Promise<boolean>;
+}) {
   const [adding, setAdding] = useState(false);
 
   async function submit() {
@@ -19,7 +27,7 @@ export default function DownloadPage({ onAdd }: { onAdd: (url: string) => Promis
     setAdding(true);
     try {
       // 失败时把 URL 留在框里：用户要重试/改的就是它，清掉等于逼他重新粘贴一次。
-      if (await onAdd(normalized)) setUrl("");
+      if (await onAdd(normalized)) onUrlChange("");
     } finally {
       setAdding(false);
     }
@@ -31,7 +39,7 @@ export default function DownloadPage({ onAdd }: { onAdd: (url: string) => Promis
       <div className="flex items-center gap-2 py-4">
         <Input
           value={url}
-          onChange={(e) => setUrl(e.target.value)}
+          onChange={(e) => onUrlChange(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter") void submit();
           }}
