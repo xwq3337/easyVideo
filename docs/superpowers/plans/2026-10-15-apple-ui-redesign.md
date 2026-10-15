@@ -877,9 +877,11 @@ Expected: 绿。若报找不到模块，说明 `vite.config.ts` 与 `tsconfig.js
   --muted-foreground: 240 2% 44%;    /* #6e6e73 */
   --border: 240 4% 83%;              /* #d2d2d7 */
   --input: 240 4% 83%;
-  --primary: 211 100% 44%;           /* #0071e3 */
-  --primary-foreground: 0 0% 100%;
   --radius: 0.375rem;
+
+  /* 这里**故意不设** `--primary` / `--primary-foreground`：那是强调色在 shadcn
+     变量体系里的第二份表示，而全仓库没有任何东西引用它（组件一律直接用
+     `--accent-blue`）。spec §6.3 那条"不允许仓库内并存两套颜色变量"就落在这里。 */
 
   /* 强调色的**唯一来源**。组件一律引用它，**不许再写死 hex** ——
      写死的话深色模式就拿不到下面那支，等于"深色强调色"成了死代码。
@@ -900,9 +902,6 @@ Expected: 绿。若报找不到模块，说明 `vite.config.ts` 与 `tsconfig.js
   --muted-foreground: 240 2% 53%;    /* #86868b */
   --border: 240 3% 26%;              /* #424245 */
   --input: 240 3% 26%;
-  --primary: 209 100% 58%;           /* #2997ff */
-  --primary-foreground: 0 0% 0%;
-
   --accent-blue: #2997ff;
   --accent-blue-ring: rgba(41, 151, 255, .25);
 

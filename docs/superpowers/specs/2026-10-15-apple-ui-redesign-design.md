@@ -200,7 +200,9 @@ lucide，`stroke-width: 1.75`（默认 2 偏粗像描边图标，1.5 偏细发�
 ### 6.3 两个接线坑
 
 1. shadcn 需要路径别名 `@/`，必须**同时**修改 `vite.config.ts` 的 `resolve.alias` 与 `tsconfig.json` 的 `paths`。漏一处即为构建期报错。
-2. shadcn 组件自带一套 `--primary` / `--radius` 变量体系，**必须映射到第 5 节的 token**。不映射则仓库内同时存在两套颜色变量，之后改主题必然漏掉一边。
+2. shadcn 组件自带一套变量体系（`--background` / `--foreground` / `--border` / `--radius` 等），**必须映射到第 5 节的 token**。不映射则仓库内同时存在两套颜色变量，之后改主题必然漏掉一边。
+
+   **例外：`--primary` / `--primary-foreground` 最终没有保留。** 它们是强调色在 shadcn 体系里的第二份表示，而 vendored 的三个组件一律直接用 `--accent-blue`，所以这两支没有任何消费者 —— 留着一支无人引用的同名变量，正是本条要防的事。删除它们由整分支复审的修复波完成；初稿的计划与 spec 曾把它们写进去，照初稿重跑会把它们加回来。
 
 ## 7. core 变更：`remove_task`
 
