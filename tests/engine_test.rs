@@ -1141,3 +1141,76 @@ async fn an_invalid_choice_does_not_strand_the_task() {
         "无效选择之后，正确的选择应当照常完成下载"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_works_while_probing() {
+    // 暂停原先只认 Queued|Downloading，而界面在 Probing 上同样给出暂停按钮
+    // （src/app.rs:290-297）—— 点了毫无反应、无报错无反馈：用户以为暂停了，任务继续往下走。
+    // `probe()` 是一个网络往返，几百毫秒到几秒，正好点在这上面很正常。
+    let server = MockServer::start().await;
+    let data: Vec<u8> = (0..2048u32).map(|i| (i % 199) as u8).collect();
+    Mock::given(method("GET"))
+        .and(path("/v.mp4"))
+        .and(header("range", "bytes=0-63"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "video/mp4")
+                .insert_header("content-range", "bytes 0-63/2048")
+                .set_body_bytes(data[0..64].to_vec())
+                .set_delay(std::time::Duration::from_millis(400)),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v.mp4"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "video/mp4")
+                .insert_header("content-range", "bytes 0-2047/2048")
+                .set_body_bytes(data.clone()),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let engine = Engine::new(rt, settings_with(dir.path()), dir.path().join("data"));
+    let mut rx = engine.events();
+    let id = engine.add_url(format!("{}/v.mp4", server.uri()));
+
+    wait_state(&mut rx, id, TaskState::Probing, 10).await;
+    engine.pause(id);
+
+    // 静默窗口长于 probe 的延迟：任务必须停在 Paused，而不是继续走到 Downloading/Done。
+    let quiet_until = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    let mut after: Vec<String> = Vec::new();
+    while std::time::Instant::now() < quiet_until {
+        match tokio::time::timeout(
+            quiet_until.saturating_duration_since(std::time::Instant::now()),
+            rx.recv(),
+        )
+        .await
+        {
+            Ok(Ok(EngineEvent::StateChanged { id: eid, state })) if eid == id => {
+                after.push(format!("{state:?}"));
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    let snap = engine
+        .list_tasks()
+        .into_iter()
+        .find(|t| t.id == id)
+        .expect("任务应仍在列表中");
+    assert_eq!(
+        snap.state,
+        TaskState::Paused,
+        "探测期间点暂停没有生效（观察到 {after:?}）"
+    );
+
+    // 继续之后必须能正常下完 —— 暂停不能把任务弄成再也起不来的状态
+    engine.unpause(id);
+    wait_state(&mut rx, id, TaskState::Done, 30).await;
+    assert_eq!(std::fs::read(dir.path().join("v.mp4")).unwrap(), data);
+}

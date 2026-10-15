@@ -194,12 +194,26 @@ impl Engine {
         }
     }
 
+    /// 暂停：取消 token 并把状态落成 `Paused`。
+    ///
+    /// 接受的状态必须覆盖**界面会给出暂停按钮的那些**（`src/app.rs:290-297`），否则就是一个
+    /// 点了没反应的死按钮。
+    ///
+    /// - `Queued`：还没轮到它，界面当前没给按钮，但对着队列里的任务点暂停是正常操作；
+    /// - `Probing` / `Downloading`：worker 在跑。token 一取消，worker 会停在下一个检查点
+    ///   （`advance_state` 的闸门 + `download_direct`/`download_media` 里的取消检查）。
+    ///
+    /// 不接受的：`Merging`（`remux_to_mp4` 里的 ffmpeg 不看我们的 token，暂停在那里会变成
+    /// "等合并跑完再暂停"，还要重下分片 —— 待办）、`AwaitingChoice`（没有 worker，
+    /// pause 无从生效）、以及各终态。
     pub fn pause(&self, id: TaskId) {
         let entry = { self.inner.tasks.lock().unwrap().get(&id).cloned() };
         if let Some(e) = entry {
-            // 排队中的任务也要能暂停（用户对着队列里等待的任务点暂停是正常操作）。
             // 标记为 Paused 后，pump 的分支闸会因为状态不是 Queued 而跳过它。
-            if matches!(e.state, TaskState::Queued | TaskState::Downloading) {
+            if matches!(
+                e.state,
+                TaskState::Queued | TaskState::Probing | TaskState::Downloading
+            ) {
                 e.cancel.cancel();
                 self.set_state(id, TaskState::Paused);
             }
@@ -376,8 +390,14 @@ impl Engine {
     }
 
     /// worker 的**进度**状态推进（Probing → Downloading → Merging 之类），与 `set_state`
-    /// 的唯一区别、也是它存在的唯一理由：**当前状态已经是 `Canceled` 时拒绝生效**，
-    /// 返回 `false` 表示这次推进被拒绝，调用方必须立刻收手（`bail!("canceled")`）。
+    /// 的唯一区别、也是它存在的唯一理由：**当前状态已经是 `Canceled` 或 `Paused` 时拒绝生效**
+    /// —— 这两种都表示"用户已经把这个任务从我手里拿走了"。返回 `false` 表示这次推进被拒绝，
+    /// 调用方必须立刻收手（`bail!("canceled")`）。
+    ///
+    /// `Paused` 必须在闸门里：`pause()` 能作用在 `Probing` 上（界面在探测期间就给出暂停按钮），
+    /// 而 `probe()` 不接受 token、不会中途返回 —— worker 只能等它跑完，再靠这道闸停住。
+    /// 没有它的话，暂停会被 worker 随后的 `Downloading` 覆盖掉，而 token 已被取消，
+    /// 收尾分支既看不到 `Canceled` 也看不到 `Paused`，任务就永远停在 `Downloading` 且没有 worker。
     ///
     /// 为什么必须有这道闸：`run_task` 要等 `probe().await` 这个网络往返结束之后才会写
     /// manifest 并置 `Downloading`，而用户完全可以在探测期间点删除 —— `cancel()` 那时已经
@@ -393,7 +413,11 @@ impl Engine {
         {
             let mut tasks = self.inner.tasks.lock().unwrap();
             match tasks.get_mut(&id) {
-                Some(t) if t.state != TaskState::Canceled => t.state = state.clone(),
+                Some(t)
+                    if !matches!(t.state, TaskState::Canceled | TaskState::Paused) =>
+                {
+                    t.state = state.clone()
+                }
                 _ => return false,
             }
         }
