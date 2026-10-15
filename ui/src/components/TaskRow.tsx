@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { TaskView } from "../lib/types";
 import { formatSize, formatSpeed } from "../lib/format";
 import * as ipc from "../lib/ipc";
+import { taskAction } from "../lib/taskAction";
 import { dispatch, run } from "../store/store";
 
 // 类型钉在 StateDto 的联合上：以后 core 加了新状态而这里漏了，**编译就红**，
@@ -18,12 +19,8 @@ const LABELS: Record<TaskView["state"]["kind"], string> = {
   canceled: "已取消",
 };
 
-/** 已经走到头、不会再产出下载的状态。对这些行，按钮只是把它移出列表，并不删任何文件。 */
-const TERMINAL: ReadonlyArray<TaskView["state"]["kind"]> = ["done", "failed", "canceled"];
-
 export default function TaskRow({ task }: { task: TaskView }) {
   const [draft, setDraft] = useState(task.filename);
-  const isTerminal = TERMINAL.includes(task.state.kind);
   const pct =
     task.total > 0 ? Math.min(100, Math.round((task.downloaded / task.total) * 100)) : 0;
   // 只用来取色；中文取词统一走 LABELS。纯展示，不进 reducer。
@@ -35,6 +32,7 @@ export default function TaskRow({ task }: { task: TaskView }) {
         : task.state.kind === "paused"
           ? "var(--accent-warn)"
           : "var(--fg-muted)";
+  const action = taskAction(task.state.kind);
 
   async function commitName() {
     dispatch({ kind: "setEditing", id: task.id, editing: false });
@@ -133,12 +131,9 @@ export default function TaskRow({ task }: { task: TaskView }) {
           {["queued", "probing", "downloading", "merging"].includes(task.state.kind) && (
             <button onClick={() => void run(ipc.pause(task.id))}>暂停</button>
           )}
-          {/* 标签按状态说实话：对已结束的行，cancel 不删盘上的任何东西、只是把它移出列表
-              （core 永远是唯一真相源，不做删除），此时叫「删除」是假话，而且紧接着的
-              「已取消」还会跟「已完成」自相矛盾。取消中的行才是真的在取消。 */}
-          <button onClick={() => void run(ipc.cancel(task.id))}>
-            {isTerminal ? "从列表移除" : "删除"}
-          </button>
+          {/* 按钮的叫法与调用的命令必须一致 —— 之前这里写着「从列表移除」却调 cancel()，
+              对已取消的行连状态都不变，是个纯零反应的假按钮。见 lib/taskAction.ts。 */}
+          <button onClick={() => void run(action.invoke(task.id))}>{action.label}</button>
         </span>
       </div>
 
