@@ -14,7 +14,9 @@ export default function TaskList() {
     );
   }
   return (
-    <div>
+    // 区块之间改用背景色差而不是分隔线。列表行之间仍保留发丝线 ——
+    // 列表需要它来对齐视线，区块不需要。
+    <div className="rounded-xl overflow-hidden" style={{ background: "var(--bg-subtle)" }}>
       {tasks.map((t) => (
         <TaskRow key={t.id} task={t} />
       ))}

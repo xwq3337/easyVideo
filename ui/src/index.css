@@ -8,11 +8,11 @@
   --bg-inset: #fafafa;
   --fg: #1d1d1f;
   --fg-muted: #6e6e73;
-  --fg-faint: #b0b0b0;
+  --fg-faint: #86868b;    /* 官网页脚 */
   --line: #d2d2d7;
-  --line-strong: #e2e2e2;
+  --line-strong: #d2d2d7;
   --track: #f0f0f0;
-  --fill: #0a0a0a;
+  --fill: #1d1d1f;
   --accent-ok: #0a8f5b;
   --accent-warn: #b26a00;
   --accent-err: #c0392b;
@@ -62,16 +62,16 @@
 }
 
 :root[data-theme="dark"] {
-  --bg: #0a0a0a;
+  --bg: #000000;
   --bg-subtle: #1d1d1f;
   --bg-inset: #141414;
   --fg: #f5f5f7;
   --fg-muted: #86868b;
-  --fg-faint: #6e6e6e;
+  --fg-faint: #6e6e73;
   --line: #424245;
-  --line-strong: #262626;
+  --line-strong: #424245;
   --track: #1f1f1f;
-  --fill: #ededed;
+  --fill: #f5f5f7;
   --accent-ok: #4ad295;
   --accent-warn: #f0b45e;
   --accent-err: #ff6b5e;
@@ -85,6 +85,7 @@ body {
   color: var(--fg);
   font-family: -apple-system, "SF Pro Text", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
   font-size: 13px;
+  letter-spacing: -0.005em;   /* 官网正文的紧凑感；纯 0 在 macOS 上会显得松 */
   -webkit-font-smoothing: antialiased;
 }
 /* 数字等宽对齐：进度/速度/剩余时间逐帧变化时不抖动 */

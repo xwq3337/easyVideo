@@ -10,11 +10,12 @@ export default function Toasts() {
         <button
           key={`${i}-${text}`}
           onClick={() => dismissToast(i)}
-          className="text-left rounded-md px-3 py-2 shadow-lg"
+          className="text-left rounded-xl px-3.5 py-2.5 text-[12px]"
           style={{
             background: "var(--bg)",
             border: "1px solid var(--accent-err)",
             color: "var(--accent-err)",
+            boxShadow: "0 4px 16px rgba(0,0,0,.12)",
           }}
           title="点击关闭"
         >

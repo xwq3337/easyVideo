@@ -53,7 +53,7 @@ export default function TaskRow({ task }: { task: TaskView }) {
   }
 
   return (
-    <div className="px-3 py-2.5" style={{ borderBottom: "1px solid var(--line)" }}>
+    <div className="px-3.5 py-3" style={{ borderBottom: "1px solid var(--line)" }}>
       <div className="flex items-baseline justify-between gap-3">
         <input
           value={task.editing ? draft : task.filename}
