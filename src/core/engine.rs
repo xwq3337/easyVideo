@@ -61,6 +61,9 @@ struct TaskEntry {
     workers: Arc<AtomicUsize>,
     /// 本次 `paths()` 占下来的最终路径，worker 结束时要把它释放掉。
     reserved_path: Option<PathBuf>,
+    /// 本次 `paths()` 定下的任务目录。**清理用它，不要用 `current_settings()`** ——
+    /// 用户可以在任务跑着的时候改保存位置，见 `actual_task_dir`。
+    dir: Option<PathBuf>,
 }
 
 /// worker 生命周期守卫：退出时把该任务的 worker 计数减回去、释放最终路径的占用，并再
@@ -235,8 +238,7 @@ impl Engine {
         // （`cancel_while_queued_is_not_resurrected` 覆盖不到这一条：它取消的任务来自
         //   `add_url`，manifest 是 None，盘上本来就没有东西可泄漏。）
         if !worker_running {
-            let root = self.current_settings().download_dir;
-            std::fs::remove_dir_all(task_dir(&root, id)).ok();
+            std::fs::remove_dir_all(self.actual_task_dir(id)).ok();
         }
     }
 
@@ -326,6 +328,7 @@ impl Engine {
                     progress,
                     workers: Arc::new(AtomicUsize::new(0)),
                     reserved_path: None,
+                    dir: None,
                 },
             );
         }
@@ -333,7 +336,13 @@ impl Engine {
         // 启动时若带 manifest 立即写盘，保证恢复信息存在
         if let Some(m) = manifest {
             let root = self.inner.settings.lock().unwrap().download_dir.clone();
-            let _ = write_manifest(&task_dir(&root, id), &m);
+            let tdir = task_dir(&root, id);
+            let _ = write_manifest(&tdir, &m);
+            // 连同**写入位置**一起记下来。清理必须按实际写入的目录来，而不是执行清理那一刻的
+            // 当前设置 —— 用户在"恢复任务入队"和"取消它"之间改保存位置，是这个任务的常规走法。
+            if let Some(t) = self.inner.tasks.lock().unwrap().get_mut(&id) {
+                t.dir = Some(tdir);
+            }
         }
         self.pump();
     }
@@ -495,8 +504,7 @@ impl Engine {
                         if cancel.is_cancelled() {
                             // 只有"用户取消"才清盘；暂停、或被新 worker 接手的任务要留下断点。
                             if matches!(engine.state_of(id), Some(TaskState::Canceled)) {
-                                let root = engine.current_settings().download_dir;
-                                std::fs::remove_dir_all(task_dir(&root, id)).ok();
+                                std::fs::remove_dir_all(engine.actual_task_dir(id)).ok();
                             }
                         } else {
                             tracing::warn!("task {id} failed: {e:#}");
@@ -727,14 +735,36 @@ impl Engine {
             reserved.insert(p.clone());
             p
         };
-        self.inner
+        {
+            let mut tasks = self.inner.tasks.lock().unwrap();
+            let t = tasks.get_mut(&id).expect("task entry present");
+            t.reserved_path = Some(final_path.clone());
+            // 记下**真正**用的目录。清理一律以它为准：用户可以在任务跑着的时候改保存
+            // 位置，那时 `current_settings()` 已经指向别处了。
+            t.dir = Some(tdir.clone());
+        }
+        (final_path, tdir)
+    }
+
+    /// 任务**实际**写入的那个任务目录。
+    ///
+    /// 清理一处都不能用 `current_settings().download_dir`：用户可以在任务跑着的时候改保存
+    /// 位置（设置窗口两下就能改），那时 `current_settings()` 指向的已经不是这个任务真正用的
+    /// 目录 —— 按它删会去删新目录里同号的 `task-<id>`（**另一个任务的数据**），而真正的
+    /// `manifest.json` 留在原地，被下次启动的 `scan_resume` 复活重下。
+    ///
+    /// 没有记录时回退到"当前设置 + id"：那是 `paths()` 还没跑过的任务，它也确实只在
+    /// `insert_entry` 的 eager 写入里用过那个目录。
+    fn actual_task_dir(&self, id: TaskId) -> PathBuf {
+        let fallback_root = self.current_settings().download_dir;
+        let recorded = self
+            .inner
             .tasks
             .lock()
             .unwrap()
-            .get_mut(&id)
-            .expect("task entry present")
-            .reserved_path = Some(final_path.clone());
-        (final_path, tdir)
+            .get(&id)
+            .and_then(|t| t.dir.clone());
+        recorded.unwrap_or_else(|| task_dir(&fallback_root, id))
     }
 
     /// worker 结束后释放该任务的最终路径占用。

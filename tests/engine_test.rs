@@ -489,6 +489,63 @@ async fn cancel_queued_resumed_task_removes_its_manifest() {
     assert!(!easydownvideo::core::task::task_dir(dir.path(), id).exists());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_a_resumed_task_after_moving_the_dir_cleans_the_old_one() {
+    // 上一条的另一个入口：`resume()` 的 eager 落盘用的是**那一刻**的设置，而清理原先按
+    // 的是**取消那一刻**的设置。用户在两者之间改了保存位置，清理就会去删新目录里同号的
+    // `task-<id>`，而真正写了 manifest 的旧目录原封不动 —— 下次启动 scan_resume 照旧复活。
+    let root = tempfile::tempdir().unwrap();
+    let old_dir = root.path().join("old");
+    let new_dir = root.path().join("new");
+    std::fs::create_dir_all(&old_dir).unwrap();
+    std::fs::create_dir_all(&new_dir).unwrap();
+
+    let rt = tokio::runtime::Handle::current();
+    let mut s0 = settings_with(&old_dir);
+    s0.max_active_tasks = 0; // 让恢复出来的任务一直排队，没有 worker 会替它收尾
+    let engine = Engine::new(rt, s0, root.path().join("data"));
+
+    let id = 5u64;
+    engine.resume(TaskManifest {
+        id,
+        url: "https://example.com/a.mp4".into(),
+        filename: "a.mp4".into(),
+        download_dir: old_dir.clone(),
+        kind: ManifestKind::Direct { size: Some(10) },
+    });
+    // **前提断言**：manifest 确实落在旧目录里，否则这个测试不成立
+    assert_eq!(
+        easydownvideo::core::task::scan_resume(&old_dir).len(),
+        1,
+        "resume 应当立刻把 manifest 写进当时的下载目录"
+    );
+
+    // 用户在任务还排队的时候改了保存位置
+    // （上限保持 0：任务必须**一直排队**，否则 worker 会跑起来，清理就变成异步的了，
+    //   这条测试关心的不是那个路径。）
+    let mut s1 = settings_with(&new_dir);
+    s1.max_active_tasks = 0;
+    engine.update_settings(s1);
+    let bystander = easydownvideo::core::task::task_dir(&new_dir, id);
+    std::fs::create_dir_all(&bystander).unwrap();
+    std::fs::write(bystander.join("keepme.txt"), b"OTHER TASK DATA").unwrap();
+
+    engine.cancel(id);
+
+    assert!(
+        easydownvideo::core::task::scan_resume(&old_dir).is_empty(),
+        "旧目录里仍残留可恢复的 manifest —— 下次启动会把它复活重下"
+    );
+    assert!(
+        !easydownvideo::core::task::task_dir(&old_dir, id).exists(),
+        "任务真正写入的目录没被清掉"
+    );
+    assert!(
+        bystander.join("keepme.txt").exists(),
+        "清理删到了新目录里同号的 task-{id} —— 那是另一个任务的数据"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancel_during_probe_ends_canceled_and_leaves_nothing() {
     // 用户在"探测中"点删除。`probe()` 是一个网络往返，任务在这段时间里是 `Probing`；
@@ -576,6 +633,83 @@ async fn cancel_during_probe_ends_canceled_and_leaves_nothing() {
     );
     assert!(!tdir.exists(), "取消后任务目录仍在：{}", tdir.display());
     assert!(!dir.path().join("v.mp4").exists(), "被取消的任务产出了成品文件");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cleanup_uses_the_directory_the_task_actually_used() {
+    // 用户可以在任务跑着的时候改保存位置（设置窗口两下就能改）。清理原先用的是
+    // `current_settings().download_dir` —— 那是**新**目录，不是这个任务真正写入的那个：
+    //   * 真正的 manifest 留在原地，被下次启动的 scan_resume 复活重新下载；
+    //   * 新目录里同号的 `task-<id>`（别的任务的数据）反倒被整个删掉。
+    let server = MockServer::start().await;
+    let data: Vec<u8> = (0..4096u32).map(|i| (i % 211) as u8).collect();
+    Mock::given(method("GET"))
+        .and(path("/v.mp4"))
+        .and(header("range", "bytes=0-63"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "video/mp4")
+                .insert_header("content-range", "bytes 0-63/4096")
+                .set_body_bytes(data[0..64].to_vec()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v.mp4"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "video/mp4")
+                .insert_header("content-range", "bytes 0-4095/4096")
+                .set_body_bytes(data.clone())
+                .set_delay(std::time::Duration::from_millis(1500)),
+        )
+        .mount(&server)
+        .await;
+
+    let root = tempfile::tempdir().unwrap();
+    let old_dir = root.path().join("old");
+    let new_dir = root.path().join("new");
+    std::fs::create_dir_all(&old_dir).unwrap();
+    std::fs::create_dir_all(&new_dir).unwrap();
+
+    let rt = tokio::runtime::Handle::current();
+    let engine = Engine::new(rt, settings_with(&old_dir), root.path().join("data"));
+    let mut rx = engine.events();
+    let id = engine.add_url(format!("{}/v.mp4", server.uri()));
+
+    // 进入 Downloading 说明 manifest 已经落在**旧**目录
+    wait_state(&mut rx, id, TaskState::Downloading, 10).await;
+
+    // 用户在任务跑着的时候把保存位置改到新目录
+    engine.update_settings(settings_with(&new_dir));
+
+    // 新目录里恰好有一个同号的任务目录 —— 那是另一个任务的断点数据，绝不能碰
+    let bystander = easydownvideo::core::task::task_dir(&new_dir, id);
+    std::fs::create_dir_all(&bystander).unwrap();
+    std::fs::write(bystander.join("keepme.txt"), b"OTHER TASK DATA").unwrap();
+
+    engine.cancel(id);
+    wait_state(&mut rx, id, TaskState::Canceled, 10).await;
+
+    // 清理发生在 worker 退出路径，轮询等待（避免依赖固定 sleep 时长）
+    let real = easydownvideo::core::task::task_dir(&old_dir, id);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while real.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "任务**真正**写入的目录 {} 没被清掉 —— 它的 manifest 会被下次启动的 scan_resume 复活重下",
+            real.display()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        easydownvideo::core::task::scan_resume(&old_dir).is_empty(),
+        "旧目录里仍残留可恢复的 manifest"
+    );
+    assert!(
+        bystander.join("keepme.txt").exists(),
+        "清理删到了新目录里同号的 task-{id} —— 那是另一个任务的数据"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
