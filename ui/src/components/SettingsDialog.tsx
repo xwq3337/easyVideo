@@ -25,6 +25,17 @@ export default function SettingsDialog({ open, onClose }: Props) {
     if (open && current) setDraft({ ...current });
   }, [open, current]);
 
+  // 外观与错误横幅**不在 draft 里**（外观住在 theme.ts 的 localStorage，不在 SettingsDto），
+  // 所以上面那条 effect 管不到它们。不一起重置的话：改外观 → 取消（正确地没生效）→ 重开，
+  // 下拉框仍显示那个被取消的值，再随便改点别的按保存，它就被**真的**应用并落下去了 ——
+  // 「取消丢弃草稿」对外观这一格就是假的，取消被推迟了而已。重开时一律以"当前真正生效的"为准。
+  // error 同理：一次失败的保存留下的红字，不该在取消重开之后还挂在那儿。
+  useEffect(() => {
+    if (!open) return;
+    setTheme(readThemeMode());
+    setError(null);
+  }, [open]);
+
   // Esc 关闭。挂 window 而不是挂在遮罩上：遮罩要能收键盘事件得先有焦点，
   // 而这里没有任何元素被自动聚焦过。（Esc 与点遮罩同义：不写盘，丢弃 draft。）
   useEffect(() => {
@@ -179,8 +190,11 @@ export default function SettingsDialog({ open, onClose }: Props) {
         </label>
 
         {error && (
+          // 不再自己加「保存失败：」前缀 —— core 的 update_settings 失败时回的已经是
+          // 「保存设置失败：…」（commands.rs:73），再套一层会读成「保存失败：保存设置失败：…」。
+          // 直接照抄 core 的话，它本来就说清了这是一次保存的失败。
           <p className="mb-2" style={{ color: "var(--accent-err)" }}>
-            保存失败：{error}
+            {error}
           </p>
         )}
 
