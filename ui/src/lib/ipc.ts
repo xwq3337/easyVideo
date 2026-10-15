@@ -11,6 +11,7 @@ export const pause = (id: number) => invoke<void>("pause", { id });
 export const unpause = (id: number) => invoke<void>("unpause", { id });
 export const retry = (id: number) => invoke<void>("retry", { id });
 export const cancel = (id: number) => invoke<void>("cancel", { id });
+export const removeTask = (id: number) => invoke<void>("remove_task", { id });
 export const setFilename = (id: number, name: string) => invoke<void>("set_filename", { id, name });
 export const pendingChoice = (id: number) => invoke<ChoiceKindDto | null>("pending_choice", { id });
 export const setChoice = (id: number, choice: ChoiceDto) => invoke<void>("set_choice", { id, choice });

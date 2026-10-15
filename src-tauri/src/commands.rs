@@ -43,6 +43,24 @@ pub fn cancel(state: State<'_, AppState>, id: u64) {
     state.engine.cancel(id);
 }
 
+/// 把一条**已经彻底结束**的任务移出列表。被拒时返回 `Err`。
+///
+/// 被拒有两种原因，文案必须把两种都盖住：
+/// - 任务不是终态（界面已经按状态把按钮渲染成「取消」了，这条只在竞态下触发）；
+/// - **任务是终态、但 worker 还在收尾**（`cancel()` 是立刻置状态、worker 可能还挂在网络上）。
+///   这时用户看到的是「已取消」的行，说"只能移除已结束的任务"是假话 —— 它确实结束了。
+///
+/// 返回 `Result` 而不是 `bool`：前端全走 `run()` 那一条错误路径，命令级失败自动落成
+/// 一条 toast，不必为它新写分支。
+#[tauri::command]
+pub fn remove_task(state: State<'_, AppState>, id: u64) -> R<()> {
+    if state.engine.remove_task(id) {
+        Ok(())
+    } else {
+        Err("这个任务还在收尾，稍后再试".to_string())
+    }
+}
+
 #[tauri::command]
 pub fn set_filename(state: State<'_, AppState>, id: u64, name: String) {
     state.engine.set_filename(id, name);

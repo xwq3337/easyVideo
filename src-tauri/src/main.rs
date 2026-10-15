@@ -71,6 +71,7 @@ fn main() {
             commands::unpause,
             commands::retry,
             commands::cancel,
+            commands::remove_task,
             commands::set_filename,
             commands::pending_choice,
             commands::set_choice,
