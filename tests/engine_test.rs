@@ -1376,3 +1376,144 @@ async fn pending_choice_survives_a_frontend_that_missed_the_event() {
         "选择已被消费，候选列表不该还在"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remove_terminal_task_but_reject_active() {
+    // 终态才是"已经结束"。正在跑的任务语义含糊 —— 盘上的 .part 分片删不删?
+    // 删了是数据丢失,不删是磁盘泄漏 —— 所以一律拒绝,让调用方先取消。
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let mut s = settings_with(dir.path());
+    s.max_active_tasks = 0; // 不启动任何 worker,任务停在 Queued
+    let engine = Engine::new(rt, s, dir.path().join("data"));
+
+    let id = engine.add_url("https://example.com/a.mp4".into());
+    assert!(!engine.remove_task(id), "排队中的任务不该能被移除");
+    assert_eq!(engine.list_tasks().len(), 1, "被拒的移除不该改动列表");
+
+    engine.cancel(id); // 排队中被取消会直接落成 Canceled
+    assert!(engine.remove_task(id), "已取消的任务应当能移除");
+    assert_eq!(engine.list_tasks().len(), 0, "移除后列表里不该还有它");
+    assert!(!engine.remove_task(id), "重复移除应当返回 false");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removed_failed_task_is_not_resurrected_by_scan_resume() {
+    // 失败的任务在收尾时**刻意保留** manifest（为了下次能续传）。所以"从列表移除"
+    // 若只删内存条目，重启时 scan_resume 会把它捞回来 —— 用户移除过的任务又出现了。
+    // 这条测试钉住的就是"移除必须连目录一起清"。
+    //
+    // 关键是让失败发生在 **manifest 落盘之后**：probe 请求（bytes=0-63）必须成功，
+    // 随后的分块下载才失败。若让 probe 自己 404，manifest 根本不会写，这条测试就空跑了。
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v.mp4"))
+        .and(header("range", "bytes=0-63"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "video/mp4")
+                .insert_header("content-range", "bytes 0-63/4096")
+                .set_body_bytes(vec![0u8; 64]),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v.mp4"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let engine = Engine::new(rt, settings_with(dir.path()), dir.path().join("data"));
+    let mut rx = engine.events();
+
+    let id = engine.add_url(format!("{}/v.mp4", server.uri()));
+    wait_failed(&mut rx, id, 30).await;
+
+    // 前提检查：失败任务确实留下了 manifest。不成立的话这条测试什么也没测到。
+    assert!(
+        easydownvideo::core::task::scan_resume(dir.path())
+            .iter()
+            .any(|m| m.id == id),
+        "失败的任务本应留下可恢复的 manifest，前提不成立"
+    );
+
+    assert!(engine.remove_task(id), "失败的任务应当能移除");
+    assert!(
+        !easydownvideo::core::task::scan_resume(dir.path())
+            .iter()
+            .any(|m| m.id == id),
+        "移除后盘上仍有它的 manifest，重启会把这个任务复活"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remove_releases_reserved_path_while_the_worker_is_still_exiting() {
+    // 钉一个很窄但要命的窗口：`cancel()` 让状态**立刻**变成 Canceled，而 worker
+    // 可能还挂在网络请求上没退出。此时移除会先删掉条目，随后 WorkerGuard 的释放
+    // 在 `get_mut(&id)` 上落空 —— 于是那个"已分配但还没落盘"的占位**永久泄漏**，
+    // 之后下同名文件会被算成冲突，用户莫名拿到 `v (1).mp4`。
+    //
+    // **不能写成"移除后再等 worker 退出"**：那样 WorkerGuard 已经把占位释放干净，
+    // 测试会变成空跑。必须在 worker 仍被延迟响应卡住时就移除。
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v.mp4"))
+        .and(header("range", "bytes=0-63"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "video/mp4")
+                .insert_header("content-range", "bytes 0-63/4096")
+                .set_body_bytes(vec![0u8; 64]),
+        )
+        .mount(&server)
+        .await;
+    // 全量请求延迟返回，把 worker 卡在这里
+    Mock::given(method("GET"))
+        .and(path("/v.mp4"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "video/mp4")
+                .insert_header("content-range", "bytes 0-4095/4096")
+                .set_body_bytes(vec![0u8; 4096])
+                .set_delay(std::time::Duration::from_secs(5)),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let mut s = settings_with(dir.path());
+    s.max_active_tasks = 2; // 第二个任务要在第一个 worker 还卡着的时候就能跑
+    let engine = Engine::new(rt, s, dir.path().join("data"));
+    let mut rx = engine.events();
+
+    let first = engine.add_url(format!("{}/v.mp4", server.uri()));
+    // 进入 Downloading 说明 paths() 已经跑过、占位已经登记
+    wait_state(&mut rx, first, TaskState::Downloading, 10).await;
+
+    engine.cancel(first); // 状态立刻变 Canceled，worker 还卡在那个延迟响应上
+    assert!(engine.remove_task(first), "已取消的任务应当能移除");
+
+    let second = engine.add_url(format!("{}/v.mp4", server.uri()));
+    // 等第二个任务走到写 manifest 那一步 —— 那时它已经算过自己的最终路径
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let assigned = loop {
+        if let Some(m) = easydownvideo::core::task::scan_resume(dir.path())
+            .into_iter()
+            .find(|m| m.id == second)
+        {
+            break m.filename;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "第二个任务一直没落下 manifest"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        assigned, "v.mp4",
+        "占位没释放：同名文件被算成了冲突，第二个任务拿到 {assigned}"
+    );
+}

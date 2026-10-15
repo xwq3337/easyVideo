@@ -24,6 +24,8 @@ pub enum EngineEvent {
     StateChanged { id: TaskId, state: TaskState },
     Progress { id: TaskId, downloaded: u64, total: u64, unit: ProgressUnit },
     ChoicesOffered { id: TaskId, kind: ChoiceKind },
+    /// 任务被移出列表。前端据此把行删掉，而不是靠请求的返回值自己猜。
+    TaskRemoved { id: TaskId },
 }
 
 #[derive(Clone, Debug)]

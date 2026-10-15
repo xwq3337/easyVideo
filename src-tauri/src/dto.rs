@@ -93,6 +93,7 @@ pub enum EventDto {
         unit: UnitDto,
     },
     ChoicesOffered { id: u64, kind: ChoiceKindDto },
+    TaskRemoved { id: u64 },
 }
 
 pub fn event_dto(ev: EngineEvent) -> EventDto {
@@ -116,6 +117,7 @@ pub fn event_dto(ev: EngineEvent) -> EventDto {
             id,
             kind: ChoiceKindDto::from(kind),
         },
+        EngineEvent::TaskRemoved { id } => EventDto::TaskRemoved { id },
     }
 }
 
@@ -515,5 +517,17 @@ mod tests {
         // 标签名是精确契约：写错大小写或换名字必须解析失败，不能静默落到某个默认分支。
         assert!(serde_json::from_str::<ChoiceDto>(r#"{"kind":"Variant","index":2}"#).is_err());
         assert!(serde_json::from_str::<ChoiceDto>(r#"{"kind":"variant","idx":2}"#).is_err());
+    }
+
+    /// `taskRemoved` 是前端 reducer 必须 switch 的第三条事件。它的 `type` 标签是
+    /// 多词 camelCase，最容易在改名时静默漂移，而漂移的后果是**行永远删不掉**
+    /// （reducer 的 default 分支吞掉它）—— 正是这次要修的 bug 的翻版。
+    #[test]
+    fn task_removed_event_pins_its_tag_and_id() {
+        let d = event_dto(EngineEvent::TaskRemoved { id: 42 });
+        assert_eq!(
+            serde_json::to_value(&d).unwrap(),
+            serde_json::json!({ "type": "taskRemoved", "id": 42 })
+        );
     }
 }

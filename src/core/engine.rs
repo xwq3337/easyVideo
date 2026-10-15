@@ -105,6 +105,14 @@ impl TaskEntry {
     }
 }
 
+/// 已经走到头、不会再被 worker 推进的状态。`remove_task` 只认这几个。
+fn is_terminal(state: &TaskState) -> bool {
+    matches!(
+        state,
+        TaskState::Done | TaskState::Failed(_) | TaskState::Canceled
+    )
+}
+
 impl Engine {
     pub fn new(rt: Handle, settings: Settings, data_dir: PathBuf) -> Self {
         let (tx, _) = broadcast::channel(256);
@@ -837,6 +845,54 @@ impl Engine {
             .get(&id)
             .and_then(|t| t.dir.clone());
         recorded.unwrap_or_else(|| task_dir(&fallback_root, id))
+    }
+
+    /// 把一条**已结束**的任务从列表里彻底移除。
+    ///
+    /// 只接受终态。正在跑的任务语义含糊：盘上的 `.part` 分片删不删？删了是数据丢失，
+    /// 不删是磁盘泄漏。所以一律拒绝，让调用方先把它取消掉。
+    ///
+    /// **必须连任务目录一起删。** `Failed` 的任务在收尾时**刻意保留** manifest
+    /// （为了下次能续传，见 worker 的错误分支：那里只 `set_state(Failed)`，不碰盘）。
+    /// 只删内存条目的话，重启时 `scan_resume` 会把它捞回来并 `resume()` 回列表 ——
+    /// 用户明明"移除"过的任务又出现了。
+    ///
+    /// 返回 `false` 表示任务不存在，或不是终态。
+    pub fn remove_task(&self, id: TaskId) -> bool {
+        // 两个字段都读自条目本身，所以必须在条目消失之前取出来。
+        // `actual_task_dir` 用的是任务**真正**写入的那个目录：用户可以在任务跑着的
+        // 时候改保存位置，退回 `current_settings().download_dir` 会删错地方。
+        let tdir = self.actual_task_dir(id);
+        let (reserved, removed) = {
+            let mut tasks = self.inner.tasks.lock().unwrap();
+            // 判定与移除在**同一个锁**里完成：`retry()` 会把 `Failed` 挪回 `Queued`，
+            // 先查后删之间留个窗口的话，用户刚重试的任务会被无声抹掉。
+            if !tasks
+                .get(&id)
+                .map(|t| is_terminal(&t.state))
+                .unwrap_or(false)
+            {
+                (None, false)
+            } else {
+                let reserved = tasks.get_mut(&id).and_then(|t| t.reserved_path.take());
+                tasks.remove(&id);
+                (reserved, true)
+            }
+        };
+        if !removed {
+            return false;
+        }
+        // 释放必须由这里做完。`WorkerGuard::drop` 也会释放，但它读的同样是条目上的
+        // 字段 —— 条目已被我们删掉，那一次会静默落空。而 `cancel()` 是**立刻**把状态
+        // 置成 `Canceled` 的：worker 可能还挂在网络请求上没退出，于是"移除一个刚取消
+        // 的任务"正好落在这个窗口里，占位会**因为这个**泄漏，之后同名文件莫名变成
+        // `v (1).mp4`。
+        if let Some(p) = reserved {
+            self.inner.reserved_paths.lock().unwrap().remove(&p);
+        }
+        std::fs::remove_dir_all(&tdir).ok();
+        let _ = self.inner.tx.send(EngineEvent::TaskRemoved { id });
+        true
     }
 
     /// worker 结束后释放该任务的最终路径占用。
