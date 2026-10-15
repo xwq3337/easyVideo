@@ -10,7 +10,10 @@ const buttonVariants = cva(
     variants: {
       variant: {
         primary:
-          "bg-[#0071e3] text-white hover:bg-[#0077ed] active:bg-[#006edb] rounded-full",
+          // 强调色走变量，**不写死 hex**。写死的话深色模式会一直用浅色那支，
+          // spec §5.1 定的深色强调色就成了死代码。
+          // hover/active 用亮度滤镜而不是另外两个 hex：变量是唯一来源，滤镜天然跟着主题走。
+          "bg-[var(--accent-blue)] text-white hover:brightness-110 active:brightness-95 rounded-full",
         secondary:
           "border border-[var(--line-strong)] text-[var(--fg)] hover:bg-[var(--bg-subtle)] rounded-md",
         ghost:
