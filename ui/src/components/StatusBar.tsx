@@ -10,16 +10,13 @@ export default function StatusBar({ version }: { version: string }) {
   const bytesPerSec = tasks
     .filter((t) => t.unit === "bytes")
     .reduce((sum, t) => sum + (t.speedBps ?? 0), 0);
-  // speedBps 由 reducer 在每次进度事件里算好（Task 7）。分片单位的任务它为 null，
-  // 所以这里天然不会被"片/秒"污染。
 
+  // 从底部的通栏挪到侧边栏底部：总速度与版本号是全局信息，但底下那条横栏
+  // 在有了侧边栏之后就是白占一行高度。
   return (
-    <footer
-      className="flex items-center justify-between px-3 py-1.5 border-t tnum"
-      style={{ borderColor: "var(--line)", color: "var(--fg-muted)", background: "var(--bg-subtle)" }}
-    >
-      <span>总速度 {formatSpeed(bytesPerSec)} · {active} 个下载中</span>
-      <span>{version}</span>
-    </footer>
+    <div className="px-4 py-2.5 tnum text-[11px]" style={{ color: "var(--fg-muted)" }}>
+      <div>{formatSpeed(bytesPerSec)} · {active} 个下载中</div>
+      <div style={{ color: "var(--fg-faint)" }}>{version}</div>
+    </div>
   );
 }
