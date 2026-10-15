@@ -27,7 +27,8 @@ export default function DownloadPage({ onAdd }: { onAdd: (url: string) => Promis
 
   return (
     <>
-      <div className="flex items-center gap-2 px-6 py-4">
+      {/* 左右内边距由 App 的滚动容器提供，这里只留纵向的 */}
+      <div className="flex items-center gap-2 py-4">
         <Input
           value={url}
           onChange={(e) => setUrl(e.target.value)}
@@ -45,9 +46,7 @@ export default function DownloadPage({ onAdd }: { onAdd: (url: string) => Promis
           下载
         </Button>
       </div>
-      <div className="px-6">
-        <TaskList />
-      </div>
+      <TaskList />
     </>
   );
 }

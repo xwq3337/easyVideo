@@ -22,9 +22,15 @@ export default function Sidebar({
 }) {
   return (
     <nav
-      // 拖拽区挂在整个侧边栏上：顶部那 52px 是留给红绿灯的空白，
-      // 用户在窗口左上角按下拖动时，抓到的就是这里。
-      data-tauri-drag-region
+      // **必须是 `"deep"`，不能是裸属性。** Tauri 2.12.4 注入的 `drag.js` 里：
+      //   :64  `attr === 'deep'`            → true（子树内任意位置都算）
+      //   :66  `attr === '' || 'true'`      → `el === composedPath[0]`（**仅自身**）
+      // 而 nav 的每一个像素都被子元素盖住（spacer、导航项容器、flex-1、footer），
+      // 它永远不可能是 mousedown 的目标 —— 裸属性写在这里纯粹是装饰，
+      // 侧边栏的空白区和底部的 `StatusBar` 都拖不动窗口。
+      //
+      // 导航项不受影响：drag.js:58 规定"可点击元素且自身没有该属性"直接返回 false。
+      data-tauri-drag-region="deep"
       className="w-[200px] shrink-0 flex flex-col select-none"
       style={{
         background: "var(--bg-subtle)",
