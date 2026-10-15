@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { initialState, reduce } from "./reducer";
-import type { TaskView } from "../lib/types";
+import { humanizeSeconds, initialState, reduce } from "./reducer";
+import type { ChoiceKindDto, SettingsDto, TaskView } from "../lib/types";
 
 function task(id: number, over: Partial<TaskView> = {}): TaskView {
   return {
@@ -134,5 +134,118 @@ describe("reduce", () => {
   it("提示可以逐条关掉", () => {
     const before = { ...initialState, toasts: ["a", "b"] };
     expect(reduce(before, { kind: "dismissToast", index: 0 }).toasts).toEqual(["b"]);
+  });
+
+  // 下面两条是 `hydrate` 里仅有的两处「保留本地状态」逻辑，也是整个 store 存在的理由：
+  // 一次重同步不能把用户正在输入的框擦掉，也不能把已经弹出的选择模态框清空。
+  // 其余 hydrate 测试的旧行都是 editing:false / choices:null —— 那两处 `?:` 分支
+  // 在别处永远不会被走到，删掉它们不会有任何测试变红。
+
+  it("hydrate 保留正在编辑的文件名：重同步不擦掉用户正在输入的字", () => {
+    const before = {
+      ...initialState,
+      tasks: [task(1, { editing: true, filename: "我正在输入.mp4" })],
+    };
+    const after = reduce(before, {
+      kind: "hydrate",
+      tasks: [task(1, { filename: "core给的名字.mp4" })],
+    });
+    expect(after.tasks[0].filename).toBe("我正在输入.mp4");
+    expect(after.tasks[0].editing).toBe(true);
+  });
+
+  it("hydrate 对没在编辑的行采用 core 的新文件名", () => {
+    // 上一条的另一半：保留本地文件名**只**发生在 editing 为 true 时，
+    // 否则重同步会让 core 改名永远落不到界面上。
+    const before = { ...initialState, tasks: [task(1, { filename: "旧名字.mp4" })] };
+    const after = reduce(before, {
+      kind: "hydrate",
+      tasks: [task(1, { filename: "新名字.mp4" })],
+    });
+    expect(after.tasks[0].filename).toBe("新名字.mp4");
+  });
+
+  it("hydrate 保留本地候选副本：重同步不把已弹出的选择模态框清空", () => {
+    const cached: ChoiceKindDto = {
+      kind: "hlsVariants",
+      hlsVariants: [{ uri: "a.m3u8", bandwidth: 1, resolution: null }],
+    };
+    const before = {
+      ...initialState,
+      tasks: [task(1, { state: { kind: "awaitingChoice" }, choices: cached })],
+    };
+    const after = reduce(before, {
+      kind: "hydrate",
+      tasks: [task(1, { state: { kind: "awaitingChoice" } })],
+    });
+    expect(after.tasks[0].choices).toEqual(cached);
+  });
+
+  it("resyncRequested 置 needsResync 并记下丢了多少条", () => {
+    const after = reduce(initialState, { kind: "resyncRequested", dropped: 7 });
+    expect(after.needsResync).toBe(true);
+    expect(after.lastDropped).toBe(7);
+    expect(after.tasks).toEqual([]);
+  });
+
+  it("settings 存下设置", () => {
+    const s: SettingsDto = {
+      downloadDir: "/tmp/x",
+      segmentConcurrency: 6,
+      maxActiveTasks: 2,
+      ytdlpEnabled: true,
+      ffmpegPathOverride: "/opt/ffmpeg",
+    };
+    expect(reduce(initialState, { kind: "settings", settings: s }).settings).toEqual(s);
+  });
+
+  it("editFilename 只改目标行", () => {
+    const before = { ...initialState, tasks: [task(1), task(2)] };
+    const after = reduce(before, { kind: "editFilename", id: 2, filename: "改过.mp4" });
+    expect(after.tasks[0].filename).toBe("1.mp4");
+    expect(after.tasks[1].filename).toBe("改过.mp4");
+  });
+
+  it("setEditing 只改目标行的编辑态", () => {
+    const before = { ...initialState, tasks: [task(1), task(2)] };
+    const after = reduce(before, { kind: "setEditing", id: 1, editing: true });
+    expect(after.tasks[0].editing).toBe(true);
+    expect(after.tasks[1].editing).toBe(false);
+  });
+
+  it("choices 只把候选挂到目标行", () => {
+    const cached: ChoiceKindDto = {
+      kind: "ytdlpFormats",
+      ytdlpFormats: [
+        { id: "137", ext: "mp4", note: "1080p", filesize: 123, url: "https://example.com/v" },
+      ],
+    };
+    const before = { ...initialState, tasks: [task(1), task(2)] };
+    const after = reduce(before, { kind: "choices", id: 1, choices: cached });
+    expect(after.tasks[0].choices).toEqual(cached);
+    expect(after.tasks[1].choices).toBeNull();
+  });
+});
+
+describe("humanizeSeconds", () => {
+  it("不足一分钟直接报秒", () => {
+    expect(humanizeSeconds(0)).toBe("0 秒");
+    expect(humanizeSeconds(45)).toBe("45 秒");
+  });
+
+  it("分与秒；整分不拖一个 '0 秒' 的尾巴", () => {
+    expect(humanizeSeconds(90)).toBe("1 分 30 秒");
+    expect(humanizeSeconds(120)).toBe("2 分");
+  });
+
+  it("小时与分；整小时不拖一个 '0 分' 的尾巴", () => {
+    expect(humanizeSeconds(3600)).toBe("1 小时");
+    expect(humanizeSeconds(3900)).toBe("1 小时 5 分");
+  });
+
+  it("分钟进位到小时，不打印人话里不存在的「1 小时 60 分」", () => {
+    // 7175 秒 = 1h59m35s。分钟四舍五入到 60，必须进位成 2 小时，
+    // 而不是把 60 直接塞进 "… 分" 那个位置。
+    expect(humanizeSeconds(7175)).toBe("2 小时");
   });
 });

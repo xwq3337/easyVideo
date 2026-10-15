@@ -28,8 +28,14 @@ export function humanizeSeconds(s: number): string {
     const sec = total % 60;
     return sec === 0 ? `${m} 分` : `${m} 分 ${sec} 秒`;
   }
-  const h = Math.floor(total / 3600);
-  const m = Math.round((total % 3600) / 60);
+  let h = Math.floor(total / 3600);
+  let m = Math.round((total % 3600) / 60);
+  // 分钟四舍五入后可能正好是 60（例如 7175 秒 = 1 小时 59.5 分），要进位到小时，
+  // 否则会打印出 "1 小时 60 分" —— 人话里没有这种说法。
+  if (m === 60) {
+    m = 0;
+    h += 1;
+  }
   return m === 0 ? `${h} 小时` : `${h} 小时 ${m} 分`;
 }
 
