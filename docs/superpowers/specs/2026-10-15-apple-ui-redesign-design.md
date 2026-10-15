@@ -214,7 +214,7 @@ pub fn remove_task(&self, id: TaskId) -> bool
 
 `cancel()` 是**立刻**把状态置成 `Canceled` 的，而 worker 可能还活着——`probe()` 不接受取消令牌，worker 只能等那个网络往返自己跑完。于是「取消 → 立刻移除」会删掉一个仍然活着的 worker 脚下的条目：
 
-- **panic**：worker 回来走到 `paths()`，那里是 `.expect("task entry present")`（四处：`engine.rs` 613 / 712 / 800 / 820）——条目没了就 panic。这四处 `expect` 本来就是按「有 worker ⟹ 条目还在」写的，新 API 把这个前提破坏了。
+- **panic**：worker 回来走到 `paths()`，那里是 `.expect("task entry present")`（四处：`engine.rs` 619 / 718 / 806 / 826）——条目没了就 panic。这四处 `expect` 本来就是按「有 worker ⟹ 条目还在」写的，新 API 把这个前提破坏了。
 - **复活**：若移除恰好落在 `paths()` 与 `write_manifest` 之间，`write_manifest` 会把目录重新建出来；而 worker 随后的错误收尾判据是 `state_of(id) == Some(Canceled)`——条目已没了，判据为假，**没有任何人再删这个目录**。结果：被「移除」的任务留下 manifest，重启时 `scan_resume` 把它复活。
 
 第二条正是本设计要消灭的那件事，被新 API 从另一条路重新打开了。
