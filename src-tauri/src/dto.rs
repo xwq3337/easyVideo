@@ -296,8 +296,10 @@ mod tests {
     /// 只有真实运行时才会崩。想动这个枚举，先看这条测试为什么这么写。
     ///
     /// 这里刻意走 `event_dto(...)` 而不是直接构造 `ChoiceKindDto`：要钉的是事件路径。
-    /// 断言分三层——事件标签、枚举的内部标签、以及内层数组的字段名
-    /// (后者正是 `rename_all_fields = "camelCase"` 买来的、TS 镜像要读的那个名字)。
+    /// 断言用**整个对象的相等**而非逐个取字段——这样既能钉住内部标签与内层 camelCase 字段名
+    /// (`hlsVariants` / `ytdlpFormats`，正是 `rename_all_fields` 买来的、TS 镜像要读的名字)，
+    /// 也能钉住 payload 内部每一个键(uri/bandwidth/resolution、id/ext/note/filesize/url)，
+    /// 且多出或漏掉任何一个键都会红。
     #[test]
     fn choices_offered_pins_the_internal_tag_and_inner_field_names() {
         let hls = event_dto(EngineEvent::ChoicesOffered {
@@ -308,18 +310,34 @@ mod tests {
                 resolution: Some((1920, 1080)),
             }]),
         });
-        let j = serde_json::to_value(&hls).unwrap();
-        assert_eq!(j["type"], "choicesOffered");
-        assert_eq!(j["id"], 3);
-        assert_eq!(j["kind"]["kind"], "hlsVariants");
-        // 内层数组的字段名必须是 camelCase 的 `hlsVariants`，
-        // 而不是 Rust 侧的 `hls_variants`——这正是 rename_all_fields 的作用。
         assert_eq!(
-            j["kind"]["hlsVariants"][0]["uri"],
-            "https://example.com/1080.m3u8"
+            serde_json::to_value(&hls).unwrap(),
+            serde_json::json!({
+                "type": "choicesOffered",
+                "id": 3,
+                "kind": {
+                    "kind": "hlsVariants",
+                    "hlsVariants": [{
+                        "uri": "https://example.com/1080.m3u8",
+                        "bandwidth": 5_000_000,
+                        "resolution": [1920, 1080]
+                    }]
+                }
+            })
         );
-        // 字段级重命名要能穿透到 payload 里面：`resolution` 是元组，序列化成数组。
-        assert_eq!(j["kind"]["hlsVariants"][0]["resolution"], serde_json::json!([1920, 1080]));
+
+        // `resolution: None` 必须是 `null`，不能把字段省掉——TS 侧是 `[number, number] | null`。
+        let hls_none = event_dto(EngineEvent::ChoicesOffered {
+            id: 3,
+            kind: ChoiceKind::HlsVariants(vec![VariantChoice {
+                uri: "https://example.com/audio.m3u8".into(),
+                bandwidth: 128_000,
+                resolution: None,
+            }]),
+        });
+        let j = serde_json::to_value(&hls_none).unwrap();
+        assert_eq!(j["kind"]["hlsVariants"][0]["resolution"], serde_json::Value::Null);
+        assert!(j["kind"]["hlsVariants"][0].get("resolution").is_some());
 
         let ytdlp = event_dto(EngineEvent::ChoicesOffered {
             id: 3,
@@ -331,10 +349,163 @@ mod tests {
                 url: "https://example.com/v".into(),
             }]),
         });
-        let j = serde_json::to_value(&ytdlp).unwrap();
-        assert_eq!(j["type"], "choicesOffered");
-        assert_eq!(j["kind"]["kind"], "ytdlpFormats");
-        assert_eq!(j["kind"]["ytdlpFormats"][0]["id"], "137");
-        assert_eq!(j["kind"]["ytdlpFormats"][0]["filesize"], 123_456_789u64);
+        assert_eq!(
+            serde_json::to_value(&ytdlp).unwrap(),
+            serde_json::json!({
+                "type": "choicesOffered",
+                "id": 3,
+                "kind": {
+                    "kind": "ytdlpFormats",
+                    "ytdlpFormats": [{
+                        "id": "137",
+                        "ext": "mp4",
+                        "note": "1080p video only",
+                        "filesize": 123_456_789,
+                        "url": "https://example.com/v"
+                    }]
+                }
+            })
+        );
+    }
+
+    /// 前端必须在**全部九种** state 上 switch，所以九种 kind 字符串都得钉住。
+    /// 用整对象相等：多一个键、少一个键、大小写变了都会红。
+    #[test]
+    fn every_state_kind_serializes_to_its_exact_wire_string() {
+        let cases: [(TaskState, &str); 8] = [
+            (TaskState::Queued, "queued"),
+            (TaskState::Probing, "probing"),
+            (TaskState::AwaitingChoice, "awaitingChoice"),
+            (TaskState::Downloading, "downloading"),
+            (TaskState::Merging, "merging"),
+            (TaskState::Paused, "paused"),
+            (TaskState::Done, "done"),
+            (TaskState::Canceled, "canceled"),
+        ];
+        for (state, kind) in cases {
+            assert_eq!(
+                serde_json::to_value(StateDto::from(&state)).unwrap(),
+                serde_json::json!({ "kind": kind }),
+                "state {state:?} 应当序列化成 {{kind: {kind:?}}}"
+            );
+        }
+        // 第九种：带 message 的那个。
+        assert_eq!(
+            serde_json::to_value(StateDto::from(&TaskState::Failed("boom".into()))).unwrap(),
+            serde_json::json!({ "kind": "failed", "message": "boom" })
+        );
+    }
+
+    /// `StateChanged` 是 reducer 必须 switch 的另一条事件。它的 `type` 标签是多词 camelCase
+    /// (`stateChanged`)，最容易在改名时静默漂移，而它此前**完全没有测试**。
+    #[test]
+    fn state_changed_event_pins_its_tag_and_state() {
+        let d = event_dto(EngineEvent::StateChanged {
+            id: 9,
+            state: TaskState::Paused,
+        });
+        assert_eq!(
+            serde_json::to_value(&d).unwrap(),
+            serde_json::json!({
+                "type": "stateChanged",
+                "id": 9,
+                "state": { "kind": "paused" }
+            })
+        );
+
+        // state 里带 message 的分支也要走通，别只在 TaskDto 那一层测过。
+        let d = event_dto(EngineEvent::StateChanged {
+            id: 9,
+            state: TaskState::Failed("截图解码失败".into()),
+        });
+        assert_eq!(
+            serde_json::to_value(&d).unwrap()["state"],
+            serde_json::json!({ "kind": "failed", "message": "截图解码失败" })
+        );
+    }
+
+    /// `TaskDto` 的**每一个**键都要钉住。`url` / `downloaded` / `total` / `unit` 此前只在
+    /// `Progress` 事件里出现过——那是另一个对象，钉不住 `TaskDto` 自己的键名。
+    /// 这里特意用 `Segments` 单位，顺带覆盖 `unit` 在 `TaskDto` 上的取值。
+    #[test]
+    fn task_dto_ships_exactly_the_contract_keys() {
+        let progress = easydownvideo::core::events::ProgressHandle::new();
+        progress.add(250);
+        progress.set_total(1000);
+        progress.set_unit(ProgressUnit::Segments);
+        let t = easydownvideo::core::engine::TaskSnapshot {
+            id: 7,
+            url: "https://example.com/a.mp4".into(),
+            filename: "a.mp4".into(),
+            state: TaskState::Downloading,
+            progress,
+        };
+        assert_eq!(
+            serde_json::to_value(task_dto(t)).unwrap(),
+            serde_json::json!({
+                "id": 7,
+                "url": "https://example.com/a.mp4",
+                "filename": "a.mp4",
+                "state": { "kind": "downloading" },
+                "downloaded": 250,
+                "total": 1000,
+                "unit": "segments"
+            })
+        );
+    }
+
+    /// `SettingsDto` 的五个键名一个都不能漏。`settings_from(d) == s` 那条是**Rust 结构体**比较，
+    /// 一个 JSON 键名都钉不住——所以必须单独有这条。
+    #[test]
+    fn settings_dto_ships_exactly_the_five_contract_keys() {
+        let s = Settings {
+            download_dir: std::path::PathBuf::from("/tmp/x"),
+            segment_concurrency: 6,
+            max_active_tasks: 2,
+            ytdlp_enabled: true,
+            ffmpeg_path_override: Some(std::path::PathBuf::from("/opt/ffmpeg")),
+        };
+        assert_eq!(
+            serde_json::to_value(settings_dto(s)).unwrap(),
+            serde_json::json!({
+                "downloadDir": "/tmp/x",
+                "segmentConcurrency": 6,
+                "maxActiveTasks": 2,
+                "ytdlpEnabled": true,
+                "ffmpegPathOverride": "/opt/ffmpeg"
+            })
+        );
+
+        // None 必须是 `null` 而不是缺字段：TS 写的是 `string | null`，不是可选属性。
+        let s = Settings {
+            ffmpeg_path_override: None,
+            ..Settings::default()
+        };
+        let j = serde_json::to_value(settings_dto(s)).unwrap();
+        assert_eq!(j["ffmpegPathOverride"], serde_json::Value::Null);
+        assert!(j.get("ffmpegPathOverride").is_some());
+    }
+
+    /// 入站方向：前端**发**给我们的形状。此前 `ChoiceDto` 只 derive 了 `Deserialize`，
+    /// 从来没有一条测试真的喂过它一个 JSON 值。
+    #[test]
+    fn choice_dto_deserializes_the_inbound_shape() {
+        let d: ChoiceDto = serde_json::from_str(r#"{"kind":"variant","index":2}"#).unwrap();
+        assert_eq!(d, ChoiceDto::Variant { index: 2 });
+        match Choice::from(d) {
+            Choice::Variant(2) => {}
+            other => panic!("variant 应转成 Choice::Variant(2)，得到 {other:?}"),
+        }
+
+        let d: ChoiceDto = serde_json::from_str(r#"{"kind":"ytdlpFormat","index":5}"#).unwrap();
+        assert_eq!(d, ChoiceDto::YtdlpFormat { index: 5 });
+        match Choice::from(d) {
+            Choice::YtdlpFormat(5) => {}
+            other => panic!("ytdlpFormat 应转成 Choice::YtdlpFormat(5)，得到 {other:?}"),
+        }
+
+        // 标签名是精确契约：写错大小写或换名字必须解析失败，不能静默落到某个默认分支。
+        assert!(serde_json::from_str::<ChoiceDto>(r#"{"kind":"Variant","index":2}"#).is_err());
+        assert!(serde_json::from_str::<ChoiceDto>(r#"{"kind":"variant","idx":2}"#).is_err());
     }
 }
