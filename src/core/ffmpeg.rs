@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use anyhow::{anyhow, Context};
 use sha2::Digest;
+use tokio::io::AsyncReadExt;
+use tokio_util::sync::CancellationToken;
 
 // ===== 内嵌二进制（Task 10 用真实文件替换占位内容）=====
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -66,11 +69,12 @@ pub fn build_remux(
     // 也就是说显式加它会让所有非 AAC 音频（AC-3/E-AC-3/MP3/Opus）的 HLS 流下载后合并失败，
     // 而不加则两种都正常。让 ffmpeg 自己决定。
     cmd.arg(output);
-    // 用户取消任务时，`remux_to_mp4` 的 future 会被 drop，而 `cmd.output()` 内部持有的 Child
-    // 一并被 drop。**必须开 `kill_on_drop`**：否则 ffmpeg 子进程会变成孤儿继续跑，而引擎在取消路径上
-    // 会清掉任务目录（"取消是不要了"），于是孤儿进程还在往一个已被删除的目录里写。
-    // 设置在 `build_remux` 而不是调用点：Task 13 调的是高层 `remux_to_mp4`，拿不到 Command，
-    // 没有别的地方能设置它 —— 这是唯一正确的归属点。
+    // **必须开 `kill_on_drop`**：否则 ffmpeg 子进程会变成孤儿继续跑，而引擎在取消路径上会清掉
+    // 任务目录（"取消是不要了"），于是孤儿进程还在往一个已被删除的目录里写。
+    //
+    // 现在 `remux_to_mp4` 会显式 `start_kill` + `wait`（暂停/取消路径，见那里的说明），这个标志
+    // 是**兜底**：future 因为别的原因被 drop（例如整个 runtime 收尾）时，Child 一并 drop，
+    // 进程同样会被收掉。设置在 `build_remux` 而不是调用点 —— 调用方拿不到 Command。
     //
     // 故意不写测试：`tokio::process::Command` 没有读取该标志的 getter，无法断言。
     // 这是有据可查的"未测试"而非"忘了测"。
@@ -78,19 +82,62 @@ pub fn build_remux(
     cmd
 }
 
+/// 合并的结果。把"被用户中断"与"真的失败"分开 —— 前者要保留分片目录供继续，后者不是。
+#[derive(Debug, PartialEq, Eq)]
+pub enum RemuxOutcome {
+    Done,
+    /// token 被取消（用户暂停或取消）。ffmpeg 子进程已被**杀掉并收尸**，
+    /// 可能写了一半的产物也已删除。
+    Interrupted,
+}
+
+/// 合并成 mp4，全程可被 `cancel` 打断。
+///
+/// 合并可能很久（`-c copy` 要把整个文件搬一遍），而界面在 `Merging` 上同样给出暂停按钮，
+/// 所以这里必须真的能停下 —— 而 ffmpeg 本身**不看我们的 token**，只能把等待它的 future
+/// 连同子进程一起处理掉。
 pub async fn remux_to_mp4(
     ffmpeg: &Path,
     plan: &crate::core::hls::ConcatPlan,
     output: &Path,
-) -> anyhow::Result<()> {
-    let out = output.to_path_buf();
-    let mut cmd = build_remux(ffmpeg, &plan.list_file, &out);
-    let output_status = cmd.output().await.context("spawn ffmpeg")?;
-    if !output_status.status.success() {
-        return Err(anyhow!(
-            "ffmpeg failed: {}",
-            String::from_utf8_lossy(&output_status.stderr)
-        ));
+    cancel: &CancellationToken,
+) -> anyhow::Result<RemuxOutcome> {
+    let mut cmd = build_remux(ffmpeg, &plan.list_file, output);
+    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().context("spawn ffmpeg")?;
+
+    // stderr 必须有人抽干：`wait()` 期间没人读管道的话，ffmpeg 写满 64KB 就会卡在 write 上
+    // 永不退出。（原先用 `Command::output()`，它替我们做了这件事；改成 spawn 就得自己做。）
+    let mut err_pipe = child.stderr.take();
+    let drain = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(e) = err_pipe.as_mut() {
+            let _ = e.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+
+    tokio::select! {
+        status = child.wait() => {
+            let status = status.context("wait ffmpeg")?;
+            let stderr = drain.await.unwrap_or_default();
+            if !status.success() {
+                return Err(anyhow!(
+                    "ffmpeg failed: {}",
+                    String::from_utf8_lossy(&stderr)
+                ));
+            }
+            Ok(RemuxOutcome::Done)
+        }
+        _ = cancel.cancelled() => {
+            // **先杀、再等它真的退出，最后才删产物。** 顺序不能反：kill 只是发信号，进程
+            // 可能还有一次写在做；不等它就删，它随后会把半截文件重新写出来 —— 用户会在
+            // 下载目录里看到一个打不开的 mp4，而任务显示"已暂停"。
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            let _ = drain.await;
+            std::fs::remove_file(output).ok();
+            Ok(RemuxOutcome::Interrupted)
+        }
     }
-    Ok(())
 }

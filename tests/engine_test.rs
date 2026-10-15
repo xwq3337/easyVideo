@@ -1214,3 +1214,113 @@ async fn pause_works_while_probing() {
     wait_state(&mut rx, id, TaskState::Done, 30).await;
     assert_eq!(std::fs::read(dir.path().join("v.mp4")).unwrap(), data);
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_works_while_merging() {
+    // 界面在 Merging 上同样给暂停按钮（src/app.rs:290-297），而 pause 原先无视它，
+    // remux_to_mp4 也不看 token —— 合并会一路跑到结束。Merging 可能很久：`-c copy`
+    // 要把整个文件搬一遍，长视频是几秒到几分钟，用户完全可能想停下来。
+    //
+    // 这里用**可控的假 ffmpeg**：真 ffmpeg 没法确定性地慢下来，而这一步要验的是引擎的
+    // 取消语义（中断子进程、清掉它写出来的东西、保留分片目录供继续），不是 ffmpeg 本身。
+    //
+    // 脚本每次都一样：先写出产物，再睡 2 秒，最后成功退出。用"每次都成功"是为了让测试
+    // 对**暂停落地的时刻**不敏感 —— 第一版按调用次数分支（第一次失败、第二次成功），结果
+    // 暂停常常赶在脚本写计数文件之前就把它杀了，于是"继续"时它仍以为是第一次运行。
+    let server = MockServer::start().await;
+    let media = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n\
+#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\nseg0.ts\n#EXT-X-ENDLIST\n";
+    Mock::given(method("GET"))
+        .and(path("/media.m3u8"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.apple.mpegurl")
+                .set_body_string(media),
+        )
+        .mount(&server)
+        .await;
+    // expect(1)：分片只准被下载一次。继续之后只重跑合并，不该重下分片。
+    Mock::given(method("GET"))
+        .and(path("/seg0.ts"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "video/mp2t")
+                .set_body_bytes(vec![7u8; 1024]),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let bindir = tempfile::tempdir().unwrap();
+    let fake = bindir.path().join("fake-ffmpeg");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nout=\"\"\nfor a in \"$@\"; do out=\"$a\"; done\n\
+printf 'MERGED-BY-FAKE-FFMPEG' > \"$out\"\nsleep 2\nexit 0\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let mut s = settings_with(dir.path());
+    s.ffmpeg_path_override = Some(fake.clone());
+    let engine = Engine::new(rt, s, dir.path().join("data"));
+    let mut rx = engine.events();
+    let id = engine.add_url(format!("{}/media.m3u8", server.uri()));
+
+    wait_state(&mut rx, id, TaskState::Merging, 60).await;
+    engine.pause(id);
+
+    // 静默窗口长于假 ffmpeg 的 2 秒：若暂停没生效，它会成功跑完，任务变成 Done。
+    let quiet_until = std::time::Instant::now() + std::time::Duration::from_millis(3000);
+    let mut after: Vec<String> = Vec::new();
+    while std::time::Instant::now() < quiet_until {
+        match tokio::time::timeout(
+            quiet_until.saturating_duration_since(std::time::Instant::now()),
+            rx.recv(),
+        )
+        .await
+        {
+            Ok(Ok(EngineEvent::StateChanged { id: eid, state })) if eid == id => {
+                after.push(format!("{state:?}"));
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    let snap = engine
+        .list_tasks()
+        .into_iter()
+        .find(|t| t.id == id)
+        .expect("任务应仍在列表中");
+    assert_eq!(
+        snap.state,
+        TaskState::Paused,
+        "合并期间点暂停没有生效（观察到 {after:?}）"
+    );
+    let tdir = easydownvideo::core::task::task_dir(dir.path(), id);
+    assert!(
+        tdir.exists(),
+        "暂停应当保留断点目录 —— 分片还在，继续时只重跑合并这一步"
+    );
+    assert!(
+        !dir.path().join("media.mp4").exists(),
+        "被中断的合并写出来的东西必须清掉，否则下载目录里会留下一个用不了的 mp4"
+    );
+
+    // 继续：只重跑合并（/seg0.ts 的 expect(1) 会在 mock 析构时校验分片没有被重下）
+    engine.unpause(id);
+    wait_state(&mut rx, id, TaskState::Done, 60).await;
+    assert_eq!(
+        std::fs::read(dir.path().join("media.mp4")).unwrap(),
+        b"MERGED-BY-FAKE-FFMPEG".to_vec()
+    );
+    assert!(!tdir.exists(), "完成后任务目录应当清掉");
+}

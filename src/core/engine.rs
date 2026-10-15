@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::core::direct::{download_direct, unique_path_avoiding, MIN_BLOCK_SIZE};
 use crate::core::events::{Choice, ChoiceKind, EngineEvent, ProgressHandle, TaskId, TaskState};
-use crate::core::ffmpeg::{ensure_ffmpeg, remux_to_mp4};
+use crate::core::ffmpeg::{ensure_ffmpeg, remux_to_mp4, RemuxOutcome};
 use crate::core::hls::{download_media, parse::parse_playlist, parse::ParsedPlaylist};
 use crate::core::probe::{filename_from_url, probe, ProbeOutcome};
 use crate::core::task::{task_dir, write_manifest, ManifestKind, TaskManifest};
@@ -201,18 +201,22 @@ impl Engine {
     ///
     /// - `Queued`：还没轮到它，界面当前没给按钮，但对着队列里的任务点暂停是正常操作；
     /// - `Probing` / `Downloading`：worker 在跑。token 一取消，worker 会停在下一个检查点
-    ///   （`advance_state` 的闸门 + `download_direct`/`download_media` 里的取消检查）。
+    ///   （`advance_state` 的闸门 + `download_direct`/`download_media` 里的取消检查）；
+    /// - `Merging`：ffmpeg 不看我们的 token，靠 `remux_to_mp4` 里的 `select!` 把等待它的
+    ///   future 连同子进程一起收掉，并删掉可能写了一半的产物。暂停时任务目录**保留**
+    ///   （分片还在），继续时只重跑合并这一步，不必重下。
     ///
-    /// 不接受的：`Merging`（`remux_to_mp4` 里的 ffmpeg 不看我们的 token，暂停在那里会变成
-    /// "等合并跑完再暂停"，还要重下分片 —— 待办）、`AwaitingChoice`（没有 worker，
-    /// pause 无从生效）、以及各终态。
+    /// 不接受的：`AwaitingChoice`（没有 worker，pause 无从生效）、以及各终态。
     pub fn pause(&self, id: TaskId) {
         let entry = { self.inner.tasks.lock().unwrap().get(&id).cloned() };
         if let Some(e) = entry {
             // 标记为 Paused 后，pump 的分支闸会因为状态不是 Queued 而跳过它。
             if matches!(
                 e.state,
-                TaskState::Queued | TaskState::Probing | TaskState::Downloading
+                TaskState::Queued
+                    | TaskState::Probing
+                    | TaskState::Downloading
+                    | TaskState::Merging
             ) {
                 e.cancel.cancel();
                 self.set_state(id, TaskState::Paused);
@@ -730,7 +734,16 @@ impl Engine {
             Some(p) => p.clone(),
             None => ensure_ffmpeg(&self.inner.data_dir)?,
         };
-        remux_to_mp4(&ffmpeg, &plan, &final_path).await?;
+        // 合并可能很久（-c copy 要把整个文件搬一遍），必须能被暂停/取消打断。
+        if remux_to_mp4(&ffmpeg, &plan, &final_path, cancel).await? == RemuxOutcome::Interrupted {
+            // 用户暂停：保留任务目录（分片还在，继续时只重跑合并这一步）。
+            // 用户取消：什么都不留 —— `cancel` 见到 Merging 就把清理交给了 worker，
+            // 这个地方必须自己做完，否则任务目录会孤零零留在盘上被 scan_resume 复活。
+            if !matches!(self.state_of(id), Some(TaskState::Paused)) {
+                std::fs::remove_dir_all(&tdir).ok();
+            }
+            return Ok(());
+        }
         // 合并成功后整个任务目录（含 manifest、分片、concat 列表）一起清掉，
         // 避免重启时 scan_resume 把已完成任务复活
         std::fs::remove_dir_all(&tdir).ok();
