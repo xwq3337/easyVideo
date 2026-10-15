@@ -79,9 +79,15 @@ struct WorkerGuard {
 
 impl Drop for WorkerGuard {
     fn drop(&mut self) {
-        self.workers.fetch_sub(1, Ordering::SeqCst);
-        // 先释放占用再 pump：被挡回队列的那个任务重新 `paths()` 时要能看到干净的状态。
+        // **先释放占用，再减计数。** 顺序不能反：`remove_task` 以 `workers == 0`
+        // 作为准入条件之一，它读到 0 时就假定这个 worker 已经彻底放手了 ——
+        // 包括把 `reserved_path` 占位还回去。反过来的话会留下一个"减了计数、
+        // 还没释放"的窗口，`remove_task` 就必须在自己的临界区里额外兜它，
+        // 而那个窗口窄到写不出确定性测试。
+        //
+        // 原有注释要求的「释放必须在 pump() 之前」仍然满足。
         self.engine.release_reserved_path(self.id);
+        self.workers.fetch_sub(1, Ordering::SeqCst);
         // 因为"旧 worker 还没退干净"被挡回队列的那个任务，现在可以起来了。
         self.engine.pump();
     }
@@ -847,49 +853,47 @@ impl Engine {
         recorded.unwrap_or_else(|| task_dir(&fallback_root, id))
     }
 
-    /// 把一条**已结束**的任务从列表里彻底移除。
+    /// 把一条**已经彻底结束**的任务从列表里移除。
     ///
-    /// 只接受终态。正在跑的任务语义含糊：盘上的 `.part` 分片删不删？删了是数据丢失，
-    /// 不删是磁盘泄漏。所以一律拒绝，让调用方先把它取消掉。
+    /// 准入条件是**两件事同时成立**：状态是终态，且没有 worker 还活着。
+    /// 只判终态是不够的 —— `cancel()` 是**立刻**把状态置成 `Canceled` 的，而
+    /// `probe()` 不接受取消令牌，worker 只能等那个网络往返自己跑完。于是
+    /// "取消一个正在探测的任务、然后立刻移除"会删掉一个活着的 worker 脚下的条目：
+    /// worker 回来走到 `paths()` 时那里是 `.expect("task entry present")`，直接 panic。
+    /// 更糟的是若移除落在 `paths()` 与 `write_manifest` 之间，`write_manifest` 会把
+    /// 目录重新建出来，而错误收尾的判据 `state_of(id) == Some(Canceled)` 因为条目
+    /// 已没了而为假 —— 没有任何人再删它，重启时 `scan_resume` 把这个"已移除"的任务复活。
+    ///
+    /// `workers == 0` 把这条路一并关掉：只要还有 worker 活着，条目就不可能被删，
+    /// 那四处 `expect` 因此重新变得安全。终态任务不会被 `pump()` 启动（它只启动
+    /// `Queued`），所以过了这道闸就不会再有新 worker 冒出来。
     ///
     /// **必须连任务目录一起删。** `Failed` 的任务在收尾时**刻意保留** manifest
     /// （为了下次能续传，见 worker 的错误分支：那里只 `set_state(Failed)`，不碰盘）。
-    /// 只删内存条目的话，重启时 `scan_resume` 会把它捞回来并 `resume()` 回列表 ——
-    /// 用户明明"移除"过的任务又出现了。
+    /// 只删内存条目的话，重启时 `scan_resume` 会把它捞回来 —— 用户明明"移除"过的任务又出现了。
     ///
-    /// 返回 `false` 表示任务不存在，或不是终态。
+    /// 返回 `false` 表示任务不存在、不是终态、或者还有 worker 在跑。
     pub fn remove_task(&self, id: TaskId) -> bool {
-        // 两个字段都读自条目本身，所以必须在条目消失之前取出来。
-        // `actual_task_dir` 用的是任务**真正**写入的那个目录：用户可以在任务跑着的
-        // 时候改保存位置，退回 `current_settings().download_dir` 会删错地方。
+        // `actual_task_dir` 读的是条目上的 `dir` 记录（用户可能在任务跑着的时候
+        // 改过保存位置），所以必须在条目消失之前取。
         let tdir = self.actual_task_dir(id);
-        let (reserved, removed) = {
+        let removed = {
             let mut tasks = self.inner.tasks.lock().unwrap();
             // 判定与移除在**同一个锁**里完成：`retry()` 会把 `Failed` 挪回 `Queued`，
             // 先查后删之间留个窗口的话，用户刚重试的任务会被无声抹掉。
-            if !tasks
-                .get(&id)
-                .map(|t| is_terminal(&t.state))
-                .unwrap_or(false)
-            {
-                (None, false)
-            } else {
-                let reserved = tasks.get_mut(&id).and_then(|t| t.reserved_path.take());
-                tasks.remove(&id);
-                (reserved, true)
+            match tasks.get(&id) {
+                Some(t) if is_terminal(&t.state) && t.workers.load(Ordering::SeqCst) == 0 => {
+                    tasks.remove(&id);
+                    true
+                }
+                _ => false,
             }
         };
         if !removed {
             return false;
         }
-        // 释放必须由这里做完。`WorkerGuard::drop` 也会释放，但它读的同样是条目上的
-        // 字段 —— 条目已被我们删掉，那一次会静默落空。而 `cancel()` 是**立刻**把状态
-        // 置成 `Canceled` 的：worker 可能还挂在网络请求上没退出，于是"移除一个刚取消
-        // 的任务"正好落在这个窗口里，占位会**因为这个**泄漏，之后同名文件莫名变成
-        // `v (1).mp4`。
-        if let Some(p) = reserved {
-            self.inner.reserved_paths.lock().unwrap().remove(&p);
-        }
+        // 这里**不需要**碰 `reserved_paths`：`workers == 0` 意味着 `WorkerGuard::drop`
+        // 已经跑完 `release_reserved_path`（上面刚把它排到 `fetch_sub` 之前）。
         std::fs::remove_dir_all(&tdir).ok();
         let _ = self.inner.tx.send(EngineEvent::TaskRemoved { id });
         true

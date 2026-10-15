@@ -1448,15 +1448,16 @@ async fn removed_failed_task_is_not_resurrected_by_scan_resume() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn remove_releases_reserved_path_while_the_worker_is_still_exiting() {
-    // 钉一个很窄但要命的窗口：`cancel()` 让状态**立刻**变成 Canceled，而 worker
-    // 可能还挂在网络请求上没退出。此时移除会先删掉条目，随后 WorkerGuard 的释放
-    // 在 `get_mut(&id)` 上落空 —— 于是那个"已分配但还没落盘"的占位**永久泄漏**，
-    // 之后下同名文件会被算成冲突，用户莫名拿到 `v (1).mp4`。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remove_is_rejected_while_a_worker_is_still_alive() {
+    // `cancel()` 是**立刻**把状态置成 Canceled 的，而 worker 可能还活着 ——
+    // `probe()` 不接受取消令牌，只能等那个网络往返自己跑完。若此时允许移除，
+    // 条目会在一个活着的 worker 脚下消失：worker 走到 `paths()` 时那四处
+    // `.expect("task entry present")` 会 panic；更糟的是若移除落在 `paths()` 与
+    // `write_manifest` 之间，目录会被重新建出来而**没有任何人再删它** ——
+    // 重启时 scan_resume 把这个"已移除"的任务复活。
     //
-    // **不能写成"移除后再等 worker 退出"**：那样 WorkerGuard 已经把占位释放干净，
-    // 测试会变成空跑。必须在 worker 仍被延迟响应卡住时就移除。
+    // 所以准入条件必须是"终态 **且** 没有 worker 在跑"，这条钉的是后半句。
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v.mp4"))
@@ -1469,7 +1470,7 @@ async fn remove_releases_reserved_path_while_the_worker_is_still_exiting() {
         )
         .mount(&server)
         .await;
-    // 全量请求延迟返回，把 worker 卡在这里
+    // 全量请求延迟返回，把 worker 卡在这里，制造"状态已 Canceled 但 worker 还在"的窗口
     Mock::given(method("GET"))
         .and(path("/v.mp4"))
         .respond_with(
@@ -1477,43 +1478,43 @@ async fn remove_releases_reserved_path_while_the_worker_is_still_exiting() {
                 .insert_header("content-type", "video/mp4")
                 .insert_header("content-range", "bytes 0-4095/4096")
                 .set_body_bytes(vec![0u8; 4096])
-                .set_delay(std::time::Duration::from_secs(5)),
+                .set_delay(std::time::Duration::from_secs(3)),
         )
         .mount(&server)
         .await;
 
     let dir = tempfile::tempdir().unwrap();
     let rt = tokio::runtime::Handle::current();
-    let mut s = settings_with(dir.path());
-    s.max_active_tasks = 2; // 第二个任务要在第一个 worker 还卡着的时候就能跑
-    let engine = Engine::new(rt, s, dir.path().join("data"));
+    let engine = Engine::new(rt, settings_with(dir.path()), dir.path().join("data"));
     let mut rx = engine.events();
 
-    let first = engine.add_url(format!("{}/v.mp4", server.uri()));
-    // 进入 Downloading 说明 paths() 已经跑过、占位已经登记
-    wait_state(&mut rx, first, TaskState::Downloading, 10).await;
+    let id = engine.add_url(format!("{}/v.mp4", server.uri()));
+    // 进入 Downloading 说明 worker 正在跑
+    wait_state(&mut rx, id, TaskState::Downloading, 10).await;
 
-    engine.cancel(first); // 状态立刻变 Canceled，worker 还卡在那个延迟响应上
-    assert!(engine.remove_task(first), "已取消的任务应当能移除");
+    engine.cancel(id); // 状态立刻变 Canceled，但 worker 还卡在那个延迟响应上
+    assert!(
+        !engine.remove_task(id),
+        "worker 还活着时不该允许移除 —— 那会让条目在一个活着的 worker 脚下消失"
+    );
 
-    let second = engine.add_url(format!("{}/v.mp4", server.uri()));
-    // 等第二个任务走到写 manifest 那一步 —— 那时它已经算过自己的最终路径
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let assigned = loop {
-        if let Some(m) = easydownvideo::core::task::scan_resume(dir.path())
-            .into_iter()
-            .find(|m| m.id == second)
-        {
-            break m.filename;
+    // 等 worker 真正退出，此后才允许移除
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if engine.remove_task(id) {
+            break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "第二个任务一直没落下 manifest"
+            "worker 已经退出了，却仍然拒绝移除"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    };
-    assert_eq!(
-        assigned, "v.mp4",
-        "占位没释放：同名文件被算成了冲突，第二个任务拿到 {assigned}"
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(engine.list_tasks().len(), 0, "移除后列表里不该还有它");
+    assert!(
+        !easydownvideo::core::task::scan_resume(dir.path())
+            .iter()
+            .any(|m| m.id == id),
+        "移除后盘上仍有它的 manifest，重启会把这个任务复活"
     );
 }
