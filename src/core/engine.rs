@@ -310,8 +310,7 @@ impl Engine {
     ///
     /// 读的是候选字段本身，**不看状态**。所以：一个在 `AwaitingChoice` 时被 `cancel()` 掉的
     /// 任务仍会返回 `Some(..)`（`cancel` 不清这个字段，只有 `retry` 与 `set_choice` 清）。
-    /// 调用方应当先按状态过滤 —— 当前唯一的调用方（前端 `ChoiceDialog` 与 `store.hydrate()`）
-    /// 正是这么做的。
+    /// 因此调用方必须自行按状态过滤，不要假定返回值非空就意味着任务还在等选择。
     pub fn pending_choice(&self, id: TaskId) -> Option<ChoiceKind> {
         self.inner
             .tasks
