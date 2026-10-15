@@ -112,6 +112,94 @@ async fn end_to_end_direct_download() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_tasks_with_the_same_derived_name_do_not_clobber() {
+    // `unique_path` 是"先查后用"：两个任务在同一时刻都看到"最终文件不存在"，于是算出
+    // **同一个**最终路径，各自下载到自己的任务目录后都往那一个路径拼接 —— 后完成的把
+    // 先完成的成果覆盖掉。两个任务都报成功，用户以为自己下到了两个文件。
+    //
+    // 触发条件很普通：`filename_from_url` 对末段不含 `.` 的 URL 一律回落到 `video.mp4`，
+    // 而默认 `max_active_tasks = 2`，连续贴两个这样的链接就会并发跑。
+    //
+    // 这里让两个任务都"先过 paths() 再写盘"：body 响应延迟 500ms，于是两者的 paths()
+    // 都发生在任何一个最终文件落盘之前 —— 这不是碰运气，是构造出来的必然重叠。
+    let a: Vec<u8> = (0..4096u32).map(|i| (i % 197) as u8).collect();
+    let b: Vec<u8> = (0..4096u32).map(|i| (i % 181) as u8).collect();
+    let server = MockServer::start().await;
+    for (p, body) in [("/a/watch", a.clone()), ("/b/download", b.clone())] {
+        Mock::given(method("GET"))
+            .and(path(p))
+            .and(header("range", "bytes=0-63"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("content-type", "video/mp4")
+                    .insert_header("content-range", "bytes 0-63/4096")
+                    .set_body_bytes(body[0..64].to_vec()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(p))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("content-type", "video/mp4")
+                    .insert_header("content-range", "bytes 0-4095/4096")
+                    .set_body_bytes(body.clone())
+                    .set_delay(std::time::Duration::from_millis(500)),
+            )
+            .mount(&server)
+            .await;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let mut s = settings_with(dir.path());
+    s.max_active_tasks = 2; // 默认值，这里写出来是为了让触发条件显式
+    let engine = Engine::new(rt, s, dir.path().join("data"));
+
+    engine.add_url(format!("{}/a/watch", server.uri()));
+    engine.add_url(format!("{}/b/download", server.uri()));
+
+    // 两个任务并发，**不能**按 id 分别 `wait_state`：broadcast 每个事件只投递一次，
+    // 后一个 id 若先完成，它的事件会在等前一个 id 时被消费掉，之后就永远等不到了。
+    // 这里轮询快照（项目里其他测试等清理也是这个写法），与事件到达顺序无关。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let snaps = engine.list_tasks();
+        if let Some(bad) = snaps
+            .iter()
+            .find(|t| matches!(t.state, TaskState::Failed(_) | TaskState::Canceled))
+        {
+            panic!("任务没有成功：{:?}", bad.state);
+        }
+        if !snaps.is_empty() && snaps.iter().all(|t| t.state == TaskState::Done) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "两个同名任务没有在 60s 内完成"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let mut got: Vec<Vec<u8>> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .map(|e| std::fs::read(e.path()).unwrap())
+        .collect();
+    got.sort();
+    let mut want = vec![a.clone(), b.clone()];
+    want.sort();
+    assert_eq!(
+        got.len(),
+        2,
+        "两个同名任务应当各落一个文件（video.mp4 与 video (1).mp4），实际只有 {} 个 —— 后完成的把先完成的覆盖了",
+        got.len()
+    );
+    assert_eq!(got, want, "落盘的两个文件与两份响应体对不上");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failure_does_not_block_queue() {
     let server = MockServer::start().await;
     // 坏 URL 直接 404

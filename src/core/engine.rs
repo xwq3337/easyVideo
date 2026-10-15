@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -7,7 +7,7 @@ use tokio::runtime::Handle;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::core::direct::{download_direct, unique_path, MIN_BLOCK_SIZE};
+use crate::core::direct::{download_direct, unique_path_avoiding, MIN_BLOCK_SIZE};
 use crate::core::events::{Choice, ChoiceKind, EngineEvent, ProgressHandle, TaskId, TaskState};
 use crate::core::ffmpeg::{ensure_ffmpeg, remux_to_mp4};
 use crate::core::hls::{download_media, parse::parse_playlist, parse::ParsedPlaylist};
@@ -40,6 +40,9 @@ struct Inner {
     tx: broadcast::Sender<EngineEvent>,
     next_id: AtomicU64,
     data_dir: PathBuf,
+    /// 已被某个在途任务占用、但尚未落盘的最终路径。见 `unique_path_avoiding`：
+    /// 只问文件系统是不够的，两个任务会在同一个时刻都得到"这个文件不存在"的答案。
+    reserved_paths: Mutex<HashSet<PathBuf>>,
 }
 
 #[derive(Clone)]
@@ -56,13 +59,17 @@ struct TaskEntry {
     /// `File::create` 截断写），产出一个静默损坏的文件 —— Direct 下载没有校验和，
     /// 没有任何东西会把这个错误暴露出来。
     workers: Arc<AtomicUsize>,
+    /// 本次 `paths()` 占下来的最终路径，worker 结束时要把它释放掉。
+    reserved_path: Option<PathBuf>,
 }
 
-/// worker 生命周期守卫：退出时把该任务的 worker 计数减回去，并再 `pump` 一次。
+/// worker 生命周期守卫：退出时把该任务的 worker 计数减回去、释放最终路径的占用，并再
+/// `pump` 一次。
 ///
 /// 用 `Drop` 而不是在收尾处手写一次减法：收尾路径里有早退、有 `?`、也有 panic 的可能，
 /// 而计数一旦泄漏（没有减回去），这个任务就**永远不会再被启动** —— 比它要修的缺陷更糟。
 struct WorkerGuard {
+    id: TaskId,
     workers: Arc<AtomicUsize>,
     engine: Engine,
 }
@@ -70,6 +77,8 @@ struct WorkerGuard {
 impl Drop for WorkerGuard {
     fn drop(&mut self) {
         self.workers.fetch_sub(1, Ordering::SeqCst);
+        // 先释放占用再 pump：被挡回队列的那个任务重新 `paths()` 时要能看到干净的状态。
+        self.engine.release_reserved_path(self.id);
         // 因为"旧 worker 还没退干净"被挡回队列的那个任务，现在可以起来了。
         self.engine.pump();
     }
@@ -103,6 +112,7 @@ impl Engine {
                 tx,
                 next_id: AtomicU64::new(1),
                 data_dir,
+                reserved_paths: Mutex::new(HashSet::new()),
             }),
         }
     }
@@ -315,6 +325,7 @@ impl Engine {
                     pending_choice: None,
                     progress,
                     workers: Arc::new(AtomicUsize::new(0)),
+                    reserved_path: None,
                 },
             );
         }
@@ -427,6 +438,7 @@ impl Engine {
                 // 计数在 pump 里、与"Queued → Probing"同一个锁内已 +1；这里交给守卫在退出时 -1，
                 // 并顺带把被它挡回队列的任务重新 pump 起来。
                 let _worker = WorkerGuard {
+                    id,
                     workers,
                     engine: engine.clone(),
                 };
@@ -707,7 +719,38 @@ impl Engine {
                 .into_owned(),
             None => current,
         };
-        let final_path = unique_path(root, &filename);
+        // **查询与登记必须在同一个 `reserved_paths` 锁内完成。** 只问文件系统的话，
+        // 两个任务会在同一时刻都得到"这个文件不存在"，于是算出同一个最终路径。
+        let final_path = {
+            let mut reserved = self.inner.reserved_paths.lock().unwrap();
+            let p = unique_path_avoiding(root, &filename, |c| reserved.contains(c));
+            reserved.insert(p.clone());
+            p
+        };
+        self.inner
+            .tasks
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .expect("task entry present")
+            .reserved_path = Some(final_path.clone());
         (final_path, tdir)
+    }
+
+    /// worker 结束后释放该任务的最终路径占用。
+    ///
+    /// **总是**释放，不做条件判断：占用本身就是"已分配但还没落盘"的意思。成功后文件已经在
+    /// 盘上，之后的唯一性判断由文件系统回答，结果一样；取消/失败/暂停时什么都没写出来，
+    /// 不释放的话这个名字会被永久占着 —— 用户再下同一个视频只会得到
+    /// `video (1).mp4`、`video (2).mp4`……越攒越多。
+    fn release_reserved_path(&self, id: TaskId) {
+        let path = {
+            let mut tasks = self.inner.tasks.lock().unwrap();
+            match tasks.get_mut(&id).and_then(|t| t.reserved_path.take()) {
+                Some(p) => p,
+                None => return,
+            }
+        };
+        self.inner.reserved_paths.lock().unwrap().remove(&path);
     }
 }

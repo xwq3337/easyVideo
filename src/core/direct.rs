@@ -25,8 +25,19 @@ pub fn plan_blocks(total: u64, concurrency: usize, min_block: u64) -> Vec<(u64, 
 }
 
 pub fn unique_path(dir: &Path, filename: &str) -> PathBuf {
+    unique_path_avoiding(dir, filename, |_| false)
+}
+
+/// `unique_path` 的并发安全版本：除文件系统外，还避开调用方已经占用、但**尚未落盘**的名字。
+///
+/// 为什么需要它：`unique_path` 是"先查后用"—— 两个任务在同一时刻都看到"最终文件不存在"，
+/// 于是算出**同一个**最终路径，各自下载到自己的任务目录后都往那一个路径写；后完成的把先
+/// 完成的覆盖掉，而两个任务都报成功。占用登记必须与查询在**同一个锁内**完成，否则只是把
+/// 窗口挪了个位置。
+pub fn unique_path_avoiding(dir: &Path, filename: &str, taken: impl Fn(&Path) -> bool) -> PathBuf {
+    let free = |p: &Path| !p.exists() && !taken(p);
     let candidate = dir.join(filename);
-    if !candidate.exists() {
+    if free(&candidate) {
         return candidate;
     }
     let stem = Path::new(filename)
@@ -41,7 +52,7 @@ pub fn unique_path(dir: &Path, filename: &str) -> PathBuf {
         .unwrap_or_default();
     for i in 1.. {
         let p = dir.join(format!("{stem} ({i}){ext}"));
-        if !p.exists() {
+        if free(&p) {
             return p;
         }
     }
