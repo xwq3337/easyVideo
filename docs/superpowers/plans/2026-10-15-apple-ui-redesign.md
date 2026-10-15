@@ -988,7 +988,9 @@ export function Input({ className, ...props }: React.InputHTMLAttributes<HTMLInp
 `ui/src/components/ui/tabs.tsx`——用 Radix 的 `Tabs` 做数据源，但视觉上**改造成 Apple 的分段控件**（一整块浅灰底 + 选中项浮起），而不是它默认的下划线样式：
 
 ```tsx
-import * as React from "react";
+// 不要写 `import * as React from "react"` —— 这个文件里一个 React 命名空间都用不到，
+// 而 tsconfig 开了 noUnusedLocals，那句会直接 `error TS6133` 让构建挂掉。
+// JSX 由 `jsx: "react-jsx"` 处理，不需要把 React 引进来。
 import * as TabsPrimitive from "@radix-ui/react-tabs";
 import { cn } from "@/lib/utils";
 
