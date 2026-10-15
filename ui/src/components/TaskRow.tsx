@@ -20,7 +20,15 @@ export default function TaskRow({ task }: { task: TaskView }) {
   const [draft, setDraft] = useState(task.filename);
   const pct =
     task.total > 0 ? Math.min(100, Math.round((task.downloaded / task.total) * 100)) : 0;
-  const done = task.state.kind === "done" || task.state.kind === "canceled";
+  // 只用来取色；中文取词统一走 LABELS。纯展示，不进 reducer。
+  const labelColor =
+    task.state.kind === "failed"
+      ? "var(--accent-err)"
+      : task.state.kind === "merging" || task.state.kind === "done"
+        ? "var(--accent-ok)"
+        : task.state.kind === "paused"
+          ? "var(--accent-warn)"
+          : "var(--fg-muted)";
 
   async function commitName() {
     dispatch({ kind: "setEditing", id: task.id, editing: false });
@@ -63,26 +71,16 @@ export default function TaskRow({ task }: { task: TaskView }) {
           title="点一下可改文件名"
         />
         <span className="tnum shrink-0" style={{ color: "var(--fg-muted)" }}>
-          {task.state.kind === "failed" ? (
-            <span style={{ color: "var(--accent-err)" }}>{LABELS[task.state.kind]}</span>
-          ) : task.state.kind === "merging" ? (
-            <span style={{ color: "var(--accent-ok)" }}>{LABELS[task.state.kind]}</span>
-          ) : task.state.kind === "paused" ? (
-            <span style={{ color: "var(--accent-warn)" }}>{LABELS[task.state.kind]}</span>
-          ) : done ? (
-            // 终态给名字，不给「100%」—— brief 的 Step 4 明确要求完成时"显示已完成";
-            // 作者已定义 done/已取消 两条文案，并把 done 算出来却只写了个 `{done && null}` 的桩。
-            <span
-              style={{
-                color: task.state.kind === "done" ? "var(--accent-ok)" : "var(--fg-muted)",
-              }}
-            >
-              {LABELS[task.state.kind]}
-            </span>
-          ) : task.unit === "bytes" ? (
-            `${pct}%`
+          {/* 只有下载中才谈得上「进度」；其余状态显示状态名 —— 否则「等待选择」会显示成 0%，
+              看着像什么都没发生。百分比也只对字节单位有意义。 */}
+          {task.state.kind === "downloading" ? (
+            task.unit === "bytes" ? (
+              `${pct}%`
+            ) : (
+              `${task.downloaded} / ${task.total} 片`
+            )
           ) : (
-            `${task.downloaded} / ${task.total} 片`
+            <span style={{ color: labelColor }}>{LABELS[task.state.kind]}</span>
           )}
         </span>
       </div>
