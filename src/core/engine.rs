@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Handle;
@@ -50,6 +50,29 @@ struct TaskEntry {
     cancel: CancellationToken,
     pending_choice: Option<ChoiceKind>,
     progress: ProgressHandle,
+    /// 该任务当前还活着的 worker 数。**同一任务永远不允许两个 worker 并发**：
+    /// 「暂停 → 立刻继续」时旧 worker 可能还挂在网络请求上没退出，而 `unpause` 已经把它
+    /// 重新排进队列；此时若直接起新 worker，两者会同时写同一批 `f.part-N`（都是
+    /// `File::create` 截断写），产出一个静默损坏的文件 —— Direct 下载没有校验和，
+    /// 没有任何东西会把这个错误暴露出来。
+    workers: Arc<AtomicUsize>,
+}
+
+/// worker 生命周期守卫：退出时把该任务的 worker 计数减回去，并再 `pump` 一次。
+///
+/// 用 `Drop` 而不是在收尾处手写一次减法：收尾路径里有早退、有 `?`、也有 panic 的可能，
+/// 而计数一旦泄漏（没有减回去），这个任务就**永远不会再被启动** —— 比它要修的缺陷更糟。
+struct WorkerGuard {
+    workers: Arc<AtomicUsize>,
+    engine: Engine,
+}
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        self.workers.fetch_sub(1, Ordering::SeqCst);
+        // 因为"旧 worker 还没退干净"被挡回队列的那个任务，现在可以起来了。
+        self.engine.pump();
+    }
 }
 
 impl TaskEntry {
@@ -291,6 +314,7 @@ impl Engine {
                     cancel,
                     pending_choice: None,
                     progress,
+                    workers: Arc::new(AtomicUsize::new(0)),
                 },
             );
         }
@@ -332,9 +356,7 @@ impl Engine {
         {
             let mut tasks = self.inner.tasks.lock().unwrap();
             match tasks.get_mut(&id) {
-                Some(t) if t.state != TaskState::Canceled => {
-                    t.state = state.clone();
-                }
+                Some(t) if t.state != TaskState::Canceled => t.state = state.clone(),
                 _ => return false,
             }
         }
@@ -363,17 +385,37 @@ impl Engine {
                 let next = { self.inner.queue.lock().unwrap().pop_front() };
                 let Some(id) = next else { return };
                 match tasks.get_mut(&id) {
-                    // **只有仍处于 Queued 的才允许启动。** 取消/暂停发生在"排队期间"时，id 还留在
-                    // 队列里；没有这道闸，pump 会把它重新拉起来 —— 用户明明点了取消，任务却自己复活。
-                    Some(t) if t.state == TaskState::Queued => {
+                    // **只有仍处于 Queued、且没有 worker 在跑时才允许启动。**
+                    //
+                    // 第一道闸（取消/暂停发生在"排队期间"）：id 还留在队列里，没有它 pump 会把
+                    // 任务重新拉起来 —— 用户明明点了取消，任务却自己复活。
+                    //
+                    // 第二道闸（`workers == 0`）：暂停后**立刻**继续时，旧 worker 可能还挂在
+                    // 网络请求上没退出，而 `unpause` 已经把它重新排进队列。此时起新 worker，
+                    // 两者会并发写同一批 `f.part-N`（都是 `File::create` 截断写），互相截断，
+                    // 而 Direct 下载没有校验和，损坏不会以任何形式暴露出来。
+                    Some(t) if t.state == TaskState::Queued && t.workers.load(Ordering::SeqCst) == 0 => {
                         t.cancel = CancellationToken::new();
                         t.state = TaskState::Probing; // 与上面的判定同锁，关掉 (b) 的窗口
-                        Some((id, t.url.clone(), t.progress.clone()))
+                        t.workers.fetch_add(1, Ordering::SeqCst);
+                        Some((
+                            id,
+                            t.url.clone(),
+                            t.progress.clone(),
+                            t.cancel.clone(),
+                            t.workers.clone(),
+                        ))
+                    }
+                    // 仍是 Queued、但旧 worker 还没退干净：放回**队尾**，什么都不启动。
+                    // 旧 worker 的 `WorkerGuard::drop` 会再 pump 一次，那时才开始下载。
+                    Some(t) if t.state == TaskState::Queued => {
+                        self.inner.queue.lock().unwrap().push_back(id);
+                        return;
                     }
                     _ => None,
                 }
             };
-            let Some((id, url, progress)) = started else { continue };
+            let Some((id, url, progress, cancel, workers)) = started else { continue };
             // 状态事件在锁外发。这里**不调 set_state**：它会再次进入 pump，把这条路径变成递归。
             let _ = self
                 .inner
@@ -382,6 +424,12 @@ impl Engine {
             let engine = self.clone();
             let tx = self.inner.tx.clone();
             self.inner.rt.spawn(async move {
+                // 计数在 pump 里、与"Queued → Probing"同一个锁内已 +1；这里交给守卫在退出时 -1，
+                // 并顺带把被它挡回队列的任务重新 pump 起来。
+                let _worker = WorkerGuard {
+                    workers,
+                    engine: engine.clone(),
+                };
                 // 进度转发：每 300ms 把原子计数器快照发为事件
                 let mut ticker = tokio::time::interval(std::time::Duration::from_millis(300));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -390,7 +438,11 @@ impl Engine {
                 // tick 分支胜出时 `select!` 都会丢弃另一分支的 future —— 于是任务每 300ms 被
                 // 从头重建一次：probe 反复重跑，永远走不到终止态。实测症状：一个会在 7 秒后
                 // 失败的 404 任务会永久卡在 Downloading（20 秒都不出结果）。
-                let task = engine.run_task(id, url.clone(), progress.clone());
+                //
+                // token 在 pump 里就取好了并随 worker 一起走：**worker 必须拿"自己那一个" token**。
+                // 若像原先那样在 run_task 内部再去 entry 上读，暂停→继续换过 token 之后，旧 worker
+                // 会读到新 token（没被取消），于是它既不会停下、收尾时也无法判断自己被顶替了。
+                let task = engine.run_task(id, url.clone(), progress.clone(), cancel.clone());
                 tokio::pin!(task);
                 let result = loop {
                     tokio::select! {
@@ -421,13 +473,19 @@ impl Engine {
                         }
                     }
                     Err(e) => {
-                        // 用户主动取消：清掉断点目录。否则 manifest 还在，下次启动
-                        // scan_resume 会把已取消的任务当未完成任务复活并重新下载。
-                        if matches!(engine.state_of(id), Some(TaskState::Canceled)) {
-                            let root = engine.current_settings().download_dir;
-                            std::fs::remove_dir_all(task_dir(&root, id)).ok();
-                        } else if matches!(engine.state_of(id), Some(TaskState::Paused)) {
-                            // 暂停：保留断点与 manifest，等待用户继续
+                        // 判据是**这个 worker 自己的 token 是否被取消**，而不是"当前状态是什么"。
+                        //
+                        // token 被取消只有两种可能：用户点了取消，或者用户暂停后又继续
+                        // （`unpause`/`retry` 会换一个**新的** token）。两种都不允许在这里标记
+                        // `Failed`：暂停→立刻继续时任务已经重新排队、新 worker 正在跑，旧 worker
+                        // 按"当前状态"分派只会看到 Probing/Downloading —— 既不是 Canceled 也不是
+                        // Paused —— 于是把任务标成失败，用户双击"继续"就得到一个失败的任务。
+                        if cancel.is_cancelled() {
+                            // 只有"用户取消"才清盘；暂停、或被新 worker 接手的任务要留下断点。
+                            if matches!(engine.state_of(id), Some(TaskState::Canceled)) {
+                                let root = engine.current_settings().download_dir;
+                                std::fs::remove_dir_all(task_dir(&root, id)).ok();
+                            }
                         } else {
                             tracing::warn!("task {id} failed: {e:#}");
                             engine.set_state(id, TaskState::Failed(format!("{e:#}")));
@@ -443,6 +501,7 @@ impl Engine {
         id: TaskId,
         url: String,
         progress: ProgressHandle,
+        cancel: CancellationToken,
     ) -> anyhow::Result<()> {
         let settings = self.inner.settings.lock().unwrap().clone();
         let outcome = probe(&self.inner.client, &url).await?;
@@ -471,7 +530,7 @@ impl Engine {
                 }
                 anyhow::bail!("无法识别的网页地址；可安装 yt-dlp 或在设置中启用");
             }
-            ProbeOutcome::Hls { url } => self.run_hls(id, &url, &settings, &progress).await,
+            ProbeOutcome::Hls { url } => self.run_hls(id, &url, &settings, &progress, &cancel).await,
             ProbeOutcome::Direct {
                 url,
                 size,
@@ -512,15 +571,6 @@ impl Engine {
                 if !self.advance_state(id, TaskState::Downloading) {
                     anyhow::bail!("canceled");
                 }
-                let cancel = self
-                    .inner
-                    .tasks
-                    .lock()
-                    .unwrap()
-                    .get(&id)
-                    .expect("task entry present")
-                    .cancel
-                    .clone();
                 download_direct(
                     &self.inner.client,
                     &url,
@@ -547,6 +597,7 @@ impl Engine {
         playlist_url: &str,
         settings: &Settings,
         progress: &ProgressHandle,
+        cancel: &CancellationToken,
     ) -> anyhow::Result<()> {
         let body = {
             let resp = self
@@ -599,22 +650,13 @@ impl Engine {
         if !self.advance_state(id, TaskState::Downloading) {
             anyhow::bail!("canceled");
         }
-        let cancel = self
-            .inner
-            .tasks
-            .lock()
-            .unwrap()
-            .get(&id)
-            .expect("task entry present")
-            .cancel
-            .clone();
         let plan = download_media(
             &self.inner.client,
             &media,
             &tdir,
             settings.segment_concurrency,
             progress,
-            cancel,
+            cancel.clone(),
         )
         .await?;
         // 合并前再确认一次：下载期间用户可能取消了。过了这一关就**不要**再跑 ffmpeg ——

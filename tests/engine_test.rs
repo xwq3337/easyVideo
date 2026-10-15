@@ -444,11 +444,10 @@ async fn cancel_during_probe_ends_canceled_and_leaves_nothing() {
     wait_state(&mut rx, id, TaskState::Probing, 10).await;
     engine.cancel(id);
 
-    // **取消之后不允许再出现 `Canceled` 以外的任何状态。** 这里要看的正是"取消之后再
-    // 发生了什么"，所以不能见到下一个事件就断言（那会把 Downloading 当成正常流程）。用一个
-    // 明确长于 probe 延迟的静默窗口把事件的"有/无"区分开 —— 这是下界等待，不是"睡一会儿
+    // **取消之后不允许再有任何状态变化。** 这里要看的正是"取消之后再发生了什么"，
+    // 所以不能等到下一个事件就断言（那会把 Downloading 当成正常流程）。用一个明确
+    // 长于 probe 延迟的静默窗口把事件的"有/无"区分开 —— 这是下界等待，不是"睡一会儿
     // 希望它跑完"：probe 的延迟是 400ms，窗口是它的 4 倍。
-    //
     // （`cancel()` 自己发出的那个 `Canceled` 事件也会被这个循环收到，所以下面过滤掉它 ——
     //  这里要拦的是**取消之后又被改成别的状态**，不是取消本身。）
     let mut after_cancel: Vec<TaskState> = Vec::new();
@@ -489,6 +488,132 @@ async fn cancel_during_probe_ends_canceled_and_leaves_nothing() {
     );
     assert!(!tdir.exists(), "取消后任务目录仍在：{}", tdir.display());
     assert!(!dir.path().join("v.mp4").exists(), "被取消的任务产出了成品文件");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_then_immediate_resume_does_not_fail_the_task() {
+    // 暂停后**立刻**继续。旧 worker 此时还挂在块请求上（响应延迟 1500ms）没有退出；
+    // `unpause` 会换一个**新的** token 并重新排队，于是新 worker 起来下载同一个任务。
+    // 旧 worker 拿到 Err 后按"当前状态"分派 —— 它看到的是新 worker 设下的 Probing/
+    // Downloading，既不是 Canceled 也不是 Paused，于是把任务标记成 `Failed`。
+    // 用户双击"继续"，任务就失败了。
+    let server = MockServer::start().await;
+    let data: Vec<u8> = (0..4096u32).map(|i| (i % 241) as u8).collect();
+    Mock::given(method("GET"))
+        .and(path("/v.mp4"))
+        .and(header("range", "bytes=0-63"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "video/mp4")
+                .insert_header("content-range", "bytes 0-63/4096")
+                .set_body_bytes(data[0..64].to_vec()),
+        )
+        .mount(&server)
+        .await;
+    // 全量请求延迟返回：旧 worker 会在这上面挂住，从而与新 worker 重叠
+    Mock::given(method("GET"))
+        .and(path("/v.mp4"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "video/mp4")
+                .insert_header("content-range", "bytes 0-4095/4096")
+                .set_body_bytes(data.clone())
+                .set_delay(std::time::Duration::from_millis(1500)),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let engine = Engine::new(rt, settings_with(dir.path()), dir.path().join("data"));
+    let mut rx = engine.events();
+    let id = engine.add_url(format!("{}/v.mp4", server.uri()));
+
+    wait_state(&mut rx, id, TaskState::Downloading, 10).await;
+    engine.pause(id);
+    engine.unpause(id); // 立刻继续，不给旧 worker 退出的时间
+
+    // wait_state 见到 Failed 会 panic，正是这里要暴露的失败
+    wait_state(&mut rx, id, TaskState::Done, 60).await;
+    assert_eq!(
+        std::fs::read(dir.path().join("v.mp4")).unwrap(),
+        data,
+        "暂停→继续后成品被两个 worker 并发写坏了"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_task_never_runs_two_workers_at_once() {
+    // 「暂停 → 立刻继续」时旧 worker 还挂在网络请求上没退出，而 `unpause` 已经把它重新
+    // 排进队列。若此时就起新 worker，两者会并发写同一批 `f.part-N`（都是 `File::create`
+    // 截断写），产出一个**静默损坏**的文件 —— Direct 下载没有校验和，没有任何东西会暴露它。
+    //
+    // 判据直接取"新 worker 有没有立刻起来"：新 worker 起来的第一步就是置 `Probing`，
+    // 而旧 worker 要等 1500ms 的延迟响应回来才会退出。所以取消暂停后的 600ms 内
+    // **不应该有任何状态事件**；出现 `Probing` 就说明两个 worker 重叠了。
+    let server = MockServer::start().await;
+    let data: Vec<u8> = (0..4096u32).map(|i| (i % 233) as u8).collect();
+    Mock::given(method("GET"))
+        .and(path("/v.mp4"))
+        .and(header("range", "bytes=0-63"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "video/mp4")
+                .insert_header("content-range", "bytes 0-63/4096")
+                .set_body_bytes(data[0..64].to_vec()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v.mp4"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "video/mp4")
+                .insert_header("content-range", "bytes 0-4095/4096")
+                .set_body_bytes(data.clone())
+                .set_delay(std::time::Duration::from_millis(1500)),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let engine = Engine::new(rt, settings_with(dir.path()), dir.path().join("data"));
+    let mut rx = engine.events();
+    let id = engine.add_url(format!("{}/v.mp4", server.uri()));
+
+    wait_state(&mut rx, id, TaskState::Downloading, 10).await;
+    engine.pause(id);
+    engine.unpause(id);
+
+    let mut early: Vec<TaskState> = Vec::new();
+    let window = std::time::Instant::now() + std::time::Duration::from_millis(600);
+    while std::time::Instant::now() < window {
+        match tokio::time::timeout(
+            window.saturating_duration_since(std::time::Instant::now()),
+            rx.recv(),
+        )
+        .await
+        {
+            // `pause()` 自己发出的那个 `Paused` 事件也会被这个窗口收到，滤掉它 ——
+            // 这里要拦的是"新 worker 已经起来"，也就是 `Probing`。
+            Ok(Ok(EngineEvent::StateChanged { id: eid, state })) if eid == id => {
+                if state != TaskState::Paused {
+                    early.push(state);
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    assert!(
+        early.is_empty(),
+        "旧 worker 还没退出，新 worker 就已经起来了（看到 {early:?}）—— 两个 worker 会并发写同一个 .part 文件"
+    );
+
+    // 旧 worker 退出后新 worker 接手，任务最终必须成功
+    wait_state(&mut rx, id, TaskState::Done, 60).await;
+    assert_eq!(std::fs::read(dir.path().join("v.mp4")).unwrap(), data);
 }
 
 /// 引擎的 HLS 接线（playlist → 分片 → ffmpeg 合并 → Done → 清目录）此前**完全没有测试**，
