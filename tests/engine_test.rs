@@ -401,6 +401,96 @@ async fn cancel_queued_resumed_task_removes_its_manifest() {
     assert!(!easydownvideo::core::task::task_dir(dir.path(), id).exists());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_during_probe_ends_canceled_and_leaves_nothing() {
+    // 用户在"探测中"点删除。`probe()` 是一个网络往返，任务在这段时间里是 `Probing`；
+    // `cancel()` 已经把终态落成 `Canceled`。但 `run_task` 从 probe 返回后会**无条件**
+    // `set_state(Downloading)`，把 `Canceled` 抹掉 —— 收尾分支随后看到的不是 Canceled，
+    // 于是走了 `else`：标记 `Failed` **并且跳过清理**。任务目录与 manifest 留在盘上，
+    // 下次启动 `scan_resume` 把它复活重下。实测复现见 progress.md 的 `cancel-during-probe`。
+    //
+    // 把这个窗口从毫秒拉长到可稳定命中：probe 的响应延迟 400ms。
+    let server = MockServer::start().await;
+    let data: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    Mock::given(method("GET"))
+        .and(path("/v.mp4"))
+        .and(header("range", "bytes=0-63"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "video/mp4")
+                .insert_header("content-range", "bytes 0-63/4096")
+                .set_body_bytes(data[0..64].to_vec())
+                .set_delay(std::time::Duration::from_millis(400)),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v.mp4"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "video/mp4")
+                .insert_header("content-range", "bytes 0-4095/4096")
+                .set_body_bytes(data.clone()),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let engine = Engine::new(rt, settings_with(dir.path()), dir.path().join("data"));
+    let mut rx = engine.events();
+    let id = engine.add_url(format!("{}/v.mp4", server.uri()));
+
+    wait_state(&mut rx, id, TaskState::Probing, 10).await;
+    engine.cancel(id);
+
+    // **取消之后不允许再出现 `Canceled` 以外的任何状态。** 这里要看的正是"取消之后再
+    // 发生了什么"，所以不能见到下一个事件就断言（那会把 Downloading 当成正常流程）。用一个
+    // 明确长于 probe 延迟的静默窗口把事件的"有/无"区分开 —— 这是下界等待，不是"睡一会儿
+    // 希望它跑完"：probe 的延迟是 400ms，窗口是它的 4 倍。
+    //
+    // （`cancel()` 自己发出的那个 `Canceled` 事件也会被这个循环收到，所以下面过滤掉它 ——
+    //  这里要拦的是**取消之后又被改成别的状态**，不是取消本身。）
+    let mut after_cancel: Vec<TaskState> = Vec::new();
+    let quiet_until = std::time::Instant::now() + std::time::Duration::from_millis(1600);
+    while std::time::Instant::now() < quiet_until {
+        match tokio::time::timeout(
+            quiet_until.saturating_duration_since(std::time::Instant::now()),
+            rx.recv(),
+        )
+        .await
+        {
+            Ok(Ok(EngineEvent::StateChanged { id: eid, state })) if eid == id => {
+                if state != TaskState::Canceled {
+                    after_cancel.push(state);
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+
+    let snap = engine
+        .list_tasks()
+        .into_iter()
+        .find(|t| t.id == id)
+        .expect("任务应仍在列表中");
+    let tdir = easydownvideo::core::task::task_dir(dir.path(), id);
+
+    assert!(
+        after_cancel.is_empty(),
+        "取消之后任务状态又被改了 {after_cancel:?} —— 用户的取消被覆盖了（终态 {:?}）",
+        snap.state
+    );
+    assert_eq!(snap.state, TaskState::Canceled, "终态不是 Canceled");
+    assert!(
+        easydownvideo::core::task::scan_resume(dir.path()).is_empty(),
+        "取消后仍残留可恢复的 manifest，重启会把已取消任务复活"
+    );
+    assert!(!tdir.exists(), "取消后任务目录仍在：{}", tdir.display());
+    assert!(!dir.path().join("v.mp4").exists(), "被取消的任务产出了成品文件");
+}
+
 /// 引擎的 HLS 接线（playlist → 分片 → ffmpeg 合并 → Done → 清目录）此前**完全没有测试**，
 /// 只做到"能编译"。假 `.ts` 字节不行：ffmpeg 的 concat 解复用器会拒绝非法 TS，合并直接失败。
 /// 所以用 `tests/fixtures/seg.ts` —— 一个真实的小分片（160x120 h264，1 秒，约 10KB）。

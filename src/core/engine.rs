@@ -314,6 +314,35 @@ impl Engine {
         self.pump();
     }
 
+    /// worker 的**进度**状态推进（Probing → Downloading → Merging 之类），与 `set_state`
+    /// 的唯一区别、也是它存在的唯一理由：**当前状态已经是 `Canceled` 时拒绝生效**，
+    /// 返回 `false` 表示这次推进被拒绝，调用方必须立刻收手（`bail!("canceled")`）。
+    ///
+    /// 为什么必须有这道闸：`run_task` 要等 `probe().await` 这个网络往返结束之后才会写
+    /// manifest 并置 `Downloading`，而用户完全可以在探测期间点删除 —— `cancel()` 那时已经
+    /// 把终态落成 `Canceled`（它看到 `Probing` 就认为有 worker 在跑，因此**不会**自己删目录，
+    /// 这是对的，worker 可能正在写盘）。若无条件覆盖，`Canceled` 就被抹成 `Downloading`：
+    /// worker 的收尾分支随后看到的不是 `Canceled`，于是走 `else` —— 标记 `Failed` **并且
+    /// 跳过清理**，任务目录与 manifest 留在盘上，下次启动 `scan_resume` 把它复活重下。
+    /// 这正是"取消是不要了"那条全局约束明令禁止的事，且是实测复现过的（见 progress.md
+    /// 的 `cancel-during-probe` 场景与 `cancel_during_probe_ends_canceled_and_leaves_nothing`）。
+    ///
+    /// 判定与写入在**同一个锁**里完成：拆成"先查后写"两步，中间仍然留着同一个窗口。
+    fn advance_state(&self, id: TaskId, state: TaskState) -> bool {
+        {
+            let mut tasks = self.inner.tasks.lock().unwrap();
+            match tasks.get_mut(&id) {
+                Some(t) if t.state != TaskState::Canceled => {
+                    t.state = state.clone();
+                }
+                _ => return false,
+            }
+        }
+        let _ = self.inner.tx.send(EngineEvent::StateChanged { id, state });
+        self.pump();
+        true
+    }
+
     fn pump(&self) {
         let settings = self.inner.settings.lock().unwrap().clone();
         loop {
@@ -425,7 +454,10 @@ impl Engine {
                         if formats.is_empty() {
                             anyhow::bail!("yt-dlp 未找到可下载格式");
                         }
-                        self.set_state(id, TaskState::AwaitingChoice);
+                        // 用户可能在 probe 期间已经取消：先确认状态还能推进，再动 pending_choice。
+                        if !self.advance_state(id, TaskState::AwaitingChoice) {
+                            anyhow::bail!("canceled");
+                        }
                         let kind = {
                             let mut tasks = self.inner.tasks.lock().unwrap();
                             let t = tasks.get_mut(&id).expect("task entry present");
@@ -474,7 +506,12 @@ impl Engine {
                     kind: ManifestKind::Direct { size },
                 };
                 let _ = write_manifest(&tdir, &manifest);
-                self.set_state(id, TaskState::Downloading);
+                // 用户在探测期间可能已经点了删除。`advance_state` 会拒绝覆盖 `Canceled`
+                // 并返回 false —— 此时立刻收手：收尾分支看到 Canceled，会把刚建出来的
+                // 任务目录连同 manifest 一起清掉。
+                if !self.advance_state(id, TaskState::Downloading) {
+                    anyhow::bail!("canceled");
+                }
                 let cancel = self
                     .inner
                     .tasks
@@ -524,7 +561,10 @@ impl Engine {
         let parsed = parse_playlist(playlist_url, &body)?;
         let media = match parsed {
             ParsedPlaylist::Master { variants } => {
-                self.set_state(id, TaskState::AwaitingChoice);
+                // 同理：拉播放列表期间用户可能已经取消，先确认状态还能推进。
+                if !self.advance_state(id, TaskState::AwaitingChoice) {
+                    anyhow::bail!("canceled");
+                }
                 let kind = {
                     let mut tasks = self.inner.tasks.lock().unwrap();
                     let t = tasks.get_mut(&id).expect("task entry present");
@@ -556,7 +596,9 @@ impl Engine {
                 },
             },
         );
-        self.set_state(id, TaskState::Downloading);
+        if !self.advance_state(id, TaskState::Downloading) {
+            anyhow::bail!("canceled");
+        }
         let cancel = self
             .inner
             .tasks
@@ -575,7 +617,11 @@ impl Engine {
             cancel,
         )
         .await?;
-        self.set_state(id, TaskState::Merging);
+        // 合并前再确认一次：下载期间用户可能取消了。过了这一关就**不要**再跑 ffmpeg ——
+        // 否则会为一个已取消的任务产出 mp4，而收尾分支随后会把整个任务目录删掉。
+        if !self.advance_state(id, TaskState::Merging) {
+            anyhow::bail!("canceled");
+        }
         let ffmpeg = match &settings.ffmpeg_path_override {
             Some(p) => p.clone(),
             None => ensure_ffmpeg(&self.inner.data_dir)?,
