@@ -10,7 +10,14 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 const SEGMENT_CONCURRENCY = { min: 1, max: 16 } as const;
 const MAX_ACTIVE_TASKS = { min: 1, max: 8 } as const;
 
-/** 与 core 的接受范围一致。见原 SettingsDialog 的注释：`<input type="number">` 挡不住任何东西。 */
+/**
+ * 把输入框的原始字符串夹进 [lo, hi]，与 core 的接受范围一致。
+ *
+ * `<input type="number" min max>` 挡不住任何东西 —— 程序化设值、粘贴、科学计数法都能
+ * 绕过去，而 `save()` 是直接把 draft 发给 core 的。不夹的话 `99999` 会落在 serde 的
+ * 原始英文报错上，`-5` / `1e30` 同理，那些英文会原样变成 toast 文案。
+ * 非法/空值退回 fallback（等价于 egui 滑块拖不动的那一格）。
+ */
 function clampInt(raw: string, lo: number, hi: number, fallback: number): number {
   const n = Number(raw);
   if (!Number.isFinite(n)) return fallback;
@@ -34,6 +41,8 @@ export default function SettingsPage() {
 
   async function save() {
     if (!draft) return;
+    // 提交前再夹一次：onChange 已夹过，但"onChange 一定跑过"这件事不该由 save 来假设
+    // （draft 若被别的路径设成越界值，这里就是唯一还站着的闸）。
     const toSave = {
       ...draft,
       segmentConcurrency: clampInt(
@@ -56,18 +65,29 @@ export default function SettingsPage() {
       return;
     }
     setError(null);
+    // setThemeMode 做两件事：上色 + 把"跟随系统"的订阅重新绑到新模式上。
+    // 它是同步的（内部只写 localStorage、加/退一个 matchMedia 监听）；
+    // 万一它抛（webview 禁用存储之类），设置其实已经落盘成功，不该反过来报"保存失败"，
+    // 所以单独兜一下 —— save() 是 `void save()` 调起来的，漏出去的异常没人接。
     try {
       setThemeMode(theme);
     } catch {
       /* 主题没写进去不影响设置本身 */
     }
+    // 写盘成功后把 store 的 settings 拉回来：core 是唯一真相源，
+    // 而且 downloadDir 在 core 那边是 PathBuf（回传时要经过 to_string_lossy），
+    // 界面照着 draft 自己拼一份未必与 core 存下来的完全一致。
+    // 走 run()：拉取失败给一条 toast，不要让它在后台无声失败。
     await run(loadSettings());
   }
 
   if (!draft) return null;
 
+  // **不要再加 px-6。** App 的滚动容器已经提供了左右内边距（见 App.tsx 里
+  // "左右内边距放在滚动容器上"那段），这里再加一层，设置页的内容就会比其它页
+  // 多缩进 24px —— 切过去时整块右移，还跟自己的页面标题对不齐。
   return (
-    <div className="max-w-[520px] px-6 pb-8">
+    <div className="max-w-[520px] pb-8">
       <label className="block mb-5">
         <span style={{ color: "var(--fg-muted)" }}>保存位置</span>
         <div className="flex gap-2 mt-1.5">
