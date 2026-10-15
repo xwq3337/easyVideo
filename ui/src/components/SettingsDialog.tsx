@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import type { SettingsDto } from "../lib/types";
 import * as ipc from "../lib/ipc";
 import { loadSettings, run, useSettings } from "../store/store";
-import { applyTheme, readThemeMode, type ThemeMode } from "../lib/theme";
+import { readThemeMode, setThemeMode, type ThemeMode } from "../lib/theme";
 
 interface Props {
   open: boolean;
@@ -11,7 +11,7 @@ interface Props {
 
 /**
  * 设置对话框。**只有点"保存"才写盘** —— 控件变化一律只落在本地 `draft` 上，
- * 不碰 core。（egui 版每帧落盘的教训。）"取消"（以及点遮罩）直接丢弃 draft。
+ * 不碰 core。（egui 版每帧落盘的教训。）"取消"、Esc、点遮罩都直接丢弃 draft。
  */
 export default function SettingsDialog({ open, onClose }: Props) {
   const current = useSettings();
@@ -24,6 +24,17 @@ export default function SettingsDialog({ open, onClose }: Props) {
   useEffect(() => {
     if (open && current) setDraft({ ...current });
   }, [open, current]);
+
+  // Esc 关闭。挂 window 而不是挂在遮罩上：遮罩要能收键盘事件得先有焦点，
+  // 而这里没有任何元素被自动聚焦过。（Esc 与点遮罩同义：不写盘，丢弃 draft。）
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
 
   if (!open || !draft) return null;
   const d = draft;
@@ -42,11 +53,12 @@ export default function SettingsDialog({ open, onClose }: Props) {
       return;
     }
     setError(null);
-    // applyTheme 只写 localStorage，是同步的；万一它抛（webview 禁用存储之类），
-    // 设置其实已经落盘成功，不该反过来报"保存失败"，所以单独兜一下 ——
-    // save() 是 `void save()` 调起来的，漏出去的异常没人接。
+    // setThemeMode 做两件事：上色 + 把"跟随系统"的订阅重新绑到新模式上。
+    // 它是同步的（内部只写 localStorage、加/退一个 matchMedia 监听）；
+    // 万一它抛（webview 禁用存储之类），设置其实已经落盘成功，不该反过来报"保存失败"，
+    // 所以单独兜一下 —— save() 是 `void save()` 调起来的，漏出去的异常没人接。
     try {
-      applyTheme(theme);
+      setThemeMode(theme);
     } catch {
       /* 主题没写进去不影响设置本身 */
     }

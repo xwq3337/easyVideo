@@ -6,20 +6,18 @@ import StatusBar from "./components/StatusBar";
 import Toasts from "./components/Toasts";
 import * as ipc from "./lib/ipc";
 import { startBridge, hydrate, loadSettings, run } from "./store/store";
-import { applyTheme, readThemeMode, watchSystemTheme } from "./lib/theme";
+import { readThemeMode, setThemeMode } from "./lib/theme";
 
 export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   useEffect(() => {
-    const mode = readThemeMode();
-    applyTheme(mode);
     // brief 的 Step 10 只调了 applyTheme 一次；可 Step 11 第 5 条要求"把系统切到深色、窗口立刻变深"，
-    // 那就得订阅 prefers-color-scheme。brief 自己给了 watchSystemTheme，正是干这个的，接上去（见报告）。
-    const stopWatching = watchSystemTheme(mode, () => applyTheme(mode));
+    // 那就得订阅 prefers-color-scheme。setThemeMode 把"上色 + 订阅"绑成一件事，
+    // 设置对话框改外观时也走它 —— 否则从"强制浅色"切到"跟随系统"会只上色、不订阅（见报告）。
+    setThemeMode(readThemeMode());
     void startBridge();
     void loadSettings();
-    return stopWatching;
   }, []);
 
   async function addUrl(url: string) {
