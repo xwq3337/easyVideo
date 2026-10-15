@@ -881,6 +881,14 @@ Expected: 绿。若报找不到模块，说明 `vite.config.ts` 与 `tsconfig.js
   --primary-foreground: 0 0% 100%;
   --radius: 0.375rem;
 
+  /* 强调色的**唯一来源**。组件一律引用它，**不许再写死 hex** ——
+     写死的话深色模式就拿不到下面那支，等于"深色强调色"成了死代码。
+     （这正是不写死的原因，也是 spec 那句"不允许仓库内并存两套颜色变量"的落点。） */
+  --accent-blue: #0071e3;
+  /* 焦点环用单独一支：Tailwind 对「任意值变量 + 透明度修饰符」的支持不稳，
+     与其赌它能不能编译，不如把带 alpha 的值也做成变量。 */
+  --accent-blue-ring: rgba(0, 113, 227, .2);
+
   /* 导航项的选中/悬停底色。**必须做成变量**：写死 rgba(0,0,0,.06) 的话，
      深色模式下就是黑底叠黑，选中项直接看不见。深色要用白色透明叠。 */
   --nav-sel: rgba(0, 0, 0, .06);
@@ -894,6 +902,9 @@ Expected: 绿。若报找不到模块，说明 `vite.config.ts` 与 `tsconfig.js
   --input: 240 3% 26%;
   --primary: 209 100% 58%;           /* #2997ff */
   --primary-foreground: 0 0% 0%;
+
+  --accent-blue: #2997ff;
+  --accent-blue-ring: rgba(41, 151, 255, .25);
 
   --nav-sel: rgba(255, 255, 255, .08);
   --nav-hover: rgba(255, 255, 255, .04);
@@ -921,7 +932,10 @@ const buttonVariants = cva(
     variants: {
       variant: {
         primary:
-          "bg-[#0071e3] text-white hover:bg-[#0077ed] active:bg-[#006edb] rounded-full",
+          // 强调色走变量，**不写死 hex**。写死的话深色模式会一直用浅色那支，
+          // spec §5.1 定的深色强调色就成了死代码。
+          // hover/active 用亮度滤镜而不是另外两个 hex：变量是唯一来源，滤镜天然跟着主题走。
+          "bg-[var(--accent-blue)] text-white hover:brightness-110 active:brightness-95 rounded-full",
         secondary:
           "border border-[var(--line-strong)] text-[var(--fg)] hover:bg-[var(--bg-subtle)] rounded-md",
         ghost:
@@ -962,7 +976,7 @@ export function Input({ className, ...props }: React.InputHTMLAttributes<HTMLInp
         "w-full min-w-0 rounded-lg border px-3 py-1.5 text-[13px] outline-none",
         "bg-[var(--bg-inset)] border-[var(--line-strong)] text-[var(--fg)]",
         "placeholder:text-[var(--fg-faint)]",
-        "focus:border-[#0071e3] focus:ring-2 focus:ring-[#0071e3]/20",
+        "focus:border-[var(--accent-blue)] focus:ring-2 focus:ring-[var(--accent-blue-ring)]",
         className
       )}
       {...props}
@@ -1611,11 +1625,7 @@ git commit -m "feat(ui): 设置改为整页,删掉 SettingsDialog
   --fill: #1d1d1f;
 ```
 
-再在同一个块里**新增**一行：
-
-```css
-  --accent-blue: #0071e3;
-```
+`--accent-blue` / `--accent-blue-ring` **不在这里新增** —— Task 5 已经加了它们（shadcn 的 `button`/`input` 从那时起就引用它们）。这里只要确认它们还在、没被这一轮改动的变量挤掉。
 
 深色（`[data-theme="dark"]` 那块）同理，逐个改：
 
@@ -1630,11 +1640,7 @@ git commit -m "feat(ui): 设置改为整页,删掉 SettingsDialog
   --fill: #f5f5f7;
 ```
 
-并新增：
-
-```css
-  --accent-blue: #2997ff;
-```
+同样，深色那支 `--accent-blue: #2997ff` / `--accent-blue-ring` 也**已经由 Task 5 加好**，这里不重复新增。
 
 `--bg`（浅色 `#ffffff`）、`--bg-inset`、`--track`、`--accent-ok`、`--accent-warn`、`--accent-err`、`--btn-fg` **不动**。
 
