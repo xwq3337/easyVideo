@@ -21,9 +21,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 url = "2"
 sha2 = "0.10"
-eframe = "0.30"
-rfd = "0.15"
-arboard = "3"
 
 [dev-dependencies]
 wiremock = "0.6"
