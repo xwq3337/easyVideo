@@ -1088,9 +1088,15 @@ export default function Sidebar({
 }) {
   return (
     <nav
-      // 拖拽区挂在整个侧边栏上：顶部那 52px 是留给红绿灯的空白，
-      // 用户在窗口左上角按下拖动时，抓到的就是这里。
-      data-tauri-drag-region
+      // **必须是 `"deep"`，不能是裸属性。** Tauri 2.12.4 注入的 `drag.js` 里：
+      //   :64  `attr === 'deep'`            → true（子树内任意位置都算）
+      //   :66  `attr === '' || 'true'`      → `el === composedPath[0]`（**仅自身**）
+      // 而 nav 的每一个像素都被子元素盖住（spacer、导航项容器、flex-1、footer），
+      // 它永远不可能是 mousedown 的目标 —— 裸属性写在这里纯粹是装饰，
+      // 侧边栏的空白区和底部的 `StatusBar` 都拖不动窗口。
+      //
+      // 导航项不受影响：drag.js:58 规定"可点击元素且自身没有该属性"直接返回 false。
+      data-tauri-drag-region="deep"
       className="w-[200px] shrink-0 flex flex-col select-none"
       style={{
         background: "var(--bg-subtle)",
@@ -1191,7 +1197,8 @@ export default function DownloadPage({ onAdd }: { onAdd: (url: string) => Promis
 
   return (
     <>
-      <div className="flex items-center gap-2 px-6 py-4">
+      {/* 左右内边距由 App 的滚动容器提供，这里只留纵向的 */}
+      <div className="flex items-center gap-2 py-4">
         <Input
           value={url}
           onChange={(e) => setUrl(e.target.value)}
@@ -1209,9 +1216,7 @@ export default function DownloadPage({ onAdd }: { onAdd: (url: string) => Promis
           下载
         </Button>
       </div>
-      <div className="px-6">
-        <TaskList />
-      </div>
+      <TaskList />
     </>
   );
 }
@@ -1301,7 +1306,9 @@ export default function App() {
       <main className="flex-1 min-w-0 flex flex-col">
         {/* 非 macOS 的自绘窗口键挂在这里；macOS 上 WindowControls 按设计不渲染 */}
         <header
-          data-tauri-drag-region
+          // 同样必须 `"deep"`：裸属性只让 header 自身的留白可拖，
+          // 标题文字 `<h1>` 盖住的那部分拖不动。按钮仍然可点（drag.js:58）。
+          data-tauri-drag-region="deep"
           className="flex items-center justify-between px-6 pt-5 pb-3 select-none"
         >
           <h1 className="text-[22px] font-semibold" style={{ letterSpacing: "-0.01em" }}>
@@ -1310,7 +1317,11 @@ export default function App() {
           <WindowControls />
         </header>
 
-        <div className="flex-1 overflow-y-auto">
+        {/* 左右内边距放在**滚动容器**上，不要塞进 DownloadPage 内部的包里。
+            TaskList 的空状态靠 `h-full flex items-center justify-center` 做垂直居中，
+            而百分比高度需要一个**确定高度**的父级；中间多包一层 auto 高的 div，
+            h-full 就退化成 auto，那句"粘贴一个视频链接"会贴着输入行而不是居中。 */}
+        <div className="flex-1 overflow-y-auto px-6">
           {page === "download" && <DownloadPage onAdd={addUrl} />}
           {page === "videoOps" && <VideoOpsPage />}
           {page === "settings" && <SettingsPage />}

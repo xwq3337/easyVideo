@@ -82,7 +82,7 @@ StatusBar(总速度 / 版本)               ← 通栏
 
 **侧边栏**（宽 200px，`--bg-subtle` 底 + 右侧发丝线）
 
-- 顶部留 52px 给红绿灯，整块作为 `data-tauri-drag-region`（macOS 使用 `titleBarStyle: Overlay`，红绿灯由系统绘制）
+- 顶部留 52px 给红绿灯，整块作为拖拽区（macOS 使用 `titleBarStyle: Overlay`，红绿灯由系统绘制）。**必须写 `data-tauri-drag-region="deep"`，不能写裸属性** —— Tauri 注入的 `drag.js` 把裸属性/`"true"` 解析成「仅自身」，而侧边栏的每个像素都被子元素盖住，裸属性永远不会命中，等于装饰。`"deep"` 才是子树语义；可点击元素不受影响。
 - 三个导航项：lucide 图标 + 文字，行高 32px、圆角 6px
 - **选中态用浅灰底 `rgba(0,0,0,.06)` + 文字转深，不使用品牌色填充**——Apple 自家的侧边栏（系统设置、访达）即如此，彩色填充会立刻显得不像苹果
 - 底部放 `StatusBar` 的**总速度 + 版本号**，与导航之间一条发丝线分隔。这两个是全局信息，放侧边栏底部可省掉一条通栏
