@@ -92,6 +92,48 @@ async fn resumes_completed_parts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rerun_does_not_accumulate_byte_progress() {
+    // 与 HLS 同源：ProgressHandle 跨单次运行存活（retry/unpause/resume 会再次调用
+    // download_direct）。第二次运行时块已在盘上/已合并，若不把本轮计数归零，就会把上一次
+    // 的运行结果再加一遍——Direct 路径上就是 `1.4 GB / 2.0 GB` 那种超过总数的读数。
+    let data: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/f.bin")).and(header("range", "bytes=0-511"))
+        .respond_with(ResponseTemplate::new(206)
+            .insert_header("content-range", "bytes 0-511/1024")
+            .set_body_bytes(data[0..512].to_vec()))
+        .mount(&server).await;
+    Mock::given(method("GET")).and(path("/f.bin")).and(header("range", "bytes=512-1023"))
+        .respond_with(ResponseTemplate::new(206)
+            .insert_header("content-range", "bytes 512-1023/1024")
+            .set_body_bytes(data[512..].to_vec()))
+        .mount(&server).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let final_path = dir.path().join("f.bin");
+    let progress = ProgressHandle::new();
+    let url = format!("{}/f.bin", server.uri());
+
+    download_direct(
+        &reqwest::Client::new(), &url, &final_path, dir.path(),
+        Some(1024), true, 2, 512, &progress, CancellationToken::new(),
+    ).await.unwrap();
+    assert_eq!(progress.snapshot(), (1024, 1024), "第一次运行结束后 downloaded 必须等于 total");
+    assert_eq!(std::fs::read(&final_path).unwrap(), data);
+
+    // 第二次运行：同一任务目录、同一 handle
+    download_direct(
+        &reqwest::Client::new(), &url, &final_path, dir.path(),
+        Some(1024), true, 2, 512, &progress, CancellationToken::new(),
+    ).await.unwrap();
+    assert_eq!(
+        progress.snapshot(),
+        (1024, 1024),
+        "重跑后 downloaded 不能累加超过 total（这正是 1.4/2.0 GB 的成因）"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_stops_download() {
     let server = MockServer::start().await;
     Mock::given(method("GET")).and(path("/slow.bin"))

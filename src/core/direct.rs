@@ -76,6 +76,11 @@ pub async fn download_direct(
         (Some(total), true) if total > 0 => plan_blocks(total, concurrency, min_block),
         _ => vec![(0, u64::MAX)], // 单流
     };
+    // ProgressHandle 挂在 TaskEntry 上，**跨单次运行存活**：失败后的 retry、暂停后的
+    // unpause、重启后的 resume 都会再次进入本函数，而上一轮已计入的字节仍留在 handle 里。
+    // 本轮从零开始，否则重跑会把新一轮的计数叠加上去，downloaded 超过 total
+    // （用户看到 1.4 GB / 2.0 GB）。
+    progress.reset();
     if let Some(total) = size {
         progress.set_total(total);
     }

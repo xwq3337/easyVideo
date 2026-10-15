@@ -46,6 +46,11 @@ pub async fn download_media(
     // HLS 进度按"已下分片数/总分片数"计数，GUI 用 ProgressUnit 决定展示格式
     progress.set_unit(crate::core::events::ProgressUnit::Segments);
     progress.set_total(media.segments.len() as u64);
+    // ProgressHandle 挂在 TaskEntry 上，**跨单次运行存活**：失败后的 retry、暂停后的
+    // unpause、重启后的 resume 都会再次进入本函数，而上一轮的计数仍留在 handle 里。
+    // 本轮从零开始，否则重跑时那些"已在盘上、被续传跳过"的分片会再次计入，
+    // 叠加上一次的运行结果，读数超过总数（用户看到 49 / 36 片）。
+    progress.reset();
 
     let ext = if media.is_fmp4 { "m4s" } else { "ts" };
     let keys = Arc::new(Mutex::new(HashMap::new()));

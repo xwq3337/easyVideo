@@ -108,6 +108,68 @@ async fn resumes_existing_segments() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rerun_does_not_accumulate_segment_progress() {
+    // ProgressHandle 挂在 TaskEntry 上，**跨单次运行存活**：失败后的 retry、暂停后的
+    // unpause、重启后的 resume 都会再次调用 download_media。第二次运行时所有分片都已在盘上，
+    // 全部走"续传"分支（`progress.add(1)`）。若本轮开始时不把计数归零，这一次的续传计数
+    // 就会叠加在上一次之上——用户看到 `49 / 36 片` 这种超过总数的读数。
+    let server = MockServer::start().await;
+    let s0 = vec![7u8; 100];
+    let s1 = vec![8u8; 200];
+    Mock::given(method("GET"))
+        .and(path("/seg0.ts"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(s0.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/seg1.ts"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(s1.clone()))
+        .mount(&server)
+        .await;
+
+    let media = media_no_crypto(&[
+        format!("{}/seg0.ts", server.uri()),
+        format!("{}/seg1.ts", server.uri()),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let progress = ProgressHandle::new();
+
+    // 第一次运行：两个分片都真正下载
+    download_media(
+        &reqwest::Client::new(),
+        &media,
+        dir.path(),
+        2,
+        &progress,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        progress.snapshot(),
+        (2, 2),
+        "第一次运行结束后计数必须等于总数"
+    );
+
+    // 第二次运行：两个分片都已在盘上，全部走续传分支
+    download_media(
+        &reqwest::Client::new(),
+        &media,
+        dir.path(),
+        2,
+        &progress,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        progress.snapshot(),
+        (2, 2),
+        "重跑后计数不能累加变成两倍总数（这正是 49/36 的成因）"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retries_failed_segment() {
     let server = MockServer::start().await;
     let s0 = vec![7u8; 100];
