@@ -198,18 +198,57 @@ lucide，`stroke-width: 1.75`（默认 2 偏粗像描边图标，1.5 偏细发�
 pub fn remove_task(&self, id: TaskId) -> bool
 ```
 
-必须做满四件事：
+必须做满三件事：
 
-1. **只接受终态**（`Done` / `Failed` / `Canceled`）。其余状态返回 `false`。「移除一个正在下载的任务」语义含糊（盘上 `.part` 分片删不删？），不该让它存在。
-2. **删除任务目录** `actual_task_dir(id)`。**对 `Failed` 是必需的**——见下方说明；对 `Done` / `Canceled` 该目录本已为空，删了无害。
-3. **`release_reserved_path(id)`**。理由与本条直觉相反，值得写清楚：`WorkerGuard::drop`（`engine.rs:80-88`）**本来就会**无条件释放占位。但 `cancel()` 让状态**立刻**变成 `Canceled`，而 worker 可能还挂在网络请求上没退出。此时移除会先删掉条目，worker 随后退出的那次释放便在 `get_mut(&id)` 上落空——占位反而**因为这个**才泄漏。所以释放必须由 `remove_task` 自己**在移除条目之前**完成。
-4. 从 `inner.tasks` 移除，并广播新事件 `EngineEvent::TaskRemoved { id }`。
+1. **只接受「终态 且 没有 worker 在跑」**——即 `is_terminal(state) && workers == 0`。其余返回 `false`。缺少 `workers == 0` 这一半会打开两条危险路径，见 §7.1。
+2. **删除任务目录** `actual_task_dir(id)`。**对 `Failed` 是必需的**——见 §7.2；对 `Done` / `Canceled` 该目录本已为空，删了无害。
+3. 从 `inner.tasks` 移除，并广播新事件 `EngineEvent::TaskRemoved { id }`。
 
-### 7.1 「重启也不回来」的约束来源
+判定与移除必须在**同一个 `tasks` 锁**内完成：`retry()` 会把 `Failed` 挪回 `Queued`，先查后删之间留个窗口的话，用户刚重试的任务会被无声抹掉。
+
+`actual_task_dir` 要在条目消失**之前**取——它读的是条目上的 `dir` 记录，用户可能中途改过保存位置。
+
+### 7.1 准入条件里为什么必须有 `workers == 0`
+
+原本只写「终态」是不够的。这是一个**审查阶段才发现**的缺口，写清楚以免被后来的人当作冗余"简化"掉。
+
+`cancel()` 是**立刻**把状态置成 `Canceled` 的，而 worker 可能还活着——`probe()` 不接受取消令牌，worker 只能等那个网络往返自己跑完。于是「取消 → 立刻移除」会删掉一个仍然活着的 worker 脚下的条目：
+
+- **panic**：worker 回来走到 `paths()`，那里是 `.expect("task entry present")`（四处：`engine.rs` 613 / 712 / 800 / 820）——条目没了就 panic。这四处 `expect` 本来就是按「有 worker ⟹ 条目还在」写的，新 API 把这个前提破坏了。
+- **复活**：若移除恰好落在 `paths()` 与 `write_manifest` 之间，`write_manifest` 会把目录重新建出来；而 worker 随后的错误收尾判据是 `state_of(id) == Some(Canceled)`——条目已没了，判据为假，**没有任何人再删这个目录**。结果：被「移除」的任务留下 manifest，重启时 `scan_resume` 把它复活。
+
+第二条正是本设计要消灭的那件事，被新 API 从另一条路重新打开了。
+
+`workers == 0` 这道闸把两条路一起关掉：只要还有 worker 活着，条目就不可能被删，四处 `expect` 因此重新变得安全。判定与移除同锁，且终态任务不会被 `pump()` 启动（`pump` 只启动 `Queued`），所以过了这道闸就真的不会有新 worker 冒出来。
+
+**代价**：取消一个正卡在网络上的任务后立刻点「移除」，会得到一次失败提示，需要等 worker 退出后重试。这个窗口通常毫秒级，探测请求慢时可能到秒级。这个取舍是划算的——**一个会说"稍后再试"的按钮，好过一个会 panic 或悄悄复活任务的按钮。**
+
+### 7.2 「重启也不回来」的约束来源
 
 `src/core/engine.rs:572-575`：任务失败时**只置 `Failed`，不清任务目录**（这是刻意的，为了下次可续传）。因此 `Failed` 任务的 `manifest.json` 仍留在盘上。一个只删内存条目的 `remove_task`，重启后会被 `scan_resume` 捞回来并 `resume()` 回列表——**「重启也不回来」对失败任务不成立**。所以删除目录是必需动作，不是可选清理。
 
-### 7.2 配套改动
+### 7.3 `WorkerGuard::drop` 的顺序要调整
+
+```rust
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        // 先释放占用，**再**减计数。
+        self.engine.release_reserved_path(self.id);
+        self.workers.fetch_sub(1, Ordering::SeqCst);
+        self.engine.pump();
+    }
+}
+```
+
+原顺序是「减计数 → 释放占用 → `pump`」。把释放提到减计数之前，是为了建立一条不变量：
+
+> **`workers == 0` ⟹ 这个 worker 的 `reserved_path` 占位已经释放干净。**
+
+有了它，`remove_task` 就不必自己管占位——它读到 `workers == 0` 时释放必然已完成。若保持原顺序，会留下一个"减了计数但还没释放"的窗口，`remove_task` 就必须在自己的临界区里额外处理它，而那个窗口窄到写不出确定性测试。
+
+影响面是闭合的：`release_reserved_path` 全文只有 `WorkerGuard::drop` 这一个调用点，`workers` 也只有 `drop` 一处减、`pump()` 一处增。原注释要求的「释放必须在 `pump()` 之前」仍然满足。
+
+### 7.4 配套改动
 
 - `src-tauri/src/main.rs` 注册命令 `remove_task`
 - `ui/src/lib/ipc.ts` 增加 `removeTask`
@@ -226,8 +265,8 @@ UI 层仍会把非终态按钮渲染成「取消」而非「移除」，所以�
 ### Rust（`cargo test`）—— 新增 3 条
 
 1. `remove_terminal_task_but_reject_active`——终态可移除，`Queued` / `Downloading` 被拒。
-2. **`removed_failed_task_is_not_resurrected_by_scan_resume`**——最有价值的一条。造一个失败任务（有 manifest 落盘）→ 移除 → 断言 `scan_resume` 扫不到它。这是防「重启又回来」的回归测试，**没有它第 7.1 节那个坑随时会被改回去**。
-3. `remove_releases_reserved_path_while_the_worker_is_still_exiting`——钉住第 7 节第 3 条那个窄窗口：先 `cancel()` 让状态立刻变 `Canceled`，在 worker 仍被延迟响应卡住时移除，随后下同名文件应得到原名。**注意不能写成"移除后再等 worker 退出"**——那样 `WorkerGuard` 已经把占位释放干净，测试会变成空跑。
+2. **`removed_failed_task_is_not_resurrected_by_scan_resume`**——最有价值的一条。造一个失败任务（有 manifest 落盘）→ 移除 → 断言 `scan_resume` 扫不到它。这是防「重启又回来」的回归测试，**没有它 §7.2 那个坑随时会被改回去**。
+3. **`remove_is_rejected_while_a_worker_is_still_alive`**——钉住 §7.1 的准入闸。让一个任务卡在延迟响应上（`Downloading`），`cancel()` 之后状态立刻是 `Canceled` 而 worker 还活着：此时移除应返回 `false`；等 worker 退出后再移除应返回 `true`，且盘上不留 manifest。**这条直接对着「取消后立刻点移除」那个手势**——它是 §7.1 里两条危险交错（`paths()` 的 panic、`write_manifest` 的复活）的唯一入口。
 
 ### 前端（`npm --prefix ui test`）—— 新增 2 条
 
