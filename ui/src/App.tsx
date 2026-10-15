@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import Toolbar from "./components/Toolbar";
 import TaskList from "./components/TaskList";
 import SettingsDialog from "./components/SettingsDialog";
+import ChoiceDialog from "./components/ChoiceDialog";
 import StatusBar from "./components/StatusBar";
 import Toasts from "./components/Toasts";
 import * as ipc from "./lib/ipc";
@@ -34,6 +35,7 @@ export default function App() {
       <main className="flex-1 overflow-y-auto">
         <TaskList />
       </main>
+      <ChoiceDialog />
       <StatusBar version="v0.1.0" />
       <Toasts />
       <SettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} />
