@@ -234,17 +234,35 @@ async fn removed_failed_task_is_not_resurrected_by_scan_resume() {
 }
 ```
 
-- [ ] **Step 8: 运行确认它失败**
+- [ ] **Step 8: 运行它，应当直接通过**
 
 Run: `cargo test --test engine_test removed_failed_task_is_not_resurrected_by_scan_resume`
-Expected: FAIL —— `移除后盘上仍有它的 manifest...`
+Expected: PASS
 
-（此时 `remove_task` 已在 Step 5 实现，若没删目录这条会红。若它直接绿了，说明 Step 5 里漏了什么，回查。）
+`remove_task` 在 Step 5 已经实现，所以这条写完就是绿的 —— 这里没有"先看它红"的环节。
 
-- [ ] **Step 9: 确认 Step 5 的实现已经让这条通过**
+- [ ] **Step 9: 做一次负向验证，证明这条测试不是空跑**
+
+一条写完即绿的测试有两种可能：它真的在测那行代码，或者它什么都没测。必须区分开。
+
+临时把 Step 5 里这两行注释掉：
+
+```rust
+        // ACTUALLY 不要连目录一起删
+        // std::fs::remove_dir_all(&tdir).ok();
+```
+
+再跑：
 
 Run: `cargo test --test engine_test removed_failed_task_is_not_resurrected_by_scan_resume`
-Expected: PASS。若 FAIL，检查 Step 5 中 `std::fs::remove_dir_all(&tdir)` 一行是否真的存在且用的是 `&tdir`。
+Expected: FAIL，且失败信息是 `移除后盘上仍有它的 manifest，重启会把这个任务复活`
+
+看到这个失败，就证明了测试确实钉在"删目录"那个动作上。**验证完立刻把注释恢复。**
+
+- [ ] **Step 10: 恢复后确认重新变绿**
+
+Run: `cargo test --test engine_test removed_failed_task_is_not_resurrected_by_scan_resume`
+Expected: PASS
 
 - [ ] **Step 10: 写第三条失败测试——worker 还在退出时移除，占位仍要释放**
 
