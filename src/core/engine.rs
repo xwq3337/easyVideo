@@ -13,8 +13,19 @@ use crate::core::ffmpeg::{ensure_ffmpeg, remux_to_mp4, RemuxOutcome};
 use crate::core::hls::{download_media, parse::parse_playlist, parse::ParsedPlaylist};
 use crate::core::probe::{filename_from_url, probe, ProbeOutcome};
 use crate::core::task::{task_dir, write_manifest, ManifestKind, TaskManifest};
-use crate::core::ytdlp::{fetch_formats, find_ytdlp};
+use crate::core::ytdlp::{cookie_jar_from_netscape, fetch_formats, find_ytdlp};
 use crate::settings::Settings;
+
+/// 不伪装时用的 UA。诚实标出自己是谁。
+const DEFAULT_UA: &str = "easydownvideo/0.1";
+
+/// 伪装开启时用的 UA，与传给 yt-dlp 的 `--impersonate chrome` 配套。
+///
+/// yt-dlp 那边伪装的是 TLS 指纹，我们这边伪装不了（reqwest 走 rustls），但 UA 必须
+/// 跟着换：Cloudflare 会把 `cf_clearance` 与本轮请求的 UA 绑在一起，带着浏览器 cookie
+/// 却用一个自报家门的 UA 去要同一个文件，反而更容易被判成"换了客户端"。
+const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 #[derive(Clone)]
 pub struct Engine {
@@ -33,7 +44,10 @@ pub struct TaskSnapshot {
 
 struct Inner {
     rt: Handle,
-    client: reqwest::Client,
+    /// **可重建**的 HTTP 客户端。浏览器 UA 与 cookie jar 都挂在它上面（见
+    /// `refresh_http_client`），而这两样恰恰是 Cloudflare 站点拦不拦你的关键，
+    /// 所以不能像原先那样在 `new` 里一次定死。
+    client: Mutex<reqwest::Client>,
     settings: Mutex<Settings>,
     tasks: Mutex<HashMap<TaskId, TaskEntry>>,
     queue: Mutex<VecDeque<TaskId>>,
@@ -123,13 +137,12 @@ fn is_terminal(state: &TaskState) -> bool {
 impl Engine {
     pub fn new(rt: Handle, settings: Settings, data_dir: PathBuf) -> Self {
         let (tx, _) = broadcast::channel(256);
-        Self {
+        let engine = Self {
             inner: Arc::new(Inner {
                 rt,
-                client: reqwest::Client::builder()
-                    .user_agent("easydownvideo/0.1")
-                    .build()
-                    .expect("build http client"),
+                // 占位。下面立刻按设置重建 —— 不能在这里直接建好，因为"用什么 UA、
+                // 带不带 cookie"都由设置决定。
+                client: Mutex::new(reqwest::Client::new()),
                 settings: Mutex::new(settings),
                 tasks: Mutex::new(HashMap::new()),
                 queue: Mutex::new(VecDeque::new()),
@@ -138,7 +151,45 @@ impl Engine {
                 data_dir,
                 reserved_paths: Mutex::new(HashSet::new()),
             }),
-        }
+        };
+        engine.refresh_http_client();
+        engine
+    }
+
+    /// yt-dlp 写回 cookie jar 的位置（固定一个文件，不随任务变）。
+    pub fn cookies_file(&self) -> PathBuf {
+        self.inner.data_dir.join("cookies.txt")
+    }
+
+    /// 按当前设置重建 HTTP 客户端：UA 与 cookie jar 都挂在它上面。
+    ///
+    /// **三个调用时机缺一不可**：构造时、用户改设置时、以及每次 yt-dlp 探测返回之后
+    /// —— cookie jar 是 yt-dlp 在那次进程退出时才写回文件的，早一步读就是空的。
+    ///
+    /// cookie 走 `cookie_provider` 而不是一个写死的 `Cookie:` 头：前者按域分发，
+    /// 只把 cookie 发给它自己的站点。理由见 `cookie_jar_from_netscape` 的文档 ——
+    /// 这是一道隐私防线，不是实现细节。
+    ///
+    /// 读不到文件（没配过浏览器 cookie）就是空 jar，一切照常。
+    fn refresh_http_client(&self) {
+        let impersonate = self.inner.settings.lock().unwrap().impersonate;
+        let ua = if impersonate { BROWSER_UA } else { DEFAULT_UA };
+
+        let jar_text = std::fs::read_to_string(self.cookies_file()).unwrap_or_default();
+        let jar = std::sync::Arc::new(cookie_jar_from_netscape(&jar_text));
+
+        let client = reqwest::Client::builder()
+            .user_agent(ua)
+            .cookie_provider(jar)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        *self.inner.client.lock().unwrap() = client;
+    }
+
+    /// 取一份客户端副本，用完即弃。`reqwest::Client` 内部是 Arc，克隆很便宜；
+    /// 这样调用方不必抱着锁去 await（抱锁 await 会把整台引擎卡住）。
+    fn http(&self) -> reqwest::Client {
+        self.inner.client.lock().unwrap().clone()
     }
 
     pub fn events(&self) -> broadcast::Receiver<EngineEvent> {
@@ -152,6 +203,9 @@ impl Engine {
 
     pub fn update_settings(&self, s: Settings) {
         *self.inner.settings.lock().unwrap() = s;
+        // 伪装开关一变，UA 与 cookie 就得跟着换 —— 只写设置不重建客户端的话，
+        // 用户在设置页打开"伪装"再点重试，请求仍然是旧的 UA，看起来像功能没生效。
+        self.refresh_http_client();
         self.pump(); // 并发上限提高时可立即启动排队中的任务
     }
 
@@ -547,7 +601,13 @@ impl Engine {
                     tokio::select! {
                         _ = ticker.tick() => {
                             let (d, t) = progress.snapshot();
-                            let _ = tx.send(EngineEvent::Progress { id, downloaded: d, total: t, unit: progress.unit() });
+                            let _ = tx.send(EngineEvent::Progress {
+                                id,
+                                downloaded: d,
+                                total: t,
+                                unit: progress.unit(),
+                                bytes_downloaded: progress.bytes(),
+                            });
                         }
                         r = &mut task => break r,
                     }
@@ -558,6 +618,7 @@ impl Engine {
                     downloaded: d,
                     total: t,
                     unit: progress.unit(),
+                    bytes_downloaded: progress.bytes(),
                 });
                 // 收尾：只有仍处于执行态才标记 Done；AwaitingChoice/Paused/Canceled 保持
                 match result {
@@ -602,12 +663,25 @@ impl Engine {
         cancel: CancellationToken,
     ) -> anyhow::Result<()> {
         let settings = self.inner.settings.lock().unwrap().clone();
-        let outcome = probe(&self.inner.client, &url).await?;
+        let client = self.http();
+        let outcome = probe(&client, &url).await?;
         match outcome {
             ProbeOutcome::WebPage => {
                 if settings.ytdlp_enabled {
                     if let Some(exe) = find_ytdlp() {
-                        let formats = fetch_formats(&exe, &url).await?;
+                        let formats = fetch_formats(
+                            &exe,
+                            &url,
+                            &self.cookies_file(),
+                            settings.cookies_from_browser.as_deref(),
+                            settings.impersonate,
+                        )
+                        .await?;
+                        // yt-dlp 刚把 cookie jar 写回文件（--cookies 既是输入也是输出），
+                        // 现在才读得到。重建客户端之后，下面选的格式 URL 就会带着
+                        // 浏览器 cookie 和 UA 去下载 —— 少了这一步，前面绕过的
+                        // Cloudflare 会在真正下载时再来一次 403。
+                        self.refresh_http_client();
                         if formats.is_empty() {
                             anyhow::bail!("yt-dlp 未找到可下载格式");
                         }
@@ -670,7 +744,7 @@ impl Engine {
                     anyhow::bail!("canceled");
                 }
                 download_direct(
-                    &self.inner.client,
+                    &client,
                     &url,
                     &final_path,
                     &tdir,
@@ -697,10 +771,10 @@ impl Engine {
         progress: &ProgressHandle,
         cancel: &CancellationToken,
     ) -> anyhow::Result<()> {
+        // 与 run_task 同源：拿一份带当前 cookie/UA 的客户端副本，别抱着锁 await。
+        let client = self.http();
         let body = {
-            let resp = self
-                .inner
-                .client
+            let resp = client
                 .get(playlist_url)
                 .send()
                 .await?
@@ -750,7 +824,7 @@ impl Engine {
             anyhow::bail!("canceled");
         }
         let plan = download_media(
-            &self.inner.client,
+            &client,
             &media,
             &tdir,
             settings.segment_concurrency,

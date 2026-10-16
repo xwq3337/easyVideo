@@ -146,6 +146,7 @@ mod tests {
                 downloaded: i,
                 total: 100,
                 unit: ProgressUnit::Bytes,
+                bytes_downloaded: i,
             });
         }
         drop(tx);

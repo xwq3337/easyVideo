@@ -9,6 +9,18 @@ pub struct Settings {
     pub max_active_tasks: usize,
     pub ytdlp_enabled: bool,
     pub ffmpeg_path_override: Option<PathBuf>,
+    /// 从哪个浏览器读 cookie（`chrome` / `firefox` / `safari` …）。`None` = 不读。
+    ///
+    /// **必须带 `#[serde(default)]`**：老配置里没有这个键，缺了它整份 settings.json
+    /// 反序列化失败，而 `load()` 用 `unwrap_or_default()` 兜底 —— 用户升级后所有设置
+    /// 会静默回到默认值（保存目录都丢），且界面上没有任何提示。
+    #[serde(default)]
+    pub cookies_from_browser: Option<String>,
+    /// 让 yt-dlp 以浏览器指纹发请求（`--extractor-args generic:impersonate`），
+    /// 并让本程序自己的下载客户端也用浏览器 UA。绕过 Cloudflare 的主要手段。
+    /// 需要 yt-dlp 装了 `curl_cffi`，否则它会报错（见 `ytdlp_error_hint`）。
+    #[serde(default)]
+    pub impersonate: bool,
 }
 
 impl Default for Settings {
@@ -24,8 +36,25 @@ impl Default for Settings {
             max_active_tasks: 2,
             ytdlp_enabled: true,
             ffmpeg_path_override: None,
+            cookies_from_browser: None,
+            impersonate: false,
         }
     }
+}
+
+/// 允许出现在 `--cookies-from-browser` 里的浏览器名。
+///
+/// 这是一份**白名单**，不是"看着像就放行"：这个值会被原样拼进 yt-dlp 的命令行，
+/// 而设置是从界面来的。任意的字符串（比如以 `-` 开头的东西）会被 yt-dlp 当成新的
+/// 参数解析 —— 那就是一条从设置页通往任意命令行的路。
+pub const BROWSERS: &[&str] = &[
+    "brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi", "whale",
+];
+
+/// 校验并规范化浏览器名。不认识的一律当成"不读 cookie"。
+pub fn sanitize_browser(name: &str) -> Option<String> {
+    let n = name.trim().to_ascii_lowercase();
+    BROWSERS.contains(&n.as_str()).then_some(n)
 }
 
 impl Settings {

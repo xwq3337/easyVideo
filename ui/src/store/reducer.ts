@@ -215,13 +215,18 @@ function progressFields(
   t: TaskView,
   event: Extract<EventDto, { type: "progress" }>,
   now: number
-): Pick<TaskView, "downloaded" | "total" | "unit" | "speedBps" | "etaText" | "lastTickAt"> {
+): Pick<
+  TaskView,
+  "downloaded" | "total" | "unit" | "bytesDownloaded" | "speedBps" | "etaText" | "lastTickAt"
+> {
   const dt = (now - t.lastTickAt) / 1000;
-  const dd = event.downloaded - t.downloaded;
-  // 分片单位不报速度：那是"片/秒"，混进总速度会得到 "3.0 B/s" 这种假数字。
+  // 差分走**字节数**，不走 `downloaded`：后者对分片任务是"片"，除出来的单位是片/秒。
+  // 引擎为两种单位都报 bytesDownloaded，所以这里不再需要按 unit 分支
+  // （旧写法 `unit === "bytes" && ...` 正是"m3u8 恒显示 0 B/s"的成因）。
+  const dd = event.bytesDownloaded - t.bytesDownloaded;
   // dt 太小（同一批事件）时沿用上一次的值，避免除出天文数字。
-  const speedBps =
-    t.unit === "bytes" && t.lastTickAt > 0 && dt > 0.2 && dd >= 0 ? dd / dt : t.speedBps;
+  const speedBps = t.lastTickAt > 0 && dt > 0.2 && dd >= 0 ? dd / dt : t.speedBps;
+  // 剩余时间仍只对字节单位有效：分片任务的 `total` 是片数，除以字节/秒毫无意义。
   const remaining = Math.max(0, event.total - event.downloaded);
   const etaText =
     t.unit === "bytes" && speedBps && speedBps > 0 && remaining > 0
@@ -231,6 +236,7 @@ function progressFields(
     downloaded: event.downloaded,
     total: event.total,
     unit: event.unit,
+    bytesDownloaded: event.bytesDownloaded,
     speedBps,
     etaText,
     lastTickAt: now,

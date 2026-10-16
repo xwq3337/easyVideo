@@ -57,6 +57,9 @@ async fn downloads_in_blocks_and_merges() {
 
     assert_eq!(std::fs::read(&final_path).unwrap(), data);
     assert_eq!(progress.snapshot(), (1024, 1024));
+    // 直链的 downloaded 本来就是字节数，所以字节计数必须与它同步 —— 界面算速度统一走字节，
+    // 两者一旦分叉，直链任务的速度就会凭空变成 0 或翻倍。
+    assert_eq!(progress.bytes(), 1024);
     assert!(std::fs::read_dir(dir.path()).unwrap().count() == 1); // .part 已清理
 }
 
@@ -76,6 +79,7 @@ async fn resumes_completed_parts() {
     std::fs::write(dir.path().join("f.part-0"), &data[0..512]).unwrap();
 
     let final_path = dir.path().join("f.bin");
+    let progress = ProgressHandle::new();
     download_direct(
         &reqwest::Client::new(),
         &format!("{}/f.bin", server.uri()),
@@ -85,10 +89,13 @@ async fn resumes_completed_parts() {
         true,
         2,
         512,
-        &ProgressHandle::new(),
+        &progress,
         CancellationToken::new(),
     ).await.unwrap();
     assert_eq!(std::fs::read(&final_path).unwrap(), data);
+    // 预置的那一块这一轮没走网络，字节数只该有真正下载的那 512。记成 1024 的话，
+    // 用户一"继续下载"就会看到一个凭空冒出来的速度尖峰。
+    assert_eq!(progress.bytes(), 512, "续传跳过的块不计入字节数");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -119,6 +126,7 @@ async fn rerun_does_not_accumulate_byte_progress() {
         Some(1024), true, 2, 512, &progress, CancellationToken::new(),
     ).await.unwrap();
     assert_eq!(progress.snapshot(), (1024, 1024), "第一次运行结束后 downloaded 必须等于 total");
+    assert_eq!(progress.bytes(), 1024, "首次下载：字节数与 downloaded 一致");
     assert_eq!(std::fs::read(&final_path).unwrap(), data);
 
     // 第二次运行：同一任务目录、同一 handle
@@ -131,6 +139,10 @@ async fn rerun_does_not_accumulate_byte_progress() {
         (1024, 1024),
         "重跑后 downloaded 不能累加超过 total（这正是 1.4/2.0 GB 的成因）"
     );
+    // 字节计数同理：这一轮的分块是**重新从网络下的**（合并时 .part 已被删掉），
+    // 所以字节数应等于本轮真实流量 1024，而不是两轮叠加的 2048。
+    // reset() 漏掉 bytes 的话这里正好会得到 2048。
+    assert_eq!(progress.bytes(), 1024, "重跑后字节数不能累加到 2048");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

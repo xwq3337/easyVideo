@@ -14,6 +14,8 @@ fn settings_with(dir: &std::path::Path) -> Settings {
         max_active_tasks: 1,
         ytdlp_enabled: false,
         ffmpeg_path_override: None,
+        cookies_from_browser: None,
+        impersonate: false,
     }
 }
 

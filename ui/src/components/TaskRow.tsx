@@ -20,6 +20,20 @@ const LABELS: Record<TaskView["state"]["kind"], string> = {
   canceled: "已取消",
 };
 
+/**
+ * 行内动作按钮（选择格式/继续/重试/暂停/移除）共用的样式。
+ *
+ * 这几个按钮是纯文字、没有底色，所以**悬停只能靠字色**：改成 ghost 按钮那种
+ * `hover:bg-*` 在这行里是看不见的 —— 列表的底板本身就是 `--bg-subtle`，
+ * 底色叠底色等于没有反馈。常态继承容器那层 `--fg-muted`，悬停压深到 `--fg`。
+ *
+ * `transition-colors` 与真正会变的属性（color）必须对上：写成 `transition-[filter]`
+ * 之类的会让这次变色退化成瞬跳。
+ *
+ * 光标不在这里写 —— `index.css` 里有一条全局 `button:not(:disabled)`，这里是它的受益者。
+ */
+const ACTION_BTN = "flex items-center gap-1 text-[12px] transition-colors hover:text-[var(--fg)]";
+
 export default function TaskRow({ task }: { task: TaskView }) {
   const [draft, setDraft] = useState(task.filename);
   const pct =
@@ -121,7 +135,7 @@ export default function TaskRow({ task }: { task: TaskView }) {
           {task.state.kind === "awaitingChoice" && (
             // 等待选择的行可以把选择框重新叫回来（「稍后再说」把它压下去之后的出口）。
             <button
-              className="flex items-center gap-1 text-[12px]"
+              className={ACTION_BTN}
               onClick={() => dispatch({ kind: "openChoice", id: task.id })}
             >
               <ListChecks size={14} strokeWidth={1.75} />
@@ -130,7 +144,7 @@ export default function TaskRow({ task }: { task: TaskView }) {
           )}
           {task.state.kind === "paused" && (
             <button
-              className="flex items-center gap-1 text-[12px]"
+              className={ACTION_BTN}
               onClick={() => void run(ipc.unpause(task.id))}
             >
               <Play size={14} strokeWidth={1.75} />
@@ -139,7 +153,7 @@ export default function TaskRow({ task }: { task: TaskView }) {
           )}
           {task.state.kind === "failed" && (
             <button
-              className="flex items-center gap-1 text-[12px]"
+              className={ACTION_BTN}
               onClick={() => void run(ipc.retry(task.id))}
             >
               <RotateCcw size={14} strokeWidth={1.75} />
@@ -149,7 +163,7 @@ export default function TaskRow({ task }: { task: TaskView }) {
           {/* 暂停按钮覆盖的正是 core 里 pause 接受的那四个状态 —— 否则就是死按钮 */}
           {["queued", "probing", "downloading", "merging"].includes(task.state.kind) && (
             <button
-              className="flex items-center gap-1 text-[12px]"
+              className={ACTION_BTN}
               onClick={() => void run(ipc.pause(task.id))}
             >
               <Pause size={14} strokeWidth={1.75} />
@@ -159,7 +173,7 @@ export default function TaskRow({ task }: { task: TaskView }) {
           {/* 按钮的叫法与调用的命令必须一致 —— 之前这里写着「从列表移除」却调 cancel()，
               对已取消的行连状态都不变，是个纯零反应的假按钮。见 lib/taskAction.ts。 */}
           <button
-            className="flex items-center gap-1 text-[12px]"
+            className={ACTION_BTN}
             onClick={() => void run(action.invoke(task.id))}
           >
             <X size={14} strokeWidth={1.75} />

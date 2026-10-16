@@ -70,6 +70,9 @@ async fn downloads_segments_and_builds_concat_plan() {
     // HLS 进度以分片计数：2 个分片
     assert_eq!(progress.snapshot(), (2, 2));
     assert_eq!(progress.unit(), easydownvideo::core::events::ProgressUnit::Segments);
+    // ……但同时必须报出**字节数**，否则界面算不出速度（只能是 0 B/s）。
+    // 100 + 200：这是线上真正传过来的字节，与分片计数是两回事。
+    assert_eq!(progress.bytes(), 300);
     // concat 列表已生成
     let list = std::fs::read_to_string(&plan.list_file).unwrap();
     assert!(list.contains("file '"));
@@ -93,18 +96,22 @@ async fn resumes_existing_segments() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("seg-00000.ts"), vec![7u8; 100]).unwrap();
 
+    let progress = ProgressHandle::new();
     let plan = download_media(
         &reqwest::Client::new(),
         &media,
         dir.path(),
         2,
-        &ProgressHandle::new(),
+        &progress,
         CancellationToken::new(),
     )
     .await
     .unwrap();
     assert_eq!(std::fs::read(&plan.segment_files[0]).unwrap(), vec![7u8; 100]);
     assert_eq!(std::fs::read(&plan.segment_files[1]).unwrap(), s1);
+    // 续传的那个分片**这一轮没有走网络**，所以不能计入字节数。否则一继续下载
+    // 就会看到一次凭空冒出来的速度尖峰（几十 MB/s），那是假的。
+    assert_eq!(progress.bytes(), 50);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

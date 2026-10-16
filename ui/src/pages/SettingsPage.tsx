@@ -12,6 +12,23 @@ const SEGMENT_CONCURRENCY = { min: 1, max: 16 } as const;
 const MAX_ACTIVE_TASKS = { min: 1, max: 8 } as const;
 
 /**
+ * 与 core 的 `settings::BROWSERS` 必须一致 —— 这份名单只是为了把选项画出来，
+ * 真正的闸在 core（`sanitize_browser`）。前端漏掉一个只是选项少一个，
+ * 前端多出一个才会被 core 静默丢掉。
+ */
+const BROWSERS = [
+  { value: "chrome", label: "Chrome" },
+  { value: "firefox", label: "Firefox" },
+  { value: "safari", label: "Safari" },
+  { value: "edge", label: "Edge" },
+  { value: "brave", label: "Brave" },
+  { value: "chromium", label: "Chromium" },
+  { value: "vivaldi", label: "Vivaldi" },
+  { value: "opera", label: "Opera" },
+  { value: "whale", label: "Whale" },
+] as const;
+
+/**
  * 设置**页**（原先是模态对话框）。
  *
  * **只有点「保存」才写盘** —— 控件变化一律只落在本地 `draft` 上，不碰 core。
@@ -171,6 +188,42 @@ export default function SettingsPage() {
         />
         <span>用 yt-dlp 解析网页视频（需自行安装 yt-dlp）</span>
       </label>
+
+      {/* ↓ 下面三块是"站点不让我下"那一类问题的总出口。Cloudflare 人机验证
+          挡的是"这次请求看着不像浏览器"，能改的只有两件事：带上你的登录 cookie，
+          以及让请求看着像浏览器。摆在 yt-dlp 开关旁边是因为三者是一件事。 */}
+      <label className="block mb-5">
+        <span style={{ color: "var(--fg-muted)" }}>读取 cookie 的浏览器</span>
+        <select
+          className="w-48 mt-1.5 h-8 rounded-lg border px-2 text-[13px] outline-none bg-[var(--bg-inset)] border-[var(--line-strong)] text-[var(--fg)]"
+          value={draft.cookiesFromBrowser ?? ""}
+          onChange={(e) =>
+            setDraft((p) => (p ? { ...p, cookiesFromBrowser: e.target.value || null } : p))
+          }
+        >
+          <option value="">不读取</option>
+          {BROWSERS.map((b) => (
+            <option key={b.value} value={b.value}>
+              {b.label}
+            </option>
+          ))}
+        </select>
+        <span className="block text-[12px]" style={{ color: "var(--fg-faint)" }}>
+          遇到"登录才能看""请先验证"的站点时选它。首次读取系统会要求授权。
+        </span>
+      </label>
+
+      <label className="flex items-center gap-2 mb-1.5 text-[13px]">
+        <input
+          type="checkbox"
+          checked={draft.impersonate}
+          onChange={(e) => setDraft((p) => (p ? { ...p, impersonate: e.target.checked } : p))}
+        />
+        <span>伪装浏览器指纹（对付 Cloudflare 等验证）</span>
+      </label>
+      <span className="block text-[12px] mb-5" style={{ color: "var(--fg-faint)" }}>
+        需要 yt-dlp 装有 curl_cffi，否则会提示"伪装不可用"。
+      </span>
 
       <label className="block mb-5">
         <span style={{ color: "var(--fg-muted)" }}>ffmpeg 路径覆盖（留空则用内嵌的）</span>

@@ -65,6 +65,8 @@ pub struct TaskDto {
     pub downloaded: u64,
     pub total: u64,
     pub unit: UnitDto,
+    /// 本轮运行已下字节数，与 `unit` 无关地恒为字节。界面用它算速度。
+    pub bytes_downloaded: u64,
 }
 
 /// 从快照构造。`list_tasks()` 给的是**同一批** `ProgressHandle`，所以这里读到的进度
@@ -79,11 +81,15 @@ pub fn task_dto(t: TaskSnapshot) -> TaskDto {
         downloaded,
         total,
         unit: UnitDto::from(t.progress.unit()),
+        bytes_downloaded: t.progress.bytes(),
     }
 }
 
+// `rename_all` 只管**变体名**，字段名要另外靠 `rename_all_fields`。这个枚举此前的字段
+// 全是单词（id/state/downloaded/total/unit），所以这条一直没被需要；`bytes_downloaded`
+// 是第一个多词字段，少了它发出去的就是 snake_case，TS 那边读到 undefined（速度恒为 0）。
 #[derive(Serialize, Debug, Clone)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum EventDto {
     StateChanged { id: u64, state: StateDto },
     Progress {
@@ -91,6 +97,8 @@ pub enum EventDto {
         downloaded: u64,
         total: u64,
         unit: UnitDto,
+        /// 永远以字节计，与 `downloaded`（单位随 `unit` 变）是两回事。界面算速度只用它。
+        bytes_downloaded: u64,
     },
     ChoicesOffered { id: u64, kind: ChoiceKindDto },
     TaskRemoved { id: u64 },
@@ -107,11 +115,13 @@ pub fn event_dto(ev: EngineEvent) -> EventDto {
             downloaded,
             total,
             unit,
+            bytes_downloaded,
         } => EventDto::Progress {
             id,
             downloaded,
             total,
             unit: UnitDto::from(unit),
+            bytes_downloaded,
         },
         EngineEvent::ChoicesOffered { id, kind } => EventDto::ChoicesOffered {
             id,
@@ -204,6 +214,10 @@ pub struct SettingsDto {
     pub max_active_tasks: usize,
     pub ytdlp_enabled: bool,
     pub ffmpeg_path_override: Option<String>,
+    /// 从哪个浏览器读 cookie（`chrome` / `firefox` / `safari` …），`null` = 不读。
+    pub cookies_from_browser: Option<String>,
+    /// 是否伪装浏览器指纹（绕过 Cloudflare 的主要手段）。
+    pub impersonate: bool,
 }
 
 pub fn settings_dto(s: Settings) -> SettingsDto {
@@ -213,6 +227,8 @@ pub fn settings_dto(s: Settings) -> SettingsDto {
         max_active_tasks: s.max_active_tasks,
         ytdlp_enabled: s.ytdlp_enabled,
         ffmpeg_path_override: s.ffmpeg_path_override.map(|p| p.to_string_lossy().into_owned()),
+        cookies_from_browser: s.cookies_from_browser,
+        impersonate: s.impersonate,
     }
 }
 
@@ -223,6 +239,13 @@ pub fn settings_from(s: SettingsDto) -> Settings {
         max_active_tasks: s.max_active_tasks,
         ytdlp_enabled: s.ytdlp_enabled,
         ffmpeg_path_override: s.ffmpeg_path_override.map(Into::into),
+        // 白名单在这里落闸：这个值会被拼进 yt-dlp 的命令行，而 DTO 是外部输入
+        // （前端的下拉框挡不住手写的 IPC 调用）。
+        cookies_from_browser: s
+            .cookies_from_browser
+            .as_deref()
+            .and_then(easydownvideo::settings::sanitize_browser),
+        impersonate: s.impersonate,
     }
 }
 
@@ -268,6 +291,7 @@ mod tests {
             downloaded: 100,
             total: 400,
             unit: ProgressUnit::Segments,
+            bytes_downloaded: 2_000_000,
         });
         assert_eq!(
             serde_json::to_value(&d).unwrap(),
@@ -276,7 +300,8 @@ mod tests {
                 "id": 3,
                 "downloaded": 100,
                 "total": 400,
-                "unit": "segments"
+                "unit": "segments",
+                "bytesDownloaded": 2_000_000
             })
         );
     }
@@ -289,12 +314,50 @@ mod tests {
             max_active_tasks: 2,
             ytdlp_enabled: true,
             ffmpeg_path_override: None,
+            // 刻意都用**非默认值**：用默认值的话，往返里把这两个字段整个漏掉也照样绿。
+            cookies_from_browser: Some("firefox".into()),
+            impersonate: true,
         };
         let d = settings_dto(s.clone());
         let j = serde_json::to_value(&d).unwrap();
         assert_eq!(j["downloadDir"], "/tmp/x");
         assert_eq!(j["segmentConcurrency"], 6);
+        assert_eq!(j["cookiesFromBrowser"], "firefox");
+        assert_eq!(j["impersonate"], true);
         assert_eq!(settings_from(d), s, "往返之后必须与原来完全一致");
+    }
+
+    /// 入站方向的注入防护。`cookies_from_browser` 会被拼进 yt-dlp 的命令行，
+    /// 而它来自前端的设置页 —— 前端的下拉框挡不住手写的 IPC 调用，所以 core 这边
+    /// 必须自己再挡一次。
+    #[test]
+    fn settings_from_rejects_a_non_whitelisted_browser() {
+        let d = SettingsDto {
+            download_dir: "/tmp/x".into(),
+            segment_concurrency: 6,
+            max_active_tasks: 2,
+            ytdlp_enabled: true,
+            ffmpeg_path_override: None,
+            cookies_from_browser: Some("chrome --exec rm -rf /".into()),
+            impersonate: false,
+        };
+        assert_eq!(
+            settings_from(d).cookies_from_browser,
+            None,
+            "不在白名单里的浏览器名必须被丢掉，不能原样进命令行"
+        );
+
+        // 合法名照常保留（顺带覆盖大小写/空格规范化）
+        let d = SettingsDto {
+            cookies_from_browser: Some(" Chrome ".into()),
+            ..serde_json::from_str::<SettingsDto>(
+                r#"{"downloadDir":"/tmp/x","segmentConcurrency":6,"maxActiveTasks":2,
+                    "ytdlpEnabled":true,"ffmpegPathOverride":null,
+                    "cookiesFromBrowser":"Chrome","impersonate":false}"#,
+            )
+            .unwrap()
+        };
+        assert_eq!(settings_from(d).cookies_from_browser.as_deref(), Some("chrome"));
     }
 
     /// 守卫 `ChoicesOffered` 这条**事件**路径的 wire 形状——前端真正收到的东西。
@@ -441,6 +504,7 @@ mod tests {
     fn task_dto_ships_exactly_the_contract_keys() {
         let progress = easydownvideo::core::events::ProgressHandle::new();
         progress.add(250);
+        progress.add_bytes(1_000_000);
         progress.set_total(1000);
         progress.set_unit(ProgressUnit::Segments);
         let t = easydownvideo::core::engine::TaskSnapshot {
@@ -459,21 +523,24 @@ mod tests {
                 "state": { "kind": "downloading" },
                 "downloaded": 250,
                 "total": 1000,
-                "unit": "segments"
+                "unit": "segments",
+                "bytesDownloaded": 1_000_000
             })
         );
     }
 
-    /// `SettingsDto` 的五个键名一个都不能漏。`settings_from(d) == s` 那条是**Rust 结构体**比较，
+    /// `SettingsDto` 的每一个键名都不能漏。`settings_from(d) == s` 那条是**Rust 结构体**比较，
     /// 一个 JSON 键名都钉不住——所以必须单独有这条。
     #[test]
-    fn settings_dto_ships_exactly_the_five_contract_keys() {
+    fn settings_dto_ships_exactly_the_contract_keys() {
         let s = Settings {
             download_dir: std::path::PathBuf::from("/tmp/x"),
             segment_concurrency: 6,
             max_active_tasks: 2,
             ytdlp_enabled: true,
             ffmpeg_path_override: Some(std::path::PathBuf::from("/opt/ffmpeg")),
+            cookies_from_browser: Some("edge".into()),
+            impersonate: true,
         };
         assert_eq!(
             serde_json::to_value(settings_dto(s)).unwrap(),
@@ -482,9 +549,17 @@ mod tests {
                 "segmentConcurrency": 6,
                 "maxActiveTasks": 2,
                 "ytdlpEnabled": true,
-                "ffmpegPathOverride": "/opt/ffmpeg"
+                "ffmpegPathOverride": "/opt/ffmpeg",
+                "cookiesFromBrowser": "edge",
+                "impersonate": true
             })
         );
+
+        // 没选浏览器时同样必须是 `null` 而不是缺字段：TS 写的是 `string | null`。
+        let j = serde_json::to_value(settings_dto(Settings::default())).unwrap();
+        assert_eq!(j["cookiesFromBrowser"], serde_json::Value::Null);
+        assert!(j.get("cookiesFromBrowser").is_some());
+        assert_eq!(j["impersonate"], false);
 
         // None 必须是 `null` 而不是缺字段：TS 写的是 `string | null`，不是可选属性。
         let s = Settings {

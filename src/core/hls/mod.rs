@@ -86,6 +86,10 @@ pub async fn download_media(
                 return Err(anyhow!("canceled"));
             }
             let ciphertext = fetch_bytes(&client, &seg_uri, &cancel).await?;
+            // 字节计数按**网络上传过来的密文长度**记，且必须在下面的 match 之前 ——
+            // 无加密分支会把 ciphertext 整体 move 进 data。解密后的长度不等于下载量
+            // （CBC 去填充会少几个字节），速度要反映的是真实吞吐。
+            progress.add_bytes(ciphertext.len() as u64);
             let data = match &key {
                 Some(KeyRef { uri, iv }) => {
                     let k = {

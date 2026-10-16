@@ -88,3 +88,19 @@ body {
 }
 /* 数字等宽对齐：进度/速度/剩余时间逐帧变化时不抖动 */
 .tnum { font-variant-numeric: tabular-nums; }
+
+/* `<button>` 的手型光标。
+   **不能指望 Tailwind 的 preflight**：v4 那里压根没有 cursor 这条规则（全文件只有一处
+   提到 cursor，管的是 number 输入框的上下箭头），于是光标落回 webview 的原生默认值 ——
+   macOS 上表单控件是箭头，屏幕上 15 个按钮没有一个看起来能点。
+
+   写 `:not(:disabled)` 而不是"先写 button:hover 再用 button:disabled 盖掉"：后者靠的是
+   两条规则的先后顺序，一旦有人调换就会给禁用按钮配上悬停样式。
+
+   放进 `@layer base` 是为了**让 utilities 能覆盖它**：没有层的规则优先级高于任何
+   层内的规则，写成裸 CSS 的话以后想给某个按钮 `cursor-default` 都盖不回来。 */
+@layer base {
+  button:not(:disabled) {
+    cursor: pointer;
+  }
+}

@@ -11,6 +11,7 @@ function task(id: number, over: Partial<TaskView> = {}): TaskView {
     downloaded: 0,
     total: 0,
     unit: "bytes",
+    bytesDownloaded: 0,
     choices: null,
     editing: false,
     speedBps: null,
@@ -31,7 +32,7 @@ describe("reduce", () => {
     const before = { ...initialState, tasks: [task(1), task(2)] };
     const after = reduce(before, {
       kind: "event",
-      event: { type: "progress", id: 2, downloaded: 50, total: 100, unit: "bytes" },
+      event: { type: "progress", id: 2, downloaded: 50, total: 100, unit: "bytes", bytesDownloaded: 50 },
     });
     expect(after.tasks[0].downloaded).toBe(0);
     expect(after.tasks[1].downloaded).toBe(50);
@@ -43,7 +44,7 @@ describe("reduce", () => {
     const before = { ...initialState, tasks: [task(1)] };
     const after = reduce(before, {
       kind: "event",
-      event: { type: "progress", id: 404, downloaded: 1, total: 2, unit: "bytes" },
+      event: { type: "progress", id: 404, downloaded: 1, total: 2, unit: "bytes", bytesDownloaded: 1 },
     });
     expect(after.tasks).toHaveLength(1);
     expect(after.needsResync).toBe(true);
@@ -63,7 +64,7 @@ describe("reduce", () => {
     const before = { ...initialState, tasks: [task(1, { editing: true, filename: "我改的名字" })] };
     const after = reduce(before, {
       kind: "event",
-      event: { type: "progress", id: 1, downloaded: 5, total: 9, unit: "bytes" },
+      event: { type: "progress", id: 1, downloaded: 5, total: 9, unit: "bytes", bytesDownloaded: 5 },
     });
     expect(after.tasks[0].filename).toBe("我改的名字");
   });
@@ -87,32 +88,35 @@ describe("reduce", () => {
     const t0 = 1_000_000;
     const a = reduce({ ...initialState, tasks: [task(1, { total: 1000 })] }, {
       kind: "event",
-      event: { type: "progress", id: 1, downloaded: 0, total: 1000, unit: "bytes" },
+      event: { type: "progress", id: 1, downloaded: 0, total: 1000, unit: "bytes", bytesDownloaded: 0 },
       now: t0,
     });
     const b = reduce(a, {
       kind: "event",
-      event: { type: "progress", id: 1, downloaded: 500, total: 1000, unit: "bytes" },
+      event: { type: "progress", id: 1, downloaded: 500, total: 1000, unit: "bytes", bytesDownloaded: 500 },
       now: t0 + 1000,
     });
     expect(b.tasks[0].speedBps).toBeCloseTo(500, 0);
     expect(b.tasks[0].etaText).toBe("剩 1 秒");
   });
 
-  it("分片单位不报速度：那是片/秒，不是字节/秒", () => {
-    // 混进"总速度"会得到 "3.0 B/s" 这种假数字（egui 版就是这么错的）。
+  it("分片单位也报速度：速度取自字节数，不是片数", () => {
+    // 「m3u8 下载时左下角恒为 0 B/s」的回归测试。分片任务的 downloaded 数的是"片"，
+    // 拿它算速度只会得到片/秒；真速度只能来自引擎另外报的字节数。
+    // 旧的写法是"分片单位一律不报速度"，于是每个 HLS 任务都停在 0 B/s。
     const t0 = 1_000_000;
-    const a = reduce({ ...initialState, tasks: [task(1, { unit: "segments" })] }, {
+    const a = reduce({ ...initialState, tasks: [task(1, { unit: "segments", total: 10 })] }, {
       kind: "event",
-      event: { type: "progress", id: 1, downloaded: 0, total: 10, unit: "segments" },
+      event: { type: "progress", id: 1, downloaded: 0, total: 10, unit: "segments", bytesDownloaded: 0 },
       now: t0,
     });
     const b = reduce(a, {
       kind: "event",
-      event: { type: "progress", id: 1, downloaded: 5, total: 10, unit: "segments" },
+      event: { type: "progress", id: 1, downloaded: 5, total: 10, unit: "segments", bytesDownloaded: 2_000_000 },
       now: t0 + 1000,
     });
-    expect(b.tasks[0].speedBps).toBeNull();
+    expect(b.tasks[0].speedBps).toBeCloseTo(2_000_000, 0);
+    // 剩余量是"5 片"不是字节，算不出时间——不许编一个出来。
     expect(b.tasks[0].etaText).toBeNull();
   });
 
@@ -195,6 +199,8 @@ describe("reduce", () => {
       maxActiveTasks: 2,
       ytdlpEnabled: true,
       ffmpegPathOverride: "/opt/ffmpeg",
+      cookiesFromBrowser: "chrome",
+      impersonate: true,
     };
     expect(reduce(initialState, { kind: "settings", settings: s }).settings).toEqual(s);
   });

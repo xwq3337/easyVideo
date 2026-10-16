@@ -29,6 +29,34 @@ fn load_from_missing_file_returns_none() {
     assert!(Settings::load_from(Path::new("/nonexistent/settings.json")).is_none());
 }
 
+/// 老版本的 settings.json 里没有这两个新键。反序列化必须**补默认值**，而不是整个失败。
+///
+/// 失败会很难查：`load_from` 的调用方（`load()`）用 `unwrap_or_default()` 兜底，于是
+/// "解析失败"与"文件不存在"表现完全一样 —— 用户升级后所有设置静默回到默认值，
+/// 保存目录、线程数全丢，而界面上没有任何提示。
+#[test]
+fn old_settings_json_without_new_keys_still_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("settings.json");
+    std::fs::write(
+        &cfg,
+        r#"{
+            "download_dir": "/tmp/dl",
+            "segment_concurrency": 9,
+            "max_active_tasks": 3,
+            "ytdlp_enabled": false,
+            "ffmpeg_path_override": null
+        }"#,
+    )
+    .unwrap();
+
+    let s = Settings::load_from(&cfg).expect("老配置必须能读进来，不能整份作废");
+    assert_eq!(s.segment_concurrency, 9, "已有的键不能被丢掉");
+    assert!(!s.ytdlp_enabled);
+    assert_eq!(s.cookies_from_browser, None, "新键缺省 = 不读浏览器 cookie");
+    assert!(!s.impersonate, "新键缺省 = 不伪装指纹");
+}
+
 #[test]
 fn load_from_corrupt_file_returns_none() {
     let dir = tempfile::tempdir().unwrap();

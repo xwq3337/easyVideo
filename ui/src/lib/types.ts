@@ -22,11 +22,20 @@ export interface TaskDto {
   downloaded: number;
   total: number;
   unit: UnitDto;
+  /** 本轮已下字节数。与 `unit` 无关，恒为字节 —— 速度只能从它算。 */
+  bytesDownloaded: number;
 }
 
 export type EventDto =
   | { type: "stateChanged"; id: number; state: StateDto }
-  | { type: "progress"; id: number; downloaded: number; total: number; unit: UnitDto }
+  | {
+      type: "progress";
+      id: number;
+      downloaded: number;
+      total: number;
+      unit: UnitDto;
+      bytesDownloaded: number;
+    }
   | { type: "choicesOffered"; id: number; kind: ChoiceKindDto }
   | { type: "taskRemoved"; id: number };
 
@@ -59,6 +68,10 @@ export interface SettingsDto {
   maxActiveTasks: number;
   ytdlpEnabled: boolean;
   ffmpegPathOverride: string | null;
+  /** 浏览器名（chrome/firefox/safari…）。null = 不读浏览器 cookie。 */
+  cookiesFromBrowser: string | null;
+  /** 伪装浏览器指纹：绕过 Cloudflare 的主要手段，需要 yt-dlp 装了 curl_cffi。 */
+  impersonate: boolean;
 }
 
 /** 界面用的一行。比 TaskDto 多几样本地算出来的东西。 */
@@ -67,7 +80,7 @@ export interface TaskView extends TaskDto {
   choices: ChoiceKindDto | null;
   /** 用户正在编辑文件名时为 true，此时不被进度事件刷新覆盖。 */
   editing: boolean;
-  /** 由前后两次进度快照做差得出。分片单位一律为 null（那是片/秒，不是字节/秒）。 */
+  /** 由前后两次快照的**字节数**做差得出，对分片任务同样有效。算不出时为 null。 */
   speedBps: number | null;
   /** 形如 "剩 1 分 32 秒"；算不出来时为 null。 */
   etaText: string | null;

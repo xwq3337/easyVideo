@@ -1,4 +1,5 @@
 import { useTaskList } from "../store/store";
+import { newestFirst } from "../lib/order";
 import TaskRow from "./TaskRow";
 
 export default function TaskList() {
@@ -26,7 +27,10 @@ export default function TaskList() {
       className="rounded-xl overflow-hidden [&>div:last-child]:border-b-0!"
       style={{ background: "var(--bg-subtle)" }}
     >
-      {tasks.map((t) => (
+      {/* 最新的在最上面。只是**显示**顺序反过来，store 里仍是 core 给的升序。
+          注意末尾那条 `[&>div:last-child]:border-b-0!` 的"末行"跟着变成最老的一行 ——
+          这正是我们要的：压住容器底边、被圆角切掉两端的应该是最后那一行。 */}
+      {newestFirst(tasks).map((t) => (
         <TaskRow key={t.id} task={t} />
       ))}
     </div>

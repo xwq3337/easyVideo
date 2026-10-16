@@ -198,7 +198,11 @@ impl<'a> ProgressRollback<'a> {
         }
     }
     fn add(&mut self, n: u64) {
+        // 直链的 downloaded 本来就是字节数，所以两个计数器一起加、也必须一起退。
+        // 只退其中一个的话，重试过的块会把进度留在 downloaded 上（界面显示超过总数），
+        // 而速度那边却少了这段。
         self.progress.add(n);
+        self.progress.add_bytes(n);
         self.counted += n;
     }
     /// 尝试成功：保留已计入的字节，撤销回滚。
@@ -211,6 +215,7 @@ impl Drop for ProgressRollback<'_> {
     fn drop(&mut self) {
         if self.armed {
             self.progress.sub(self.counted);
+            self.progress.sub_bytes(self.counted);
         }
     }
 }
