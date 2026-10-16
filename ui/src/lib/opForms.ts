@@ -96,3 +96,61 @@ export function planKey(
     params.op === "trim" ? params.mode : null,
   ]);
 }
+
+// ===== 画面裁剪的钳制 =====
+
+/**
+ * 奇数向下取偶。
+ *
+ * **ffmpeg 会静默取偶**（实测：请求 crop=641 得到 640，stderr 里一条提示都没有），
+ * 所以界面上要让这件事**看得见** —— 输入框里的数字当场变成 640，用户就知道
+ * 实际会裁多少。
+ */
+export function evenDown(n: number): number {
+  return Math.max(0, Math.floor(n / 2) * 2);
+}
+
+/** 裁剪框草稿。四个值都是用户刚敲进去的、可能还没合法化。 */
+export type CropDraft = { width: number; height: number; x: number; y: number };
+
+/**
+ * 把草稿钳成一个**合法**的裁剪框：取偶、不超过源、左/上不越界。
+ *
+ * 与 ffmpeg 的静默钳制有本质区别：这里钳完的结果**会写回输入框**，
+ * 用户看得见数字变了；ffmpeg 钳完什么都没说。
+ *
+ * 源尺寸未知时返回 `null` —— 界面据此禁用开始按钮并说明原因，
+ * 而不是拿 0 去算一个必然越界的框。
+ */
+export function clampCrop(
+  d: CropDraft,
+  srcW: number | null,
+  srcH: number | null
+): CropDraft | null {
+  if (srcW == null || srcH == null || srcW < 2 || srcH < 2) return null;
+  const width = Math.min(evenDown(d.width), evenDown(srcW));
+  const height = Math.min(evenDown(d.height), evenDown(srcH));
+  const x = Math.min(Math.max(0, evenDown(d.x)), srcW - width);
+  const y = Math.min(Math.max(0, evenDown(d.y)), srcH - height);
+  return { width, height, x, y };
+}
+
+// ===== 合并列表的排序 =====
+
+/**
+ * 列表里第 i 项与上一项交换。到顶时返回**新数组**（内容不变）。
+ *
+ * 到边界也返回新数组而不是原数组：返回原数组的话 React 的 `setState` 会因为
+ * 引用相同而跳过重渲染（与 `newestFirst` 那条是同一个道理）。
+ */
+export function moveUp<T>(list: readonly T[], i: number): T[] {
+  const out = [...list];
+  if (i > 0 && i < out.length) [out[i - 1], out[i]] = [out[i], out[i - 1]];
+  return out;
+}
+
+export function moveDown<T>(list: readonly T[], i: number): T[] {
+  const out = [...list];
+  if (i >= 0 && i < out.length - 1) [out[i], out[i + 1]] = [out[i + 1], out[i]];
+  return out;
+}

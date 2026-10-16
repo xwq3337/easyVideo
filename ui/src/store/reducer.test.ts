@@ -346,7 +346,7 @@ function job(id: number, over: Partial<JobView> = {}): JobView {
   return {
     id,
     label: "压缩 · 均衡",
-    input: `/in/${id}.mp4`,
+    inputs: [`/in/${id}.mp4`],
     output: `/out/${id}-压缩.mp4`,
     state: { kind: "queued" },
     progress: null,

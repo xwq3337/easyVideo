@@ -1,6 +1,57 @@
 import { describe, expect, it } from "vitest";
-import { compressQuality, planKey, trimFormReduce, trimParamsOf } from "./opForms";
+import {
+  clampCrop,
+  compressQuality,
+  evenDown,
+  moveDown,
+  moveUp,
+  planKey,
+  trimFormReduce,
+  trimParamsOf,
+} from "./opForms";
 import { DEFAULT_COMPRESS } from "./opDefaults";
+
+describe("evenDown / clampCrop", () => {
+  it("奇数向下取偶 —— ffmpeg 会静默取偶，我们让这件事**看得见**", () => {
+    // 实测：请求 crop=641 得到的是 640，而且 stderr 里没有提示。
+    // 界面上让数字当场变成 640，用户就知道实际会裁多少。
+    expect(evenDown(641)).toBe(640);
+    expect(evenDown(640)).toBe(640);
+    expect(evenDown(3)).toBe(2);
+    expect(evenDown(1)).toBe(0);
+  });
+
+  it("越界时把左/上**可见地**钳到上限", () => {
+    // 源 1920x1080，要裁 1280x720：左最多 640、上最多 360
+    const c = clampCrop({ width: 1280, height: 720, x: 1200, y: 800 }, 1920, 1080);
+    expect(c).toEqual({ width: 1280, height: 720, x: 640, y: 360 });
+  });
+
+  it("宽高超过源尺寸时也钳（并且仍然是偶数）", () => {
+    expect(clampCrop({ width: 4000, height: 3000, x: 0, y: 0 }, 1920, 1080))
+      .toEqual({ width: 1920, height: 1080, x: 0, y: 0 });
+    // 源是奇数时（罕见但合法）取偶
+    expect(clampCrop({ width: 999, height: 999, x: 0, y: 0 }, 641, 361))
+      .toEqual({ width: 640, height: 360, x: 0, y: 0 });
+  });
+
+  it("源尺寸未知时返回 null —— 界面据此禁用开始按钮并说明原因", () => {
+    expect(clampCrop({ width: 640, height: 360, x: 0, y: 0 }, null, null)).toBeNull();
+  });
+});
+
+describe("moveUp / moveDown", () => {
+  const xs = ["a", "b", "c"];
+  it("上下移动一格", () => {
+    expect(moveUp(xs, 1)).toEqual(["b", "a", "c"]);
+    expect(moveDown(xs, 1)).toEqual(["a", "c", "b"]);
+  });
+  it("到头不动，且**不返回原数组**（React 靠引用判断变没变）", () => {
+    expect(moveUp(xs, 0)).toEqual(["a", "b", "c"]);
+    expect(moveDown(xs, 2)).toEqual(["a", "b", "c"]);
+    expect(moveUp(xs, 0)).not.toBe(xs);
+  });
+});
 
 describe("trimParamsOf / trimFormReduce", () => {
   it("**中途输入非法不能把档位改掉**（这是复审抓到的 Critical）", () => {

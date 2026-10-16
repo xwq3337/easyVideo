@@ -2,16 +2,14 @@ import { describe, expect, it } from "vitest";
 import { opLabel, VIDEO_OPS } from "./videoOps";
 
 describe("VIDEO_OPS", () => {
-  it("本轮 ready 的是压缩、转码、裁剪视频", () => {
-    // 这条守卫"不做假按钮"：未实现的必须是 ready: false，界面据此灰显。
-    // 全标成 true 的话，用户点上去不会有任何反应 —— 那个界面比没有入口更糟。
+  it("五项全部 ready —— 侧边栏不该再有任何灰显项", () => {
+    // 这条守卫"不做假按钮"：以前断言的是"只有这三项 ready、另两项不是"，
+    // 现在五项都做完了，所以改成断言"一项灰显都没有"。
+    // **不是删掉它** —— 将来有人加第六个操作，这条会提醒他要么实现要么标灰。
     expect(VIDEO_OPS.filter((o) => o.ready).map((o) => o.op)).toEqual([
-      "compress",
-      "transcode",
-      "trim",
+      "compress", "transcode", "merge", "trim", "crop",
     ]);
-    // 合并与画面裁剪仍留着 —— 各自带一个独立的设计问题（多文件输入、抽帧预览界面）
-    expect(VIDEO_OPS.filter((o) => !o.ready).map((o) => o.op)).toEqual(["merge", "crop"]);
+    expect(VIDEO_OPS.filter((o) => !o.ready)).toEqual([]);
   });
 
   it("五个操作按固定顺序列出，且都有中文名", () => {

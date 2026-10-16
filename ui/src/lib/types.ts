@@ -128,7 +128,12 @@ export interface VideoInfoDto {
   durationSecs: number | null;
   hasVideo: boolean;
   videoCodec: string | null;
+  /** **没有音轨时为 null** —— 合并页要区分"编码不同"与"压根没音轨"。 */
+  audioCodec: string | null;
   container: string | null;
+  /** 画面尺寸。**裁剪页的坐标系就是它**；为 null 时裁剪不可用。 */
+  width: number | null;
+  height: number | null;
   sizeBytes: number;
 }
 
@@ -151,4 +156,14 @@ export type JobParamsDto =
       audioKbps: number | null;
     }
   | { op: "transcode"; target: string; preset: string }
-  | { op: "trim"; startSecs: number; endSecs: number | null; mode: string };
+  | { op: "trim"; startSecs: number; endSecs: number | null; mode: string }
+  /** 合并**没有参数** —— 顺序就是 inputs 的顺序。 */
+  | { op: "merge" }
+  | { op: "crop"; width: number; height: number; x: number; y: number; preset: string };
+
+/** 合并的兼容性结论。**规则只在 core 里一份** —— 前端只负责把它画出来。 */
+export interface MergeCheckDto {
+  /** 非空时禁止提交。 */
+  blockers: string[];
+  warnings: string[];
+}

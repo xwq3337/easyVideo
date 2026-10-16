@@ -6,6 +6,7 @@ import type {
   EventDto,
   JobDto,
   JobParamsDto,
+  MergeCheckDto,
   SettingsDto,
   TaskDto,
   VideoInfoDto,
@@ -38,17 +39,27 @@ export const pickDownloadDir = () => invoke<string | null>("pick_download_dir");
 
 export const getVideoJobs = () => invoke<JobDto[]>("get_video_jobs");
 
-export const addVideoJob = (input: string, outputDir: string, params: JobParamsDto) =>
-  invoke<number>("add_video_job", { input, outputDir, params });
+export const addVideoJob = (inputs: string[], outputDir: string, params: JobParamsDto) =>
+  invoke<number>("add_video_job", { inputs, outputDir, params });
 
 /** 只算产物名给界面预览。**与 addVideoJob 走 core 里同一个取名函数** —— 见 core 的说明。 */
-export const planOutput = (input: string, outputDir: string, params: JobParamsDto) =>
-  invoke<string>("plan_output", { input, outputDir, params });
+export const planOutput = (inputs: string[], outputDir: string, params: JobParamsDto) =>
+  invoke<string>("plan_output", { inputs, outputDir, params });
 
 export const cancelVideoJob = (id: number) => invoke<void>("cancel_video_job", { id });
 export const removeVideoJob = (id: number) => invoke<void>("remove_video_job", { id });
 export const pickVideoFile = () => invoke<string | null>("pick_video_file");
+/** 多选（合并用）。选中的会**追加**到现有列表 —— 用户常分几次挑。 */
+export const pickVideoFiles = () => invoke<string[]>("pick_video_files");
 export const probeVideo = (path: string) => invoke<VideoInfoDto>("probe_video", { path });
+
+/** 合并的兼容性检查。规则只在 core 一处，前端只负责把结果画出来。 */
+export const checkMerge = (inputs: string[]) =>
+  invoke<MergeCheckDto>("check_merge", { inputs });
+
+/** 抽一帧做裁剪预览，返回可直接塞进 `<img src>` 的 data URL。 */
+export const previewFrame = (path: string, atSecs: number) =>
+  invoke<string>("preview_frame", { path, atSecs });
 
 /** 视频任务的事件走**自己的通道名**，所以前端按事件名路由，不必嗅探联合类型的 tag。 */
 export const onVideoOpEvent = (cb: (e: VideoOpEventDto) => void) =>
