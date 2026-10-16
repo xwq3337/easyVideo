@@ -9,7 +9,10 @@ fn src(container: Option<&str>, dur: Option<f64>) -> MediaInfo {
         duration_secs: dur,
         has_video: true,
         video_codec: Some("h264".into()),
+        audio_codec: Some("aac".into()),
         container: container.map(|c| c.to_string()),
+        width: Some(640),
+        height: Some(360),
     }
 }
 fn p(start: f64, end: Option<f64>, mode: TrimMode) -> TrimParams {

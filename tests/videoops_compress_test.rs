@@ -153,7 +153,10 @@ fn src_mp4() -> MediaInfo {
         duration_secs: Some(5.0),
         has_video: true,
         video_codec: Some("h264".to_string()),
+        audio_codec: Some("aac".to_string()),
         container: Some("mp4".to_string()),
+        width: Some(640),
+        height: Some(360),
     }
 }
 

@@ -17,8 +17,14 @@ pub struct MediaInfo {
     pub has_video: bool,
     /// 视频编码，形如 "h264" / "hevc" / "vp9"。取不到时 None。
     pub video_codec: Option<String>,
+    /// 音频编码，形如 "aac" / "opus"。**没有音轨时是 None**（合并的兼容性检查
+    /// 要区分"编码不同"与"压根没有音轨"——后者只是警告，不是拦阻）。
+    pub audio_codec: Option<String>,
     /// 容器，形如 "mp4" / "mkv" / "webm" / "mov"。取不到时 None。
     pub container: Option<String>,
+    /// 画面尺寸。裁剪框的坐标系就是它，取不到时裁剪不可用。
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 /// 从 `Stream #0:0…: Video: h264 (High) …` 里取编码名。
@@ -26,8 +32,19 @@ pub fn parse_video_codec(stderr: &str) -> Option<String> {
     let line = stderr
         .lines()
         .find(|l| l.trim_start().starts_with("Stream #") && l.contains("Video:"))?;
-    let rest = line.split("Video:").nth(1)?.trim();
-    let codec = rest.split_whitespace().next()?.trim();
+    codec_name(line.split("Video:").nth(1)?)
+}
+
+/// 编码名那一段的第一个**词**。
+///
+/// 空白与逗号都算分隔符：实测 `Audio: opus, 48000 Hz, mono, fltp` —— 没有档位括号的
+/// 编码后面**直接跟逗号**，只按空白切会拿到 `"opus,"`。带括号的那些
+/// （`aac (LC)`、`h264 (High)`）恰好侥幸对，所以这个坑只在部分源上露头。
+fn codec_name(rest: &str) -> Option<String> {
+    let codec = rest
+        .trim()
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .next()?;
     (!codec.is_empty()).then(|| codec.to_string())
 }
 
@@ -119,12 +136,51 @@ pub fn parse_has_video(stderr: &str) -> bool {
         .any(|l| l.trim_start().starts_with("Stream #") && l.contains("Video:"))
 }
 
+fn video_stream_line(stderr: &str) -> Option<&str> {
+    stderr
+        .lines()
+        .find(|l| l.trim_start().starts_with("Stream #") && l.contains("Video:"))
+}
+
+/// 从 `Stream #0:1…: Audio: aac (LC) …` 里取音频编码名。没有音轨时 None。
+pub fn parse_audio_codec(stderr: &str) -> Option<String> {
+    let line = stderr
+        .lines()
+        .find(|l| l.trim_start().starts_with("Stream #") && l.contains("Audio:"))?;
+    codec_name(line.split("Audio:").nth(1)?)
+}
+
+/// 从视频流那一行取 `宽x高`。
+///
+/// **两个坑**：`(avc1 / 0x31637661)` 里的十六进制 tag 也含 `x`，靠"两个数都 ≥ 16"
+/// 排除；`SAR 1:1 DAR 16:9` 用的是冒号，天然不命中。
+pub fn parse_dimensions(stderr: &str) -> Option<(u32, u32)> {
+    let line = video_stream_line(stderr)?;
+    for token in line.split(|c: char| c == ',' || c.is_whitespace()) {
+        if let Some((w, h)) = token.split_once('x') {
+            if let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) {
+                if w >= 16 && h >= 16 {
+                    return Some((w, h));
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn parse_media_info(stderr: &str, path: &Path) -> MediaInfo {
+    let (width, height) = match parse_dimensions(stderr) {
+        Some((w, h)) => (Some(w), Some(h)),
+        None => (None, None),
+    };
     MediaInfo {
         duration_secs: parse_duration(stderr),
         has_video: parse_has_video(stderr),
         video_codec: parse_video_codec(stderr),
+        audio_codec: parse_audio_codec(stderr),
         container: parse_container(stderr, path),
+        width,
+        height,
     }
 }
 

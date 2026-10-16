@@ -67,7 +67,11 @@ fn one_pass_yields_everything_we_need() {
             duration_secs: Some(5.0),
             has_video: true,
             video_codec: Some("h264".to_string()),
+            // 那段 stderr 里没有音轨行 —— 没有音轨就是 None，不是空串
+            audio_codec: None,
             container: Some("mp4".to_string()),
+            width: Some(640),
+            height: Some(360),
         }
     );
 }
@@ -122,4 +126,65 @@ fn maps_container_to_muxer_and_extension() {
     assert_eq!(container_muxer("mp4"), Some(("mp4", "mp4")));
     assert_eq!(container_muxer("mov"), Some(("mov", "mov")));
     assert_eq!(container_muxer("nope"), None);
+}
+
+// ===== 画面尺寸与音频编码：合并要逐段比编码，裁剪的坐标系就是宽高 =====
+
+use easydownvideo::core::videoops::media_info::{parse_audio_codec, parse_dimensions};
+
+/// 真实输出（ffmpeg 9.0.2）。
+#[test]
+fn parses_audio_codec() {
+    let stderr = "  Stream #0:1[0x2](und): Audio: aac (LC) (mp4a / 0x6134706D), 44100 Hz, stereo";
+    assert_eq!(parse_audio_codec(stderr).as_deref(), Some("aac"));
+    let opus = "  Stream #0:1(und): Audio: opus, 48000 Hz, stereo";
+    assert_eq!(parse_audio_codec(opus).as_deref(), Some("opus"));
+    // 没有音轨
+    assert_eq!(parse_audio_codec("  Stream #0:0(und): Video: h264, yuv420p, 640x360"), None);
+}
+
+/// **编码名后面粘着逗号时要切干净。**
+///
+/// 实测（ffmpeg 9.0.2）：`Audio: opus, 48000 Hz, mono, fltp` —— 没有档位括号的编码
+/// 后面**直接跟逗号**，`split_whitespace().next()` 会拿到 `"opus,"`。带括号的
+/// 那些（`aac (LC)`、`h264 (High)`）恰好侥幸对，所以这个坑只在部分源上露头。
+#[test]
+fn codec_names_do_not_keep_the_trailing_comma() {
+    // 视频侧同样：profile 认不出来时 ffmpeg 不打括号
+    assert_eq!(
+        parse_video_codec("  Stream #0:0(und): Video: h264, yuv420p, 640x360, 30 fps")
+            .as_deref(),
+        Some("h264")
+    );
+    assert_eq!(parse_audio_codec("  Stream #0:1: Audio: opus, 48000 Hz, mono, fltp").as_deref(),
+               Some("opus"));
+}
+
+/// 尺寸是那一行里第一个像 `宽x高` 的东西。
+/// **两个坑**：`(avc1 / 0x31637661)` 里的十六进制 tag 也含 `x`，`SAR 1:1 DAR 16:9`
+/// 里是冒号不是 `x`。前者靠"两个数都必须 ≥ 16"排除，后者天然不会命中。
+#[test]
+fn parses_frame_dimensions() {
+    let real = "  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), \
+                yuv420p(progressive), 1920x1080 [SAR 1:1 DAR 16:9], 30 fps";
+    assert_eq!(parse_dimensions(real), Some((1920, 1080)));
+    // 小尺寸也要认得出来（≥16 就算数）
+    assert_eq!(parse_dimensions("  Stream #0:0: Video: h264, yuv420p, 320x240"), Some((320, 240)));
+    // 没有视频流
+    assert_eq!(parse_dimensions("  Stream #0:0(und): Audio: aac, 44100 Hz"), None);
+    // 只有那个十六进制 tag，没有真尺寸 → 不能被它骗到
+    assert_eq!(parse_dimensions("  Stream #0:0: Video: h264 (avc1 / 0x31637661)"), None);
+}
+
+/// 一次 `ffmpeg -i` 把四样都拿到：时长、有没有视频、编码、容器、尺寸。
+#[test]
+fn one_pass_yields_dimensions_and_audio_codec_too() {
+    let stderr = "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'x.mp4':\n\
+  Duration: 00:00:30.00, start: 0.000000, bitrate: 55 kb/s\n\
+  Stream #0:0[0x1](und): Video: h264 (High), yuv420p, 1280x720, 30 fps\n\
+  Stream #0:1[0x2](und): Audio: aac (LC), 44100 Hz, stereo";
+    let m = parse_media_info(stderr, Path::new("/a/x.mp4"));
+    assert_eq!(m.width, Some(1280));
+    assert_eq!(m.height, Some(720));
+    assert_eq!(m.audio_codec.as_deref(), Some("aac"));
 }
