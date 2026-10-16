@@ -2,6 +2,9 @@ use std::path::{Path, PathBuf};
 
 use crate::core::videoops::compress::{compress_args, preset_label, CompressParams};
 use crate::core::videoops::media_info::MediaInfo;
+use crate::core::videoops::transcode::{
+    target_extension, target_label, transcode_args, TranscodeParams,
+};
 
 /// 临时产物名。**唯一的产出方式** —— 每个操作的 `args` 把它交给 ffmpeg，
 /// `ffmpeg_job::run_job` 用它做失败清理与成功改名。三处各写一遍 `format!`
@@ -17,6 +20,7 @@ pub fn part_path_for(output: &Path) -> PathBuf {
 #[derive(Clone, Debug, PartialEq)]
 pub enum JobParams {
     Compress(CompressParams),
+    Transcode(TranscodeParams),
 }
 
 impl JobParams {
@@ -24,6 +28,8 @@ impl JobParams {
     pub fn label(&self) -> String {
         match self {
             JobParams::Compress(p) => format!("压缩 · {}", preset_label(p.preset)),
+            // 转码的标签是目标格式（用户选的就是它），不带档位 —— 带上了会太长
+            JobParams::Transcode(p) => format!("转码 · {}", target_label(p.target)),
         }
     }
 
@@ -31,6 +37,7 @@ impl JobParams {
     pub fn suffix(&self) -> &'static str {
         match self {
             JobParams::Compress(_) => "-压缩",
+            JobParams::Transcode(_) => "-转码",
         }
     }
 
@@ -38,6 +45,8 @@ impl JobParams {
     pub fn extension(&self, _src: &MediaInfo) -> String {
         match self {
             JobParams::Compress(_) => "mp4".to_string(),
+            // 转码的扩展名由目标格式决定，与源无关
+            JobParams::Transcode(p) => target_extension(p.target).to_string(),
         }
     }
 
@@ -48,6 +57,7 @@ impl JobParams {
     pub fn args(&self, input: &Path, output: &Path, _src: &MediaInfo) -> Vec<String> {
         match self {
             JobParams::Compress(p) => compress_args(input, output, p),
+            JobParams::Transcode(p) => transcode_args(input, output, p),
         }
     }
 
@@ -59,6 +69,8 @@ impl JobParams {
     pub fn validate(&self, _src: &MediaInfo) -> anyhow::Result<()> {
         match self {
             JobParams::Compress(_) => Ok(()),
+            // 目标格式是整组打包的，不存在"参数矛盾"这回事
+            JobParams::Transcode(_) => Ok(()),
         }
     }
 }
