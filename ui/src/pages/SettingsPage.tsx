@@ -6,6 +6,13 @@ import { readThemeMode, setThemeMode, type ThemeMode } from "../lib/theme";
 import { clampInt } from "../lib/clampInt";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 const SEGMENT_CONCURRENCY = { min: 1, max: 16 } as const;
@@ -16,6 +23,9 @@ const MAX_ACTIVE_TASKS = { min: 1, max: 8 } as const;
  * 真正的闸在 core（`sanitize_browser`）。前端漏掉一个只是选项少一个，
  * 前端多出一个才会被 core 静默丢掉。
  */
+/** 「不读取」的哨兵值。radix 不允许 SelectItem 的 value 为空串。 */
+const NO_BROWSER = "__none__";
+
 const BROWSERS = [
   { value: "chrome", label: "Chrome" },
   { value: "firefox", label: "Firefox" },
@@ -194,20 +204,26 @@ export default function SettingsPage() {
           以及让请求看着像浏览器。摆在 yt-dlp 开关旁边是因为三者是一件事。 */}
       <label className="block mb-5">
         <span style={{ color: "var(--fg-muted)" }}>读取 cookie 的浏览器</span>
-        <select
-          className="w-48 mt-1.5 h-8 rounded-lg border px-2 text-[13px] outline-none bg-[var(--bg-inset)] border-[var(--line-strong)] text-[var(--fg)]"
-          value={draft.cookiesFromBrowser ?? ""}
-          onChange={(e) =>
-            setDraft((p) => (p ? { ...p, cookiesFromBrowser: e.target.value || null } : p))
+        {/* radix 的 SelectItem **不接受空字符串** value（会直接抛错），
+            所以"不读取"用一个哨兵值，落到 draft 里再转回 null。 */}
+        <Select
+          value={draft.cookiesFromBrowser ?? NO_BROWSER}
+          onValueChange={(v) =>
+            setDraft((p) => (p ? { ...p, cookiesFromBrowser: v === NO_BROWSER ? null : v } : p))
           }
         >
-          <option value="">不读取</option>
-          {BROWSERS.map((b) => (
-            <option key={b.value} value={b.value}>
-              {b.label}
-            </option>
-          ))}
-        </select>
+          <SelectTrigger className="w-48 mt-1.5">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={NO_BROWSER}>不读取</SelectItem>
+            {BROWSERS.map((b) => (
+              <SelectItem key={b.value} value={b.value}>
+                {b.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
         <span className="block text-[12px]" style={{ color: "var(--fg-faint)" }}>
           遇到"登录才能看""请先验证"的站点时选它。首次读取系统会要求授权。
         </span>

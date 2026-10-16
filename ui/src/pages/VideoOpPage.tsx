@@ -1,6 +1,13 @@
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import JobList from "../components/JobList";
 import * as ipc from "../lib/ipc";
 import { formatSize } from "../lib/format";
@@ -163,17 +170,18 @@ export default function VideoOpPage({ op }: { op: VideoOp }) {
         <div className="mb-5 pl-3 border-l" style={{ borderColor: "var(--line)" }}>
           <label className="block mb-4">
             <span style={{ color: "var(--fg-muted)" }}>编码器</span>
-            <select
-              className="w-48 mt-1.5 h-8 rounded-lg border px-2 text-[13px] bg-[var(--bg-inset)] border-[var(--line-strong)] text-[var(--fg)]"
-              value={encoder}
-              onChange={(e) => setEncoder(e.target.value)}
-            >
-              {ENCODERS.map((x) => (
-                <option key={x.value} value={x.value}>
-                  {x.label}
-                </option>
-              ))}
-            </select>
+            <Select value={encoder} onValueChange={setEncoder}>
+              <SelectTrigger className="w-48 mt-1.5">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {ENCODERS.map((x) => (
+                  <SelectItem key={x.value} value={x.value}>
+                    {x.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
             <span className="block text-[12px]" style={{ color: "var(--fg-faint)" }}>
               「自动」用软件编码：同档位体积最小。硬件快得多，但同档位体积更大。
             </span>
@@ -181,17 +189,19 @@ export default function VideoOpPage({ op }: { op: VideoOp }) {
 
           <label className="block mb-4">
             <span style={{ color: "var(--fg-muted)" }}>分辨率</span>
-            <select
-              className="w-48 mt-1.5 h-8 rounded-lg border px-2 text-[13px] bg-[var(--bg-inset)] border-[var(--line-strong)] text-[var(--fg)]"
-              value={maxHeight}
-              onChange={(e) => setMaxHeight(Number(e.target.value))}
-            >
-              {HEIGHTS.map((x) => (
-                <option key={x.value} value={x.value}>
-                  {x.label}
-                </option>
-              ))}
-            </select>
+            {/* radix 的 Select 只认字符串值，所以这里转一道 */}
+            <Select value={String(maxHeight)} onValueChange={(v) => setMaxHeight(Number(v))}>
+              <SelectTrigger className="w-48 mt-1.5">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {HEIGHTS.map((x) => (
+                  <SelectItem key={x.value} value={String(x.value)}>
+                    {x.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </label>
 
           {/* 质量微调只在软件编码下出现：硬件根本不看 CRF，显示出来就是误导。
