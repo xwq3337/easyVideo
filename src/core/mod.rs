@@ -6,3 +6,4 @@ pub mod hls;
 pub mod probe;
 pub mod task;
 pub mod ytdlp;
+pub mod videoops;

@@ -1,0 +1,121 @@
+use easydownvideo::core::videoops::presets::{
+    compress_args, preset_defaults, CompressParams, CompressPreset, Encoder,
+};
+use std::path::Path;
+
+fn p(preset: CompressPreset, encoder: Encoder) -> CompressParams {
+    CompressParams { preset, encoder, max_height: None, crf: None, qv: None, audio_kbps: None }
+}
+
+fn run(params: &CompressParams) -> Vec<String> {
+    compress_args(Path::new("/in/a.mp4"), Path::new("/out/a-压缩.mp4"), params)
+}
+
+fn has(args: &[String], needle: &str) -> bool {
+    args.iter().any(|a| a == needle)
+}
+
+/// 硬件编码器**静默忽略** `-crf`（实测：crf 18 与 crf 40 逐字节相同）。
+/// 所以这不是"风格偏好"，而是正确性：选硬件时必须出现 `-q:v` 且绝不能出现 `-crf`。
+#[test]
+fn hardware_uses_qv_and_never_crf() {
+    let args = run(&p(CompressPreset::Balanced, Encoder::Hardware));
+    assert!(has(&args, "-q:v"), "硬件编码必须用 -q:v，实际: {args:?}");
+    assert!(
+        !has(&args, "-crf"),
+        "硬件编码绝不能带 -crf —— VideoToolbox 会静默忽略它，\
+         用户会拿到比源文件还大的产物且全程不报错。实际: {args:?}"
+    );
+    assert!(has(&args, "h264_videotoolbox"));
+}
+
+#[test]
+fn software_uses_crf_and_never_qv() {
+    let args = run(&p(CompressPreset::Balanced, Encoder::Software));
+    assert!(has(&args, "-crf"));
+    assert!(!has(&args, "-q:v"), "软件编码不该出现 -q:v。实际: {args:?}");
+    assert!(has(&args, "libx264"));
+}
+
+/// 三档的数值必须真的不同，否则档位是个摆设。
+#[test]
+fn presets_differ_in_both_scales() {
+    let small = preset_defaults(CompressPreset::Small);
+    let balanced = preset_defaults(CompressPreset::Balanced);
+    let high = preset_defaults(CompressPreset::High);
+    // CRF 越小越清晰
+    assert!(small.0 > balanced.0 && balanced.0 > high.0, "CRF 应递减: {small:?} {balanced:?} {high:?}");
+    // -q:v 越大越清晰 —— 方向与 CRF 相反，这是最容易写反的一处
+    assert!(small.1 < balanced.1 && balanced.1 < high.1, "q:v 应递增: {small:?} {balanced:?} {high:?}");
+    assert!(small.2 < balanced.2 && balanced.2 < high.2, "音频码率应递增");
+}
+
+/// 高级项留空时一律取预设自带的值。
+#[test]
+fn advanced_fields_fall_back_to_the_preset() {
+    let (crf, _qv, kbps) = preset_defaults(CompressPreset::High);
+    let args = run(&p(CompressPreset::High, Encoder::Software));
+    let crf_at = args.iter().position(|a| a == "-crf").expect("有 -crf");
+    assert_eq!(args[crf_at + 1], crf.to_string());
+    let a_at = args.iter().position(|a| a == "-b:a").expect("有 -b:a");
+    assert_eq!(args[a_at + 1], format!("{kbps}k"));
+    // 显式给了值就以给的为准
+    let mut adv = p(CompressPreset::High, Encoder::Software);
+    adv.crf = Some(31);
+    let args = run(&adv);
+    let crf_at = args.iter().position(|a| a == "-crf").unwrap();
+    assert_eq!(args[crf_at + 1], "31");
+}
+
+#[test]
+fn max_height_adds_a_scale_filter_keeping_aspect() {
+    let mut params = p(CompressPreset::Balanced, Encoder::Software);
+    params.max_height = Some(720);
+    let args = run(&params);
+    let vf = args.iter().position(|a| a == "-vf").expect("限制分辨率时要加 -vf");
+    // -2 让宽度按比例自动算并取偶数：写成固定宽度会拉伸画面，写成奇数某些编码器会直接失败
+    assert_eq!(args[vf + 1], "scale=-2:720");
+    // 不限制时不该出现 -vf（多余的滤镜会多一次无谓的拷贝）
+    assert!(!has(&run(&p(CompressPreset::Balanced, Encoder::Software)), "-vf"));
+}
+
+/// 「自动」= 软件 x264：体积画质比最好且可预测。默认走硬件等于默认降质。
+#[test]
+fn auto_means_software_x264() {
+    assert_eq!(run(&p(CompressPreset::Balanced, Encoder::Auto)), run(&p(CompressPreset::Balanced, Encoder::Software)));
+}
+
+/// **源文件绝不能被覆盖。** 输出目录被设成源文件所在目录时，用户点两下就撞上了。
+#[test]
+fn refuses_to_overwrite_the_source_file() {
+    let args = compress_args(
+        Path::new("/in/a.mp4"),
+        Path::new("/in/a.mp4"),
+        &p(CompressPreset::Balanced, Encoder::Software),
+    );
+    // 输入与输出同名时，输出必须以 .part 临时名收尾（由调用方在成功后改名），
+    // 且**不得**在输入文件身上动刀。这条靠"输出不是输入"来保证。
+    let last = args.last().unwrap();
+    assert_ne!(last, "/in/a.mp4");
+    assert!(last.ends_with(".part"), "产物应先写临时名，实际: {last}");
+}
+
+#[test]
+fn shape_is_container_agnostic_and_never_touches_stdin() {
+    let args = run(&p(CompressPreset::Balanced, Encoder::Software));
+    assert!(has(&args, "-nostdin"), "不阻断 stdin 的话 ffmpeg 会去读它并可能挂住");
+    assert!(has(&args, "-hide_banner"));
+    assert!(has(&args, "-y"));
+    assert!(has(&args, "-progress"), "-progress 是进度的唯一来源");
+    // 最后一个参数必须是输出路径
+    assert!(args.last().unwrap().ends_with(".mp4.part"));
+}
+
+#[test]
+fn preset_and_encoder_parse_from_the_wire_strings() {
+    assert_eq!("small".parse::<CompressPreset>().unwrap(), CompressPreset::Small);
+    assert_eq!("high".parse::<CompressPreset>().unwrap(), CompressPreset::High);
+    assert!("huge".parse::<CompressPreset>().is_err());
+    assert_eq!("hardware".parse::<Encoder>().unwrap(), Encoder::Hardware);
+    assert!("cuda".parse::<Encoder>().is_err());
+}
