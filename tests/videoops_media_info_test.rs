@@ -56,11 +56,70 @@ fn detects_a_video_stream() {
 
 /// 一次 `ffmpeg -i` 同时给出时长与有没有视频流 —— 只跑一遍，不是两遍。
 #[test]
-fn one_pass_yields_both_duration_and_video_presence() {
-    let stderr = "  Duration: 00:00:05.00, start: 0.000000, bitrate: 55 kb/s\n\
+fn one_pass_yields_everything_we_need() {
+    // 一次 `ffmpeg -i` 同时给出时长、有没有视频流、编码、容器 —— 不跑第二遍
+    let stderr = "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'x.mp4':\n\
+  Duration: 00:00:05.00, start: 0.000000, bitrate: 55 kb/s\n\
   Stream #0:0[0x1](und): Video: h264 (High), yuv420p, 640x360";
-    assert_eq!(parse_media_info(stderr), easydownvideo::core::videoops::media_info::MediaInfo {
-        duration_secs: Some(5.0),
-        has_video: true,
-    });
+    assert_eq!(
+        parse_media_info(stderr, Path::new("/a/x.mp4")),
+        easydownvideo::core::videoops::media_info::MediaInfo {
+            duration_secs: Some(5.0),
+            has_video: true,
+            video_codec: Some("h264".to_string()),
+            container: Some("mp4".to_string()),
+        }
+    );
+}
+
+// ===== 容器与视频编码：转码页要靠它们显示"源：H.264 · mp4" =====
+
+use easydownvideo::core::videoops::media_info::{
+    container_muxer, parse_container, parse_video_codec,
+};
+use std::path::Path;
+
+/// 真实输出（ffmpeg 9.0.2 实测）。
+#[test]
+fn parses_video_codec_from_the_stream_line() {
+    let stderr = "\
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'x.mp4':
+  Duration: 00:00:30.00, start: 0.000000, bitrate: 55 kb/s
+  Stream #0:0[0x1](und): Video: h264 (High) (avc1), yuv420p, 640x360, 30 fps
+";
+    assert_eq!(parse_video_codec(stderr).as_deref(), Some("h264"));
+    let hevc = "  Stream #0:0(und): Video: hevc (Main) (hev1), yuv420p, 1920x1080";
+    assert_eq!(parse_video_codec(hevc).as_deref(), Some("hevc"));
+    // 纯音频：没有 Video: 行
+    let audio = "  Stream #0:0(und): Audio: aac (LC), 44100 Hz, stereo";
+    assert_eq!(parse_video_codec(audio), None);
+}
+
+/// **mkv 与 webm 在 ffmpeg 眼里是同一个 demuxer**（`matroska,webm`），
+/// 光靠 stderr 分不开 —— 只能看扩展名定夺。
+#[test]
+fn parses_container_and_disambiguates_mkv_from_webm() {
+    let mp4 = "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'x.mp4':";
+    assert_eq!(parse_container(mp4, Path::new("/a/x.mp4")).as_deref(), Some("mp4"));
+    assert_eq!(parse_container(mp4, Path::new("/a/x.mov")).as_deref(), Some("mov"));
+
+    let matroska = "Input #0, matroska,webm, from 'x.mkv':";
+    assert_eq!(parse_container(matroska, Path::new("/a/x.mkv")).as_deref(), Some("mkv"));
+    assert_eq!(parse_container(matroska, Path::new("/a/x.webm")).as_deref(), Some("webm"));
+
+    // 认不出来时 None，不编一个
+    let odd = "Input #0, mpegts, from 'x.ts':";
+    assert_eq!(parse_container(odd, Path::new("/a/x.ts")), None);
+    assert_eq!(parse_container("no input line at all", Path::new("/a/x.mp4")), None);
+}
+
+#[test]
+fn maps_container_to_muxer_and_extension() {
+    // **muxer 名与扩展名不是同一个词** —— mkv 的 muxer 叫 matroska。
+    // 写成 -f mkv 会直接失败。
+    assert_eq!(container_muxer("mkv"), Some(("matroska", "mkv")));
+    assert_eq!(container_muxer("webm"), Some(("webm", "webm")));
+    assert_eq!(container_muxer("mp4"), Some(("mp4", "mp4")));
+    assert_eq!(container_muxer("mov"), Some(("mov", "mov")));
+    assert_eq!(container_muxer("nope"), None);
 }

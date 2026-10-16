@@ -148,7 +148,13 @@ use easydownvideo::core::videoops::media_info::MediaInfo;
 use easydownvideo::core::videoops::params::JobParams;
 
 fn src_mp4() -> MediaInfo {
-    MediaInfo { duration_secs: Some(5.0), has_video: true }
+    // 文件大小**不在** MediaInfo 里（它在命令层，是纯文件系统的事）
+    MediaInfo {
+        duration_secs: Some(5.0),
+        has_video: true,
+        video_codec: Some("h264".to_string()),
+        container: Some("mp4".to_string()),
+    }
 }
 
 /// 同一组参数的一个副本。故意重复构造而不是共享一个可变值 ——
