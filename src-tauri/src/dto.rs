@@ -849,6 +849,8 @@ mod tests {
             output: std::path::PathBuf::from("/out/a-压缩.mp4"),
             state: JobState::Running,
             progress: Some(0.5),
+            // JobDto 不带 duration（界面不用它），但快照构造要齐全
+            duration: Some(8.0),
         });
         assert_eq!(
             serde_json::to_value(&j).unwrap(),
@@ -869,6 +871,7 @@ mod tests {
             output: "/out/b-压缩.mp4".into(),
             state: JobState::Queued,
             progress: None,
+            duration: None,
         });
         let v = serde_json::to_value(&j).unwrap();
         assert_eq!(v["progress"], serde_json::Value::Null);

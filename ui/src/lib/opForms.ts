@@ -158,3 +158,24 @@ export function moveDown<T>(list: readonly T[], i: number): T[] {
   if (i >= 0 && i < out.length - 1) [out[i], out[i + 1]] = [out[i + 1], out[i]];
   return out;
 }
+
+/**
+ * 把「已选文件 + 它的媒体信息」重新对齐到一组**新**的路径。
+ *
+ * 按**路径**找回信息，而不是按下标。上下移、删一项、同一个文件选两次都能对上 ——
+ * 而按下标对齐时，删掉第 2 个之后剩下的两行会分别顶着原第 1、2 个的编码与尺寸，
+ * 也就是**第 3 个文件顶着第 2 个文件的信息**。这个页面唯一的任务就是让用户按看到
+ * 的信息定拼接顺序，而看到的信息是错的。
+ *
+ * 探测失败的那一项**保留 `null`** 而不是被过滤掉 —— `got.filter(...)` 那种写法会让
+ * 后面所有行整体前移，是同一个错位的第二个入口。
+ */
+export function realignPicks<T>(
+  prev: ReadonlyArray<{ path: string; info: T | null }>,
+  next: readonly string[]
+): Array<{ path: string; info: T | null }> {
+  return next.map((path) => {
+    const hit = prev.find((p) => p.path === path);
+    return { path, info: hit ? hit.info : null };
+  });
+}

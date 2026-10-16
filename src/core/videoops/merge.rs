@@ -41,6 +41,18 @@ pub fn check(infos: &[MediaInfo]) -> MergeCheck {
     let Some(first) = infos.first() else { return c };
     let name = |o: &Option<String>| o.clone().unwrap_or_else(|| "未知".to_string());
 
+    // 音频编码的基准是**第一段有音轨的**，不是第 1 段。
+    //
+    // spec §5.2 的原话是"只比**有音轨的那些段之间**"。拿第 1 段当基准的话，
+    // 第 1 段没音轨时（那本来就是合法的、只该出警告的情况）这条规则**整条失效**：
+    // [无音轨, aac, mp3] 会一条都不拦，`-c copy` 拼出一个混合音轨的文件 ——
+    // 而那正是这一节特意要拦住的"编码不一致"。
+    let audio_ref = infos
+        .iter()
+        .enumerate()
+        .find(|(_, m)| m.audio_codec.is_some())
+        .map(|(i, m)| (i + 1, m.audio_codec.clone().unwrap_or_default()));
+
     for (i, m) in infos.iter().enumerate().skip(1) {
         let n = i + 1;
         if m.video_codec != first.video_codec {
@@ -52,11 +64,9 @@ pub fn check(infos: &[MediaInfo]) -> MergeCheck {
         }
         // **只比有音轨的那些段之间**：一段压根没有音轨不算"编码不一致"
         // （实测那种情况能拼，只是音轨是断的 → 那是警告）
-        if let (Some(a), Some(b)) = (&m.audio_codec, &first.audio_codec) {
-            if a != b {
-                c.blockers.push(format!(
-                    "第 {n} 段的音频编码是 {a}，与第 1 段（{b}）不一致"
-                ));
+        if let (Some(a), Some((r, r_codec))) = (&m.audio_codec, &audio_ref) {
+            if a != r_codec {
+                c.blockers.push(format!("第 {n} 段的音频编码是 {a}，与第 {r} 段（{r_codec}）不一致"));
             }
         }
         if m.audio_codec.is_some() != first.audio_codec.is_some() {
@@ -71,6 +81,22 @@ pub fn check(infos: &[MediaInfo]) -> MergeCheck {
                 first.width.unwrap_or(0),
                 first.height.unwrap_or(0)
             ));
+        }
+        // 帧率不同：实测 30 + 25 拼出来接缝处 2 行解码错误（画面一跳）。
+        // 读不出来时不比 —— 不拿"未知"去跟一个已知值比。
+        if let (Some(a), Some(b)) = (m.fps, first.fps) {
+            if (a - b).abs() > 0.01 {
+                c.warnings.push(format!("第 {n} 段的帧率（{a}）与第 1 段（{b}）不同，接缝处会一跳"));
+            }
+        }
+        // 音频参数不同：实测拼出来 0 解码错误，但总时长偏 +0.36 秒。
+        // 只在**两段都有音轨**时比 —— 缺音轨是上面那条警告的事，别重复说一遍。
+        if let (Some(a), Some(b)) = (&m.audio_params, &first.audio_params) {
+            if a != b {
+                c.warnings.push(format!(
+                    "第 {n} 段的音频参数（{a}，即 采样率:声道）与第 1 段（{b}）不同，总时长可能略有出入"
+                ));
+            }
         }
     }
     c

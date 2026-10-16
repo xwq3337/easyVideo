@@ -6,6 +6,7 @@ import {
   moveDown,
   moveUp,
   planKey,
+  realignPicks,
   trimFormReduce,
   trimParamsOf,
 } from "./opForms";
@@ -60,6 +61,52 @@ describe("moveUp / moveDown", () => {
     expect(moveUp(xs, 0)).toEqual(["a", "b", "c"]);
     expect(moveDown(xs, 2)).toEqual(["a", "b", "c"]);
     expect(moveUp(xs, 0)).not.toBe(xs);
+  });
+});
+
+describe("realignPicks", () => {
+  const prev = [
+    { path: "/a.mp4", info: "信息A" },
+    { path: "/b.mp4", info: "信息B" },
+    { path: "/c.mp4", info: "信息C" },
+  ];
+
+  it("按**路径**找回信息 —— 调顺序、删一项都不会错位", () => {
+    // 按下标对齐的话，删掉第 2 个之后剩下的两行会分别顶着「信息A」和「信息B」，
+    // 也就是第 3 个文件顶着第 2 个文件的编码与尺寸。而这个页面唯一的任务就是
+    // 让用户按看到的信息定顺序 —— 看到的信息是错的，比不显示更坏。
+    expect(realignPicks(prev, ["/a.mp4", "/c.mp4"])).toEqual([
+      { path: "/a.mp4", info: "信息A" },
+      { path: "/c.mp4", info: "信息C" },
+    ]);
+    expect(realignPicks(prev, ["/c.mp4", "/b.mp4", "/a.mp4"])).toEqual([
+      { path: "/c.mp4", info: "信息C" },
+      { path: "/b.mp4", info: "信息B" },
+      { path: "/a.mp4", info: "信息A" },
+    ]);
+  });
+
+  it("追加没见过的路径 → 信息为 null（界面显示「读取中…」）", () => {
+    expect(realignPicks(prev, ["/a.mp4", "/新.mp4"])).toEqual([
+      { path: "/a.mp4", info: "信息A" },
+      { path: "/新.mp4", info: null },
+    ]);
+  });
+
+  it("同一个文件选两次：两条都能拿到信息（「合」的意思就是把它重复一遍）", () => {
+    expect(realignPicks(prev, ["/a.mp4", "/a.mp4"])).toEqual([
+      { path: "/a.mp4", info: "信息A" },
+      { path: "/a.mp4", info: "信息A" },
+    ]);
+  });
+
+  it("探测失败留下的 null **原地保留** —— 不能把它过滤掉，否则后面的整体前移", () => {
+    const withHole = [
+      { path: "/a.mp4", info: "信息A" },
+      { path: "/b.mp4", info: null },
+      { path: "/c.mp4", info: "信息C" },
+    ];
+    expect(realignPicks(withHole, ["/a.mp4", "/b.mp4", "/c.mp4"])).toEqual(withHole);
   });
 });
 

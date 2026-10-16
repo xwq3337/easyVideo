@@ -5,7 +5,7 @@ import JobList from "../../components/JobList";
 import * as ipc from "../../lib/ipc";
 import { formatSize } from "../../lib/format";
 import { formatTimecode } from "../../lib/timecode";
-import { planKey } from "../../lib/opForms";
+import { planKey, realignPicks } from "../../lib/opForms";
 import { run, useSettings } from "../../store/store";
 import type { JobParamsDto, VideoInfoDto } from "../../lib/types";
 import { opLabel, type VideoOp } from "../../lib/videoOps";
@@ -13,10 +13,18 @@ import { opLabel, type VideoOp } from "../../lib/videoOps";
 /** 表单拿到的东西：已选的文件、它们的媒体信息，以及改这个列表的入口。 */
 export interface OpSource {
   inputs: string[];
-  /** 与 `inputs` 一一对应。还没探完时可能比 `inputs` 短。 */
-  infos: VideoInfoDto[];
+  /**
+   * 与 `inputs` **逐位对应** —— 还没探完或探测失败时是 `null`，**绝不过滤**。
+   * 过滤掉会把后面所有行的信息整体前移，而这一页唯一的任务就是让用户按看到的
+   * 信息定顺序。
+   */
+  infos: (VideoInfoDto | null)[];
+  /** 整组替换。**按路径找回已有信息** —— 调顺序、删一项都不会错位。 */
   setInputs: (next: string[]) => void;
 }
+
+/** 一个已选文件与它的媒体信息。两者必须一起走，分开存必然错位。 */
+type Pick = { path: string; info: VideoInfoDto | null };
 
 /**
  * 各操作页共用的外框：选文件 / 源信息 / 输出目录 / 产物名预览 / 开始按钮 / 任务列表。
@@ -43,8 +51,7 @@ export default function VideoOpShell({
   children: (src: OpSource) => ReactNode;
 }) {
   const settings = useSettings();
-  const [inputs, setInputs] = useState<string[]>([]);
-  const [infos, setInfos] = useState<VideoInfoDto[]>([]);
+  const [sel, setSel] = useState<Pick[]>([]);
   const [outputDir, setOutputDir] = useState<string | null>(null);
   const [planned, setPlanned] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -56,9 +63,34 @@ export default function VideoOpShell({
     if (settings && outputDir === null) setOutputDir(settings.downloadDir);
   }, [settings, outputDir]);
 
+  const inputs = sel.map((s) => s.path);
+  const infos = sel.map((s) => s.info);
+
+  /** 整组替换：**按路径**保留已有信息，只探缺的那些。 */
+  async function apply(next: string[]) {
+    const aligned = realignPicks(sel, next);
+    setSel(aligned);
+    setPlanned(null);
+
+    const missing = aligned.filter((p) => p.info === null);
+    if (missing.length === 0) return;
+    const probed = new Map<string, VideoInfoDto>();
+    await Promise.all(
+      missing.map(async (p) => {
+        const i = await run(ipc.probeVideo(p.path));
+        if (i) probed.set(p.path, i);
+      })
+    );
+    // 只补信息，**不动顺序** —— 探测期间用户可能又改了列表
+    setSel((cur) =>
+      cur.map((p) =>
+        p.info === null && probed.has(p.path) ? { path: p.path, info: probed.get(p.path)! } : p
+      )
+    );
+  }
+
   function reset() {
-    setInputs([]);
-    setInfos([]);
+    setSel([]);
     setPlanned(null);
   }
 
@@ -66,23 +98,14 @@ export default function VideoOpShell({
   async function pickOne() {
     const p = await run(ipc.pickVideoFile());
     if (!p) return;
-    setInputs([p]);
-    setInfos([]);
-    setPlanned(null);
-    const i = await run(ipc.probeVideo(p));
-    if (i) setInfos([i]);
+    await apply([p]);
   }
 
   /** 合并：多选，**追加**到现有列表。 */
   async function pickMany() {
     const ps = await run(ipc.pickVideoFiles());
     if (!ps || ps.length === 0) return;
-    const next = [...inputs, ...ps];
-    setInputs(next);
-    setInfos([]);
-    setPlanned(null);
-    const got = await Promise.all(next.map((p) => run(ipc.probeVideo(p))));
-    setInfos(got.filter((x): x is VideoInfoDto => x !== undefined));
+    await apply([...inputs, ...ps]);
   }
 
   // **只在影响产物名的东西变化时重算** —— 键的构成在 `planKey` 里，并配有测试。
@@ -121,20 +144,19 @@ export default function VideoOpShell({
     }
   }
 
+  const one = infos[0] ?? null;
   const srcLine =
     inputs.length === 0
       ? null
-      : infos.length > 0
-        ? multi
-          ? `已选 ${inputs.length} 个文件 · 共 ${formatSize(
-              infos.reduce((n, i) => n + i.sizeBytes, 0)
-            )}`
-          : `源文件 ${formatSize(infos[0].sizeBytes)} · ${
-              infos[0].durationSecs != null
-                ? formatTimecode(infos[0].durationSecs)
-                : "时长未知"
-            } · ${infos[0].videoCodec ?? "编码未知"} · ${infos[0].container ?? "容器未知"}`
-        : null;
+      : multi
+        ? `已选 ${inputs.length} 个文件 · 共 ${formatSize(
+            infos.reduce((n, i) => n + (i?.sizeBytes ?? 0), 0)
+          )}`
+        : one
+          ? `源文件 ${formatSize(one.sizeBytes)} · ${
+              one.durationSecs != null ? formatTimecode(one.durationSecs) : "时长未知"
+            } · ${one.videoCodec ?? "编码未知"} · ${one.container ?? "容器未知"}`
+          : null;
 
   return (
     <>
@@ -161,11 +183,11 @@ export default function VideoOpShell({
       {srcLine && (
         <p className="text-[12px] mb-4" style={{ color: "var(--fg-muted)" }}>
           {srcLine}
-          {!multi && infos[0] && !infos[0].hasVideo && " · 这个文件里没有视频流"}
+          {!multi && one && !one.hasVideo && " · 这个文件里没有视频流"}
         </p>
       )}
 
-      {children({ inputs, infos, setInputs })}
+      {children({ inputs, infos, setInputs: (next) => void apply(next) })}
 
       <label className="block mb-5">
         <span style={{ color: "var(--fg-muted)" }}>保存到</span>
@@ -195,7 +217,7 @@ export default function VideoOpShell({
           inputs.length === 0 ||
           !outputDir ||
           params === null ||
-          infos[0]?.hasVideo === false
+          one?.hasVideo === false
         }
       >
         {busy ? "提交中…" : `开始${opLabel(op)}`}

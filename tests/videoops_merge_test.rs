@@ -11,9 +11,11 @@ fn m(vcodec: &str, acodec: Option<&str>, container: &str, w: u32, h: u32) -> Med
         has_video: true,
         video_codec: Some(vcodec.into()),
         audio_codec: acodec.map(|s| s.to_string()),
+        audio_params: acodec.map(|_| "44100:2".to_string()),
         container: Some(container.into()),
         width: Some(w),
         height: Some(h),
+        fps: Some(15.0),
     }
 }
 
@@ -67,6 +69,48 @@ fn missing_audio_is_a_warning_not_a_blocker() {
     assert!(c.warnings[0].contains("音轨"));
 }
 
+/// 音频编码要**在"有音轨的那些段之间"**两两比，不能拿第 1 段当基准。
+///
+/// spec §5.2 的原话就是"只比**有音轨的那些段之间**"。拿第 1 段当基准的话，
+/// 第 1 段没音轨时（它本来就是合法的、只该出警告的情况）**整条规则失效**：
+/// 下面这三段里 aac 与 mp3 会拼出一个混合音轨的文件，而一条都不拦。
+#[test]
+fn audio_codec_is_compared_among_segments_that_have_audio() {
+    let c = check(&[m("h264", None, "mp4", 640, 360),
+                    m("h264", Some("aac"), "mp4", 640, 360),
+                    m("h264", Some("mp3"), "mp4", 640, 360)]);
+    assert_eq!(c.blockers.len(), 1, "aac 与 mp3 必须被拦: {c:?}");
+    assert!(c.blockers[0].contains("mp3"), "{:?}", c.blockers);
+}
+
+/// 帧率不同 → 警告。实测 30 + 25 拼出来接缝处 **2 行解码错误**（画面一跳）。
+#[test]
+fn different_frame_rates_are_warnings() {
+    let c = check(&[fps(m("h264", Some("aac"), "mp4", 640, 360), 30.0),
+                    fps(m("h264", Some("aac"), "mp4", 640, 360), 25.0)]);
+    assert!(c.blockers.is_empty(), "帧率不影响能不能解码: {c:?}");
+    assert_eq!(c.warnings.len(), 1, "{c:?}");
+    assert!(c.warnings[0].contains("帧率"), "{:?}", c.warnings);
+    // 一样的两段不该有这条警告
+    let c = check(&[fps(m("h264", Some("aac"), "mp4", 640, 360), 30.0),
+                    fps(m("h264", Some("aac"), "mp4", 640, 360), 30.0)]);
+    assert!(c.warnings.is_empty(), "{c:?}");
+}
+
+/// 音频参数不同（采样率/声道）→ 警告。实测拼出来 **0 解码错误**，但总时长偏 +0.36 秒。
+#[test]
+fn different_audio_parameters_are_warnings() {
+    let c = check(&[aparams(m("h264", Some("aac"), "mp4", 640, 360), "44100:2"),
+                    aparams(m("h264", Some("aac"), "mp4", 640, 360), "48000:1")]);
+    assert!(c.blockers.is_empty(), "{c:?}");
+    assert_eq!(c.warnings.len(), 1, "{c:?}");
+    assert!(c.warnings[0].contains("音频参数"), "{:?}", c.warnings);
+    // 一段没有音轨时不该冒出"音频参数不同" —— 那是另一条警告的事
+    let c = check(&[m("h264", None, "mp4", 640, 360),
+                    aparams(m("h264", Some("aac"), "mp4", 640, 360), "48000:1")]);
+    assert!(!c.warnings.iter().any(|w| w.contains("音频参数")), "{c:?}");
+}
+
 /// 其余差异放行但警告 —— 分辨率不同实测 0 错误、帧率不同 2 处错误。
 #[test]
 fn other_differences_are_warnings() {
@@ -114,6 +158,16 @@ fn output_container_follows_the_first_input() {
     let odd = MediaInfo { container: None, ..m("h264", Some("aac"), "mp4", 640, 360) };
     assert_eq!(merge_muxer(&odd), "matroska");
     assert_eq!(merge_extension(&odd), "mkv");
+}
+
+fn fps(mut x: MediaInfo, f: f64) -> MediaInfo {
+    x.fps = Some(f);
+    x
+}
+
+fn aparams(mut x: MediaInfo, p: &str) -> MediaInfo {
+    x.audio_params = Some(p.into());
+    x
 }
 
 /// 进度条的分母对合并是**各段之和**。

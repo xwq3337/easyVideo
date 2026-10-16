@@ -42,6 +42,9 @@ pub struct JobSnapshot {
     pub output: PathBuf,
     pub state: JobState,
     pub progress: Option<f64>,
+    /// 进度条的分母，**入队时按各段算好**（合并是各段之和，其余是首段时长）。
+    /// 暴露出来是因为它是"这个任务打算跑多久"这件事本身，而不只是进度条的中间量。
+    pub duration: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -153,6 +156,7 @@ impl VideoOps {
                 output: j.output.clone(),
                 state: j.state.clone(),
                 progress: j.progress,
+                duration: j.duration,
             })
             .collect();
         out.sort_by_key(|s| s.id);
@@ -196,9 +200,17 @@ impl VideoOps {
             anyhow::bail!("输出目录不存在：{}", output_dir.display());
         }
         let ffmpeg = self.ffmpeg()?;
-        // 只探**首段**：单输入的操作看的就是它，而"按首段定名字与容器"对合并也成立。
-        // 逐段的媒体信息留给合并自己的兼容性校验（`check_merge` 会全探一遍）。
-        let src = media_info::inspect(&ffmpeg, &inputs[0]).await?;
+        // **逐段都探。** 曾经这里只探首段（"单输入的操作看的就是它"），后果是
+        // `ctx.infos` 永远只有一个元素 —— 于是合并的两处一起空转：
+        // 兼容性校验（`merge::check` 的循环是 `skip(1)`，单元素切片上零次迭代，
+        // 永远返回空 blockers）与进度条的分母（该是各段之和，变成了首段时长）。
+        // 界面那一层拦不住全部：`check_merge` 跑完之前按钮是亮的，而 DTO 是外部输入。
+        // 单输入的操作这里就是一次探测，代价为零。
+        let mut infos = Vec::with_capacity(inputs.len());
+        for p in &inputs {
+            infos.push(media_info::inspect(&ffmpeg, p).await?);
+        }
+        let src = infos[0].clone();
         if !src.has_video {
             anyhow::bail!(
                 "这个文件里读不到视频流（可能是纯音频，或者文件已损坏）：{}",
@@ -220,7 +232,6 @@ impl VideoOps {
         // **取名 + 登记必须在同一个锁里** —— 见 `plan_output_path` 的说明。
         let id = {
             let mut jobs = self.inner.jobs.lock().unwrap();
-            let infos = vec![src.clone()];
             // `extension` 只看首段，所以不必先有 ctx —— 先算 output（它靠 extension），
             // 再拿 output 的引用构造 ctx。**顺序不能反**：ctx 里要放 output 的引用，
             // 而 output 要靠 extension 算。

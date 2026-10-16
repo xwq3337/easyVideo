@@ -32,7 +32,8 @@ export default function MergeForm({
   onChange: (p: JobParamsDto | null) => void;
   inputs: string[];
   setInputs: (next: string[]) => void;
-  infos: VideoInfoDto[];
+  /** 与 `inputs` 逐位对应 —— 还没探完时是 null（界面显示「读取中…」）。 */
+  infos: (VideoInfoDto | null)[];
 }) {
   const [check, setCheck] = useState<MergeCheckDto | null>(null);
 
@@ -81,7 +82,9 @@ export default function MergeForm({
         >
           {inputs.map((p, i) => (
             <div
-              key={p}
+              // key 带下标：同一个文件被选两次是**合法意图**（"合"就是把它重复一遍），
+              // 只用 path 当 key 会让 React 把两行当成同一行，↑/↓/✕ 作用到错的那一行。
+              key={`${i}:${p}`}
               className="flex items-center gap-2 px-3 py-2"
               style={{ borderBottom: "1px solid var(--line)" }}
             >

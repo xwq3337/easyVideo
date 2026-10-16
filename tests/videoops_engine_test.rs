@@ -21,6 +21,16 @@ async fn make_src(ffmpeg: &std::path::Path, path: &std::path::Path, secs: u32) {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
+/// 同上，但编成 H.265 —— 合并的兼容性检查要拿一个真的编码不同的源。
+async fn make_src_hevc(ffmpeg: &std::path::Path, path: &std::path::Path, secs: u32) {
+    let out = tokio::process::Command::new(ffmpeg)
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i",
+               &format!("testsrc2=duration={secs}:size=640x360:rate=15"),
+               "-c:v", "libx265", "-crf", "30", "-tag:v", "hvc1"])
+        .arg(path).output().await.unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
 /// 收敛：一直收事件直到任务到终态或超时。事件是唯一的观察窗口，
 /// 所以测试必须像前端那样订阅它，而不是轮询内部状态。
 async fn wait_terminal(
@@ -356,6 +366,13 @@ async fn merges_through_the_engine_and_cleans_up_its_scratch_file() {
     let d = back.duration_secs.expect("产物时长");
     assert!((d - 4.0).abs() < 0.4, "两段各 2 秒应得≈4 秒，实际: {d}");
 
+    // **进度条的分母是各段之和**，不是首段的时长。分母在**入队时**就算好了 ——
+    // 用首段的话，进度条在第一段结束时就走到 100%，后面几段看起来像卡住了。
+    // 这里能直接断言，是因为它真的穿过了 `add_job` 那条路（纯函数测试手搓 ctx
+    // 的地方，正是这个 bug 藏身之处）。
+    let job = ops.list_jobs().into_iter().find(|j| j.id == id).unwrap();
+    assert_eq!(job.duration, Some(4.0), "两段各 2 秒 → 分母是 4 秒，不是 2 秒");
+
     let leftovers: Vec<String> = std::fs::read_dir(dir.path())
         .unwrap()
         .filter_map(|e| e.ok())
@@ -368,4 +385,32 @@ async fn merges_through_the_engine_and_cleans_up_its_scratch_file() {
     );
 
     ops.cancel(id);
+}
+
+/// **编码不一致必须在入队那一刻被拒**（spec §8：界面已经拦过，但 DTO 是外部输入）。
+///
+/// 这条守的是一条曾经**空转**的防线：`add_job` 当初只探首段，于是
+/// `ctx.infos` 永远只有一个元素，而 `merge::check` 的循环是 `skip(1)` ——
+/// 单元素切片上零次迭代，**永远返回空 blockers**。界面上那一层还有竞态窗口
+/// （`checkMerge` 跑完之前按钮是亮的），而 ffmpeg 对 h264+h265 报 **exit 0**。
+/// 两条一起失守，用户拿到的是一个打不开的文件、列表写着"已完成"。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refuses_a_merge_with_mismatched_codecs_at_enqueue_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let ffmpeg = ensure_ffmpeg(dir.path()).unwrap();
+    let a = dir.path().join("a.mp4");
+    let b = dir.path().join("b.mp4");
+    make_src(&ffmpeg, &a, 2).await;
+    make_src_hevc(&ffmpeg, &b, 2).await;
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let ops = VideoOps::new(rt, dir.path().to_path_buf());
+    let err = ops
+        .add_job(vec![a, b], out_dir.path().to_path_buf(), JobParams::Merge)
+        .await;
+    assert!(err.is_err(), "h264 + h265 必须在入队时被拒");
+    let msg = format!("{:#}", err.unwrap_err());
+    assert!(msg.contains("hevc"), "错误里要说清是哪个编码: {msg}");
+    assert!(ops.list_jobs().is_empty(), "被拒绝的任务不该进列表");
 }

@@ -26,9 +26,9 @@ export default function CropForm({
   value: JobParamsDto | null;
   onChange: (p: JobParamsDto | null) => void;
   inputs: string[];
-  infos: VideoInfoDto[];
+  infos: (VideoInfoDto | null)[];
 }) {
-  const src = infos[0];
+  const src = infos[0] ?? null;
   const sw = src?.width ?? null;
   const sh = src?.height ?? null;
 

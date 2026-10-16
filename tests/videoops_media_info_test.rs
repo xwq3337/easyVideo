@@ -69,9 +69,11 @@ fn one_pass_yields_everything_we_need() {
             video_codec: Some("h264".to_string()),
             // 那段 stderr 里没有音轨行 —— 没有音轨就是 None，不是空串
             audio_codec: None,
+            audio_params: None,
             container: Some("mp4".to_string()),
             width: Some(640),
             height: Some(360),
+            fps: None,
         }
     );
 }
@@ -130,7 +132,10 @@ fn maps_container_to_muxer_and_extension() {
 
 // ===== 画面尺寸与音频编码：合并要逐段比编码，裁剪的坐标系就是宽高 =====
 
-use easydownvideo::core::videoops::media_info::{parse_audio_codec, parse_dimensions};
+use easydownvideo::core::videoops::media_info::{
+    display_dimensions, parse_audio_codec, parse_audio_params, parse_dimensions, parse_fps,
+    parse_rotation,
+};
 
 /// 真实输出（ffmpeg 9.0.2）。
 #[test]
@@ -174,6 +179,61 @@ fn parses_frame_dimensions() {
     assert_eq!(parse_dimensions("  Stream #0:0(und): Audio: aac, 44100 Hz"), None);
     // 只有那个十六进制 tag，没有真尺寸 → 不能被它骗到
     assert_eq!(parse_dimensions("  Stream #0:0: Video: h264 (avc1 / 0x31637661)"), None);
+}
+
+/// **带 Display Matrix 的视频：显示尺寸与编码尺寸是转置的。**
+///
+/// 实测：`ffmpeg -display_rotation 90 -i plain.mp4 -c copy rot.mp4` 之后，
+/// Stream 行报的是 `1920x1080`，旋转位在**另一行** `Display Matrix: rotation of
+/// 90.00 degrees`。而 `-vf crop` 跑在**旋转之后**的帧上 —— 实测同一文件
+/// `crop=1920:1080:0:0` 直接报 `Invalid too big or non positive size for width '1920'`。
+///
+/// 所以裁剪的坐标系必须是**显示尺寸**（用户看到的那一个），不是 Stream 行那个。
+/// 手机竖拍、社交平台下载的 MP4 全带这个旋转位 —— 对一个下载器来说它在主路径上。
+#[test]
+fn rotated_sources_report_the_display_dimensions() {
+    let rot90 = "  Stream #0:0[0x1](und): Video: h264 (avc1), yuv420p, 1920x1080, 15 fps\n\
+      Display Matrix: rotation of 90.00 degrees";
+    assert_eq!(display_dimensions(rot90), Some((1080, 1920)));
+    // -270 / 270 与 90 是一回事（都是转 90 度）
+    let neg = rot90.replace("90.00", "-90.00");
+    assert_eq!(display_dimensions(&neg), Some((1080, 1920)));
+    let two7 = rot90.replace("90.00", "270.00");
+    assert_eq!(display_dimensions(&two7), Some((1080, 1920)));
+    // 180 度**不转置**（画面上下颠倒，但宽高关系不变）
+    let rot180 = rot90.replace("90.00", "180.00");
+    assert_eq!(display_dimensions(&rot180), Some((1920, 1080)));
+    // 没有旋转位就是原样
+    assert_eq!(display_dimensions("  Stream #0:0: Video: h264, yuv420p, 640x360"), Some((640, 360)));
+}
+
+/// 旋转角从 `Display Matrix: rotation of 90.00 degrees` 取。没有就是 None。
+#[test]
+fn parses_the_display_matrix_rotation() {
+    assert_eq!(parse_rotation("      Display Matrix: rotation of 90.00 degrees"), Some(90.0));
+    assert_eq!(parse_rotation("      Display Matrix: rotation of -90.00 degrees"), Some(-90.0));
+    assert_eq!(parse_rotation("  Stream #0:0: Video: h264, yuv420p, 640x360"), None);
+}
+
+/// 帧率与音频参数 —— 合并的兼容性检查要拿它们出灰字警告（spec §5.2）。
+///
+/// 实测：帧率不同（30+25）拼出来接缝处 2 行解码错误；音频参数不同（44.1k 立体声 +
+/// 48k 单声道）拼出来 0 错误但总时长偏 +0.36 秒。两项都不至于打不开，所以是警告不是拦阻。
+#[test]
+fn parses_fps_and_audio_parameters() {
+    let v = "  Stream #0:0[0x1](und): Video: h264 (High), yuv420p, 1920x1080, 30 fps";
+    assert_eq!(parse_fps(v), Some(30.0));
+    let frac = "  Stream #0:0: Video: h264, yuv420p, 640x360, 29.97 fps";
+    assert_eq!(parse_fps(frac), Some(29.97));
+    // 纯音频输入没有视频行
+    assert_eq!(parse_fps("  Stream #0:0: Audio: aac, 44100 Hz, stereo"), None);
+
+    let a = "  Stream #0:1[0x2](und): Audio: aac (LC), 44100 Hz, stereo, fltp";
+    assert_eq!(parse_audio_params(a), Some("44100:2".to_string()));
+    let mono = "  Stream #0:1: Audio: aac, 48000 Hz, mono, fltp";
+    assert_eq!(parse_audio_params(mono), Some("48000:1".to_string()));
+    // 没有音轨
+    assert_eq!(parse_audio_params("  Stream #0:0: Video: h264, yuv420p, 640x360"), None);
 }
 
 /// 一次 `ffmpeg -i` 把四样都拿到：时长、有没有视频、编码、容器、尺寸。

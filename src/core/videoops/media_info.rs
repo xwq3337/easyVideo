@@ -20,11 +20,20 @@ pub struct MediaInfo {
     /// 音频编码，形如 "aac" / "opus"。**没有音轨时是 None**（合并的兼容性检查
     /// 要区分"编码不同"与"压根没有音轨"——后者只是警告，不是拦阻）。
     pub audio_codec: Option<String>,
+    /// 音频参数，形如 `"44100:2"`（采样率:声道数）。没有音轨时 None。
+    /// 合并拿它出"音频参数不同"的警告 —— 那种拼接不报错，但总时长会偏。
+    pub audio_params: Option<String>,
     /// 容器，形如 "mp4" / "mkv" / "webm" / "mov"。取不到时 None。
     pub container: Option<String>,
-    /// 画面尺寸。裁剪框的坐标系就是它，取不到时裁剪不可用。
+    /// **显示尺寸** —— 自动旋转之后用户看到的那一对宽高。
+    ///
+    /// 裁剪框的坐标系就是它。注意它**不是** `Stream` 行报的那个尺寸：带
+    /// `Display Matrix` 的视频（手机竖拍、社交平台下载的 MP4）两者是转置的，
+    /// 而 `-vf crop` 跑在旋转之后的帧上。
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// 帧率。合并拿它出"帧率不同"的警告（接缝处会一跳）。
+    pub fps: Option<f64>,
 }
 
 /// 从 `Stream #0:0…: Video: h264 (High) …` 里取编码名。
@@ -168,8 +177,76 @@ pub fn parse_dimensions(stderr: &str) -> Option<(u32, u32)> {
     None
 }
 
+/// 从 `Display Matrix: rotation of 90.00 degrees` 取旋转角。没有这一行就是 `None`。
+pub fn parse_rotation(stderr: &str) -> Option<f64> {
+    let line = stderr.lines().find(|l| l.contains("Display Matrix: rotation of"))?;
+    let rest = line.split("rotation of").nth(1)?.trim();
+    rest.split_whitespace().next()?.parse().ok()
+}
+
+/// **显示尺寸**：自动旋转之后用户实际看到的那一对宽高。
+///
+/// 为什么不能直接用 Stream 行报的尺寸：`-vf crop` 跑在**旋转之后**的帧上。
+/// 实测（ffmpeg 9.0.2）一个编码 1920x1080 + `Display Matrix: rotation of 90.00 degrees`
+/// 的文件，`crop=1920:1080:0:0` 直接报 `Invalid too big or non positive size for
+/// width '1920'` —— 滤镜看到的宽是 1080。而更坏的是**没报错**的那种：
+/// `crop=640:360:1000:0` 在编码空间里合法（1640 ≤ 1920）、在显示空间里越界
+/// （1640 > 1080），ffmpeg 静默把 x 钳到 440 照常输出，stderr 一条警告都没有 ——
+/// 用户拿到的是画面另一个位置的一块。
+///
+/// 所以裁剪的坐标系必须是显示尺寸。手机竖拍、社交平台下载的 MP4 都带这个旋转位，
+/// 对一个下载器来说它在主路径上。
+pub fn display_dimensions(stderr: &str) -> Option<(u32, u32)> {
+    let (w, h) = parse_dimensions(stderr)?;
+    // 90 与 270（含负角）转置，180 与 0 不转置
+    let quarter_turn = parse_rotation(stderr)
+        .map(|r| (r.abs().round() as u32) % 180 == 90)
+        .unwrap_or(false);
+    Some(if quarter_turn { (h, w) } else { (w, h) })
+}
+
+/// 从视频流那一行取帧率（`… , 30 fps`）。没有视频流时 None。
+pub fn parse_fps(stderr: &str) -> Option<f64> {
+    let line = video_stream_line(stderr)?;
+    let toks: Vec<&str> = line.split(|c: char| c == ',' || c.is_whitespace()).collect();
+    toks.iter().position(|t| *t == "fps").and_then(|i| {
+        if i == 0 {
+            None
+        } else {
+            toks[i - 1].trim().parse().ok()
+        }
+    })
+}
+
+/// 音频参数，形如 `"44100:2"`（采样率:声道数）。**没有音轨时 None。**
+///
+/// 合并的兼容性检查要拿它出警告：实测 44.1k 立体声 + 48k 单声道拼出来 0 解码错误，
+/// 但总时长偏 +0.36 秒。参数一样的两段之间不该有这条警告。
+pub fn parse_audio_params(stderr: &str) -> Option<String> {
+    let line = stderr
+        .lines()
+        .find(|l| l.trim_start().starts_with("Stream #") && l.contains("Audio:"))?;
+    let rest = line.split("Audio:").nth(1)?;
+    let rate = rest
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find(|w| w[1] == "Hz")
+        .and_then(|w| w[0].parse::<u32>().ok())?;
+    let channels = ["mono", "stereo"]
+        .iter()
+        .find(|name| rest.contains(*name))
+        .map(|name| if *name == "mono" { 1 } else { 2 })
+        // 5.1 之类：ffmpeg 打的是 "5.1(side)" 这种，取第一个数字
+        .or_else(|| {
+            let t = rest.split(" Hz,").nth(1)?;
+            t.trim().split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+        })?;
+    Some(format!("{rate}:{channels}"))
+}
+
 pub fn parse_media_info(stderr: &str, path: &Path) -> MediaInfo {
-    let (width, height) = match parse_dimensions(stderr) {
+    let (width, height) = match display_dimensions(stderr) {
         Some((w, h)) => (Some(w), Some(h)),
         None => (None, None),
     };
@@ -178,9 +255,11 @@ pub fn parse_media_info(stderr: &str, path: &Path) -> MediaInfo {
         has_video: parse_has_video(stderr),
         video_codec: parse_video_codec(stderr),
         audio_codec: parse_audio_codec(stderr),
+        audio_params: parse_audio_params(stderr),
         container: parse_container(stderr, path),
         width,
         height,
+        fps: parse_fps(stderr),
     }
 }
 
