@@ -1,6 +1,7 @@
 pub mod compress;
 pub mod ffmpeg_job;
 pub mod media_info;
+pub mod merge;
 pub mod params;
 pub mod transcode;
 pub mod trim;
@@ -228,10 +229,17 @@ impl VideoOps {
                 params.suffix(),
                 &params.extension(&src),
             );
+            let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
             // 需要临时文件的操作（目前只有合并）在这里把**路径与内容**都备好：
-            // 内容是纯函数算的，worker 只负责写。排队中被取消的任务从没写过它。
-            // 合并那支在下一个任务里接上 —— 它依赖的 `merge` 模块那时才存在。
-            let scratch: Option<(PathBuf, String)> = None;
+            // 内容是纯函数算的（`concat_list`），worker 只负责写。
+            // 排队中被取消的任务从没写过它，所以没有可清理的东西。
+            let scratch = matches!(params, JobParams::Merge).then(|| {
+                (
+                    merge::scratch_path(&self.inner.data_dir, id),
+                    merge::concat_list(&inputs),
+                )
+            });
+            // `args` 需要列表文件的**路径**，所以从 scratch 借一个引用给它
             let scratch_path = scratch.as_ref().map(|(p, _)| p.as_path());
             let ctx = JobContext {
                 inputs: &inputs,
@@ -244,7 +252,6 @@ impl VideoOps {
             params.validate(&ctx)?;
             let duration = params.duration_secs(&ctx);
             let args = params.args(&ctx); // ctx 的最后一处使用 —— 之后才能把 scratch 移进 entry
-            let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
             jobs.insert(
                 id,
                 JobEntry {

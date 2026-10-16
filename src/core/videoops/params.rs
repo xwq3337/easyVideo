@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::core::videoops::compress::{compress_args, preset_label, CompressParams};
 use crate::core::videoops::media_info::MediaInfo;
+use crate::core::videoops::merge::{merge_args, merge_extension};
 use crate::core::videoops::transcode::{
     target_extension, target_label, transcode_args, TranscodeParams,
 };
@@ -45,6 +46,9 @@ pub enum JobParams {
     Compress(CompressParams),
     Transcode(TranscodeParams),
     Trim(TrimParams),
+    /// 合并**没有参数** —— 顺序就是 `ctx.inputs` 的顺序。
+    /// 它不是"省了一步"，而是"参数与输入该分开"的直接结果。
+    Merge,
 }
 
 impl JobParams {
@@ -55,6 +59,7 @@ impl JobParams {
             // 转码的标签是目标格式（用户选的就是它），不带档位 —— 带上了会太长
             JobParams::Transcode(p) => format!("转码 · {}", target_label(p.target)),
             JobParams::Trim(p) => format!("裁剪 · {}", mode_label(p.mode)),
+            JobParams::Merge => "合并".to_string(),
         }
     }
 
@@ -64,6 +69,7 @@ impl JobParams {
             JobParams::Compress(_) => "-压缩",
             JobParams::Transcode(_) => "-转码",
             JobParams::Trim(_) => "-裁剪",
+            JobParams::Merge => "-合并",
         }
     }
 
@@ -79,6 +85,8 @@ impl JobParams {
             // 转码的扩展名由目标格式决定，与源无关
             JobParams::Transcode(p) => target_extension(p.target).to_string(),
             JobParams::Trim(p) => trim_extension(p, src),
+            // 容器沿用首段；认不出来退 matroska
+            JobParams::Merge => merge_extension(src),
         }
     }
 
@@ -92,6 +100,14 @@ impl JobParams {
             JobParams::Compress(p) => compress_args(&ctx.inputs[0], ctx.output, p),
             JobParams::Transcode(p) => transcode_args(&ctx.inputs[0], ctx.output, p),
             JobParams::Trim(p) => trim_args(&ctx.inputs[0], ctx.output, p, ctx.src()),
+            // 列表文件由 `add_job` 在入队时备好路径（`ctx.scratch`），worker 负责写。
+            // 没有它就没法拼 —— 所以这里是 `expect` 而不是静默降级。
+            JobParams::Merge => merge_args(
+                ctx.scratch
+                    .expect("合并必须有 concat 列表文件（`add_job` 会在入队时备好）"),
+                ctx.output,
+                ctx.src(),
+            ),
         }
     }
 
@@ -107,6 +123,16 @@ impl JobParams {
             JobParams::Transcode(_) => Ok(()),
             // 时间范围必须在这里挡住：晚一步就会排进队列、跑出一个空产物再报错
             JobParams::Trim(p) => validate_trim(p, ctx.src().duration_secs),
+            // **界面已经拦过，这里再判一次**：DTO 是外部输入。
+            // 与 `check_merge` 走同一个 `merge::check` —— 两处各写一遍的话，
+            // 界面放行的组合会被入队拒绝（或反过来），用户看到的是"按钮能点、点了报错"。
+            JobParams::Merge => {
+                let c = crate::core::videoops::merge::check(ctx.infos);
+                if !c.blockers.is_empty() {
+                    anyhow::bail!("{}", c.blockers.join("\n"));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -120,6 +146,16 @@ impl JobParams {
         match self {
             JobParams::Compress(_) | JobParams::Transcode(_) | JobParams::Trim(_) => {
                 ctx.src().duration_secs
+            }
+            // **各段之和**：concat 产物的时长就是它们相加。用首段时长会让进度条在
+            // 第一段结束时就走到 100%，后面几段看起来像卡住了。
+            // 任一段读不出来就整体退化成本来就有的不确定态 —— 不编一个数出来。
+            JobParams::Merge => {
+                let mut total = 0.0;
+                for m in ctx.infos {
+                    total += m.duration_secs?;
+                }
+                Some(total)
             }
         }
     }

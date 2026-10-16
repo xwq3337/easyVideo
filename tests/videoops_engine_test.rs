@@ -1,5 +1,6 @@
 use easydownvideo::core::ffmpeg::ensure_ffmpeg;
 use easydownvideo::core::videoops::compress::{CompressParams, CompressPreset, Encoder};
+use easydownvideo::core::videoops::media_info::inspect;
 use easydownvideo::core::videoops::params::JobParams;
 use easydownvideo::core::videoops::{JobState, VideoOpEvent, VideoOps};
 use tokio::sync::broadcast;
@@ -317,6 +318,53 @@ async fn plan_output_matches_the_path_add_job_actually_takes() {
     assert!(
         planned2.ends_with("src-压缩 (1).mp4"),
         "在途任务必须占位，否则第二行会覆盖第一行的产物。实际: {planned2}"
+    );
+}
+
+/// **合并的整条路真跑一遍**：入队 → worker 写 concat 列表 → 拼 → 把列表清掉。
+///
+/// 它守的是一条**别的测试都看不见**的路径：`add_job` 若没为合并备好列表文件，
+/// `merge_args` 会拿到 `None` 而 panic —— 而合并那条清理测试用的是**手写**的
+/// 临时文件，正好看不出这件事（真实链条里文件是 worker 写的）。
+///
+/// 放在这个文件而不是 `videoops_merge_test.rs`：那条链路是**引擎**的（排队、
+/// worker、临时文件的生成与回收），而引擎的观察窗口（事件）与脚手架在这里。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merges_through_the_engine_and_cleans_up_its_scratch_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let ffmpeg = ensure_ffmpeg(dir.path()).unwrap();
+    let a = dir.path().join("a.mp4");
+    let b = dir.path().join("b.mp4");
+    make_src(&ffmpeg, &a, 2).await;
+    make_src(&ffmpeg, &b, 2).await;
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    // data_dir 就是 dir：临时列表文件落在那里，好数
+    let ops = VideoOps::new(rt, dir.path().to_path_buf());
+    let mut rx = ops.events();
+
+    let id = ops
+        .add_job(vec![a, b], out_dir.path().to_path_buf(), JobParams::Merge)
+        .await
+        .unwrap();
+    assert_eq!(wait_terminal(&mut rx, id, 120).await, JobState::Done);
+
+    let out = ops.list_jobs()[0].output.clone();
+    assert!(out.exists(), "产物应当就位: {out:?}");
+    let back = inspect(&ffmpeg, &out).await.unwrap();
+    let d = back.duration_secs.expect("产物时长");
+    assert!((d - 4.0).abs() < 0.4, "两段各 2 秒应得≈4 秒，实际: {d}");
+
+    let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("merge-") && n.ends_with(".txt"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "合并的临时列表文件必须被清掉（worker 写了它，run_job 负责删），实际留下: {leftovers:?}"
     );
 
     ops.cancel(id);
