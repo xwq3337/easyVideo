@@ -130,10 +130,14 @@ pub struct MediaInfo {
     pub has_video: bool,
     /// 视频编码，形如 "h264" / "hevc" / "vp9"。取不到时 None。
     pub video_codec: Option<String>,
-    /// 容器，形如 "mp4" / "matroska" / "webm"。取不到时 None。
+    /// 容器，形如 "mp4" / "mkv" / "webm"。取不到时 None。
     pub container: Option<String>,
-    pub size_bytes: u64,
 }
+```
+
+（**没有 `size_bytes`**：文件大小是纯文件系统的事，由命令层自己读 —— 上一轮就是这么分的，
+`probe` 只负责"ffmpeg 读得懂的那部分"。`VideoInfoDto` 照样有 `sizeBytes`，只是它不从
+`MediaInfo` 来。）
 ```
 
 容器从 `Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'x.mp4'` 那行的格式串里取（取第一个能对上

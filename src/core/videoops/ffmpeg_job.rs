@@ -51,7 +51,7 @@ pub async fn run_job(
     on_progress: Arc<dyn Fn(f64) + Send + Sync>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<JobOutcome> {
-    let part_path = crate::core::videoops::presets::part_path_for(output);
+    let part_path = crate::core::videoops::params::part_path_for(output);
     let mut cmd = tokio::process::Command::new(ffmpeg);
     cmd.args(args);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());

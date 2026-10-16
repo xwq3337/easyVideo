@@ -1,13 +1,14 @@
 use easydownvideo::core::ffmpeg::ensure_ffmpeg;
-use easydownvideo::core::videoops::presets::{CompressParams, CompressPreset, Encoder};
+use easydownvideo::core::videoops::compress::{CompressParams, CompressPreset, Encoder};
+use easydownvideo::core::videoops::params::JobParams;
 use easydownvideo::core::videoops::{JobState, VideoOpEvent, VideoOps};
 use tokio::sync::broadcast;
 
-fn params() -> CompressParams {
-    CompressParams {
+fn params() -> JobParams {
+    JobParams::Compress(CompressParams {
         preset: CompressPreset::Small, encoder: Encoder::Software,
         max_height: None, crf: None, qv: None, audio_kbps: None,
-    }
+    })
 }
 
 async fn make_src(ffmpeg: &std::path::Path, path: &std::path::Path, secs: u32) {
@@ -53,7 +54,7 @@ async fn compressing_a_real_file_reaches_done_and_writes_the_output() {
     let ops = VideoOps::new(rt, dir.path().to_path_buf());
     let mut rx = ops.events();
 
-    let id = ops.add_compress_job(src.clone(), out_dir.path().to_path_buf(), params()).await.unwrap();
+    let id = ops.add_job(src.clone(), out_dir.path().to_path_buf(), params()).await.unwrap();
     assert_eq!(ops.list_jobs().len(), 1);
     assert_eq!(ops.list_jobs()[0].label, "压缩 · 小体积");
 
@@ -83,7 +84,7 @@ async fn never_overwrites_the_source_file() {
     // 输出目录 = 源文件所在目录；且先手动占掉「src-压缩.mp4」这个名字
     std::fs::write(dir.path().join("src-压缩.mp4"), b"already here").unwrap();
 
-    let id = ops.add_compress_job(src.clone(), dir.path().to_path_buf(), params()).await.unwrap();
+    let id = ops.add_job(src.clone(), dir.path().to_path_buf(), params()).await.unwrap();
     assert_eq!(wait_terminal(&mut rx, id, 60).await, JobState::Done);
 
     assert_eq!(std::fs::read(&src).unwrap(), before, "源文件一个字节都不能动");
@@ -111,7 +112,7 @@ async fn refuses_input_without_a_video_stream_at_enqueue_time() {
 
     let rt = tokio::runtime::Handle::current();
     let ops = VideoOps::new(rt, dir.path().to_path_buf());
-    let err = ops.add_compress_job(src, dir.path().to_path_buf(), params()).await;
+    let err = ops.add_job(src, dir.path().to_path_buf(), params()).await;
     assert!(err.is_err(), "纯音频输入必须在入队时被拒绝");
     let msg = format!("{:#}", err.unwrap_err());
     assert!(msg.contains("视频流"), "错误里要说清原因，实际: {msg}");
@@ -124,7 +125,7 @@ async fn refuses_a_missing_input_at_enqueue_time() {
     let dir = tempfile::tempdir().unwrap();
     let rt = tokio::runtime::Handle::current();
     let ops = VideoOps::new(rt, dir.path().to_path_buf());
-    let err = ops.add_compress_job(
+    let err = ops.add_job(
         dir.path().join("nope.mp4"), dir.path().to_path_buf(), params(),
     ).await;
     assert!(err.is_err(), "不存在的输入必须在入队时就拒绝");
@@ -149,7 +150,7 @@ async fn refuses_an_unwritable_output_dir_at_enqueue_time() {
 
     let rt = tokio::runtime::Handle::current();
     let ops = VideoOps::new(rt, dir.path().to_path_buf());
-    let err = ops.add_compress_job(src, ro.clone(), params()).await;
+    let err = ops.add_job(src, ro.clone(), params()).await;
     // root 用户会绕过权限位，那种环境下这条断言没意义
     if err.is_err() {
         assert!(ops.list_jobs().is_empty());
@@ -177,8 +178,8 @@ async fn cancelling_a_queued_job_stays_cancelled() {
     let ops = VideoOps::new(rt, dir.path().to_path_buf());
     let mut rx = ops.events();
 
-    let first = ops.add_compress_job(src, dir.path().to_path_buf(), params()).await.unwrap();
-    let second = ops.add_compress_job(src2, dir.path().to_path_buf(), params()).await.unwrap();
+    let first = ops.add_job(src, dir.path().to_path_buf(), params()).await.unwrap();
+    let second = ops.add_job(src2, dir.path().to_path_buf(), params()).await.unwrap();
     // 并发上限是 1，所以第二个必然还在排队 —— 这一步是确定的，不需要 sleep
     assert_eq!(
         ops.list_jobs().iter().find(|j| j.id == second).unwrap().state,
@@ -207,7 +208,7 @@ async fn remove_only_works_on_terminal_jobs() {
     let rt = tokio::runtime::Handle::current();
     let ops = VideoOps::new(rt, dir.path().to_path_buf());
     let mut rx = ops.events();
-    let id = ops.add_compress_job(src, dir.path().to_path_buf(), params()).await.unwrap();
+    let id = ops.add_job(src, dir.path().to_path_buf(), params()).await.unwrap();
 
     assert!(!ops.remove(id), "运行中的任务不能被移除");
     assert_eq!(wait_terminal(&mut rx, id, 60).await, JobState::Done);
@@ -235,8 +236,8 @@ async fn two_in_flight_jobs_never_share_an_output_path() {
     let ops = VideoOps::new(rt, dir.path().to_path_buf());
     ops.events(); // 订阅一下，反正 worker 会发
 
-    let first = ops.add_compress_job(src.clone(), out_dir.path().to_path_buf(), params()).await.unwrap();
-    let second = ops.add_compress_job(src.clone(), out_dir.path().to_path_buf(), params()).await.unwrap();
+    let first = ops.add_job(src.clone(), out_dir.path().to_path_buf(), params()).await.unwrap();
+    let second = ops.add_job(src.clone(), out_dir.path().to_path_buf(), params()).await.unwrap();
 
     let jobs = ops.list_jobs();
     let a = jobs.iter().find(|j| j.id == first).unwrap();

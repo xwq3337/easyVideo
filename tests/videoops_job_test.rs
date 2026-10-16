@@ -1,7 +1,7 @@
 use easydownvideo::core::ffmpeg::ensure_ffmpeg;
 use easydownvideo::core::videoops::ffmpeg_job::{parse_progress_fraction, run_job, JobOutcome};
 use easydownvideo::core::videoops::media_info::inspect;
-use easydownvideo::core::videoops::presets::{compress_args, CompressParams, CompressPreset, Encoder};
+use easydownvideo::core::videoops::compress::{compress_args, CompressParams, CompressPreset, Encoder};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -116,6 +116,9 @@ async fn handles_paths_with_quotes_spaces_and_cjk() {
         .await.unwrap();
     assert_eq!(outcome, JobOutcome::Done);
     assert!(out.exists());
+    // 撇号/空格/中文路径下同样要把临时名清干净 —— 这条以前是个没人用的死变量，
+    // 现在它是个真的断言：rename 成功之后 `.part` 不该还留着。
+    assert!(!part.exists(), "成功后临时名不该还留着: {part:?}");
 }
 
 /// 取消的收尾顺序：先 kill、再等它真的退出、最后才删产物。
@@ -176,7 +179,7 @@ async fn a_failed_rename_does_not_leave_the_part_file_behind() {
         .await;
     assert!(err.is_err(), "改名到非空目录上必须失败");
 
-    let part = easydownvideo::core::videoops::presets::part_path_for(&out);
+    let part = easydownvideo::core::videoops::params::part_path_for(&out);
     assert!(
         !part.exists(),
         "改名失败时也必须删掉 .part —— 否则用户会在目录里看到一个打不开的半截文件，实际: {part:?}"

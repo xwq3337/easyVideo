@@ -1,12 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 
-/// 临时产物名。**唯一的产出方式** —— `compress_args` 把它交给 ffmpeg，
-/// `run_job` 用它做失败清理与成功改名。三处各写一遍 `format!` 迟早会分叉，
-/// 而分叉的后果是清理清不掉、改名改了个不存在的文件。
-pub fn part_path_for(output: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.part", output.to_string_lossy()))
-}
+use crate::core::videoops::params::part_path_for;
 
 /// 三档质量预设。数值取自 spec 第 6.1 节。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +41,15 @@ impl FromStr for Encoder {
             "software" => Ok(Self::Software),
             other => Err(anyhow::anyhow!("未知的编码器: {other}")),
         }
+    }
+}
+
+/// 队列那一行显示的中文档位名。挂在压缩这里，因为只有它有"档位"这个概念。
+pub fn preset_label(p: CompressPreset) -> &'static str {
+    match p {
+        CompressPreset::Small => "小体积",
+        CompressPreset::Balanced => "均衡",
+        CompressPreset::High => "高画质",
     }
 }
 

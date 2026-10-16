@@ -83,7 +83,8 @@ use easydownvideo::core::videoops::media_info::MediaInfo;
 use easydownvideo::core::videoops::params::JobParams;
 
 fn src_mp4() -> MediaInfo {
-    MediaInfo { duration_secs: Some(5.0), has_video: true, size_bytes: 1000 }
+    // 注意：`MediaInfo` 只有这两个字段 —— 文件大小在命令层，不在它里面
+    MediaInfo { duration_secs: Some(5.0), has_video: true }
 }
 
 /// `JobParams` 是三个操作共用的分派点，四个能力缺一不可 —— 少一个，
@@ -483,7 +484,6 @@ pub fn parse_media_info(stderr: &str, path: &Path) -> MediaInfo {
         has_video: parse_has_video(stderr),
         video_codec: parse_video_codec(stderr),
         container: parse_container(stderr, path),
-        size_bytes: 0, // 由命令层填（见 Task 5）
     }
 }
 
@@ -503,9 +503,9 @@ pub async fn inspect(ffmpeg: &Path, input: &Path) -> anyhow::Result<MediaInfo> {
 
 1. `tests/videoops_media_info_test.rs` 里既有的 `parse_media_info(stderr)` 调用要补上路径参数，
    并补 `video_codec: …` / `container: …` 两个字段的期望值。
-2. `tests/videoops_compress_test.rs` 里 Task 1 新增的 `src_mp4()` 辅助函数只构造了三个字段
-   （因为那时 `MediaInfo` 还只有三个），要补上：
-   `video_codec: Some("h264".into()), container: Some("mp4".into())`。
+2. `tests/videoops_compress_test.rs` 里 Task 1 新增的 `src_mp4()` 辅助函数只构造了两个字段
+   （`MediaInfo` 只有 `duration_secs` 与 `has_video` —— 大小在命令层，不在它里面），
+   要补上：`video_codec: Some("h264".into()), container: Some("mp4".into())`。
 
 - [ ] **Step 4: 跑测试看它通过**
 

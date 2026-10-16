@@ -1,9 +1,10 @@
+pub mod compress;
 pub mod ffmpeg_job;
 pub mod media_info;
-pub mod presets;
+pub mod params;
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -14,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use crate::core::direct::unique_path_avoiding;
 use crate::core::ffmpeg::ensure_ffmpeg;
 use ffmpeg_job::{run_job, JobOutcome};
-use presets::{compress_args, CompressParams};
+use params::JobParams;
 
 pub type JobId = u64;
 
@@ -163,11 +164,11 @@ impl VideoOps {
     /// 纯音频输入**不会**让 ffmpeg 报错，它会老老实实编出一个只有音轨的 mp4 并退出 0，
     /// 用户点的是"压缩视频"却拿到一个没有画面的文件 —— 那种"看起来成功了"的结果
     /// 比直接报错坏得多。
-    pub async fn add_compress_job(
+    pub async fn add_job(
         &self,
         input: PathBuf,
         output_dir: PathBuf,
-        params: CompressParams,
+        params: JobParams,
     ) -> anyhow::Result<JobId> {
         if !input.is_file() {
             anyhow::bail!("找不到输入文件：{}", input.display());
@@ -176,12 +177,17 @@ impl VideoOps {
             anyhow::bail!("输出目录不存在：{}", output_dir.display());
         }
         let ffmpeg = self.ffmpeg()?;
-        if !media_info::inspect(&ffmpeg, &input).await?.has_video {
+        // 要**整份** MediaInfo 而不只是 has_video：产物扩展名与裁剪的 -f 都看源容器
+        let src = media_info::inspect(&ffmpeg, &input).await?;
+        if !src.has_video {
             anyhow::bail!(
                 "这个文件里读不到视频流（可能是纯音频，或者文件已损坏）：{}",
                 input.display()
             );
         }
+        // **操作自己的语义校验**（裁剪的时间范围就靠这一步挡住）。
+        // 放在这里而不是命令层：入队校验全在 core，命令层只做薄封装，这条规矩别破。
+        params.validate(&src)?;
         // 真写一个探针文件，而不是查权限位 —— 权限位在 ACL、只读卷、网络盘上都不作数
         let probe = output_dir.join(".easydownvideo-write-probe");
         std::fs::write(&probe, b"")
@@ -194,26 +200,22 @@ impl VideoOps {
             .unwrap_or("video")
             .to_string();
 
-        // **取名 + 登记必须在同一个锁里，而且 `taken` 要问的是"有没有别的在途任务
-        // 已经占了它"。** 只问文件系统是不够的：产物要等任务真跑完才存在，于是两个
-        // 都还没跑完的任务会拿到同一个"这个文件不存在"的答案，随后后完成的那次
-        // rename 会静默覆盖先完成的那份 —— 界面上两行都显示"已完成"、都指着同一个
-        // 路径，而用户真正想要的那个变体已经没了。
-        // 下载那边有同样的教训（`engine.rs` 的 `reserved_paths` 就是为它存在的）。
-        //
-        // 重名让路成 " (1)"、" (2)"，与下载那边同一个 helper、同一个约定。
-        // **绝不覆盖源文件**：源文件若正好叫 `<stem>-压缩.mp4`，这里也会让到下一位。
+        // **取名 + 登记必须在同一个锁里** —— 见 `plan_output_path` 的说明。
         let id = {
             let mut jobs = self.inner.jobs.lock().unwrap();
-            let output = unique_path_avoiding(&output_dir, &format!("{stem}-压缩.mp4"), |c| {
-                jobs.values().any(|j| j.output == c)
-            });
-            let args = compress_args(&input, &output, &params);
+            let output = Self::plan_output_path(
+                &jobs,
+                &output_dir,
+                &stem,
+                params.suffix(),
+                &params.extension(&src),
+            );
+            let args = params.args(&input, &output, &src);
             let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
             jobs.insert(
                 id,
                 JobEntry {
-                    label: format!("压缩 · {}", preset_label(params.preset)),
+                    label: params.label(),
                     input,
                     output,
                     args,
@@ -228,6 +230,29 @@ impl VideoOps {
         let _ = self.inner.tx.send(VideoOpEvent::Added { id });
         self.pump();
         Ok(id)
+    }
+
+    /// 算产物的完整路径。**`plan_output` 与 `add_job` 都走这里** —— 两处各写一遍的话，
+    /// 预览与实际落盘会在某个边角上分叉，而那正是产物名预览存在的意义。
+    ///
+    /// `taken` 问的是"有没有别的**在途任务**已经占了它"。只问文件系统是不够的：
+    /// 产物要等任务真跑完才存在，于是两个都还没跑完的任务会拿到同一个"这个文件不存在"
+    /// 的答案，随后后完成的那次 rename 会静默覆盖先完成的那份 —— 界面上两行都显示
+    /// "已完成"、都指着同一个路径，而用户真正想要的那个变体已经没了。
+    /// 下载那边有同样的教训（`engine.rs` 的 `reserved_paths` 就是为它存在的）。
+    ///
+    /// 重名让路成 " (1)"、" (2)"，与下载那边同一个 helper、同一个约定。
+    /// **绝不覆盖源文件**：源文件若正好叫 `<stem>-压缩.mp4`，这里也会让到下一位。
+    fn plan_output_path(
+        jobs: &HashMap<JobId, JobEntry>,
+        output_dir: &Path,
+        stem: &str,
+        suffix: &str,
+        extension: &str,
+    ) -> PathBuf {
+        unique_path_avoiding(output_dir, &format!("{stem}{suffix}.{extension}"), |c| {
+            jobs.values().any(|j| j.output == c)
+        })
     }
 
     pub fn cancel(&self, id: JobId) {
@@ -375,13 +400,5 @@ impl VideoOps {
         if changed {
             let _ = self.inner.tx.send(VideoOpEvent::StateChanged { id, state });
         }
-    }
-}
-
-fn preset_label(p: presets::CompressPreset) -> &'static str {
-    match p {
-        presets::CompressPreset::Small => "小体积",
-        presets::CompressPreset::Balanced => "均衡",
-        presets::CompressPreset::High => "高画质",
     }
 }

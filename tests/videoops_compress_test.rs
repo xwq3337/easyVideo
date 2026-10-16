@@ -1,4 +1,4 @@
-use easydownvideo::core::videoops::presets::{
+use easydownvideo::core::videoops::compress::{
     compress_args, preset_defaults, CompressParams, CompressPreset, Encoder,
 };
 use std::path::Path;
@@ -140,4 +140,41 @@ fn preset_and_encoder_parse_from_the_wire_strings() {
     assert!("huge".parse::<CompressPreset>().is_err());
     assert_eq!("hardware".parse::<Encoder>().unwrap(), Encoder::Hardware);
     assert!("cuda".parse::<Encoder>().is_err());
+}
+
+// ===== JobParams：多操作共用的分派点 =====
+
+use easydownvideo::core::videoops::media_info::MediaInfo;
+use easydownvideo::core::videoops::params::JobParams;
+
+fn src_mp4() -> MediaInfo {
+    MediaInfo { duration_secs: Some(5.0), has_video: true }
+}
+
+/// 同一组参数的一个副本。故意重复构造而不是共享一个可变值 ——
+/// 测试之间共享可变状态是难查的 flake 来源。
+fn p_match() -> CompressParams {
+    CompressParams { preset: CompressPreset::Balanced, encoder: Encoder::Software,
+                     max_height: None, crf: None, qv: None, audio_kbps: None }
+}
+
+/// `JobParams` 是三个操作共用的分派点，**五个能力缺一不可** ——
+/// 少一个，后续的转码/裁剪就得在调用方加 special case。
+///
+/// `validate` 尤其重要：它一度被我漏掉（定义了却没接线），于是测试全绿而
+/// "起始时间超出视频长度"根本挡不住 —— 那是最坏的一种"完成"。
+#[test]
+fn job_params_exposes_the_five_capabilities_for_compress() {
+    let jp = JobParams::Compress(p(CompressPreset::Balanced, Encoder::Software));
+    assert_eq!(jp.label(), "压缩 · 均衡");
+    assert_eq!(jp.suffix(), "-压缩");
+    assert_eq!(jp.extension(&src_mp4()), "mp4");
+    // 压缩目前没有额外的语义校验
+    assert!(jp.validate(&src_mp4()).is_ok());
+    // args 与直接调 compress_args 必须一致 —— 分派层不能顺手改行为
+    let want = compress_args(Path::new("/in/a.mp4"), Path::new("/out/a-压缩.mp4.part"), &p_match());
+    assert_eq!(
+        jp.args(Path::new("/in/a.mp4"), Path::new("/out/a-压缩.mp4.part"), &src_mp4()),
+        want
+    );
 }
