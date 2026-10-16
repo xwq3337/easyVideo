@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
-import Sidebar, { type Page } from "./components/Sidebar";
+import Sidebar, { pageTitle, type Page } from "./components/Sidebar";
 import StatusBar from "./components/StatusBar";
 import DownloadPage from "./pages/DownloadPage";
-import VideoOpsPage from "./pages/VideoOpsPage";
+import VideoOpPage from "./pages/VideoOpPage";
 import SettingsPage from "./pages/SettingsPage";
 import ChoiceDialog from "./components/ChoiceDialog";
 import Toasts from "./components/Toasts";
@@ -11,15 +11,12 @@ import * as ipc from "./lib/ipc";
 import { startBridge, hydrate, loadSettings, run } from "./store/store";
 import { readThemeMode, setThemeMode } from "./lib/theme";
 
-const TITLES: Record<Page, string> = {
-  download: "下载",
-  videoOps: "视频操作",
-  settings: "设置",
-};
-
 export default function App() {
   // 三个页面用 useState 切就够了，不引 react-router —— 桌面 App 没有 URL 的需求。
-  const [page, setPage] = useState<Page>("download");
+  const [page, setPage] = useState<Page>({ kind: "download" });
+  // 侧边栏「视频操作」那一组展开没有。放这里而不是 Sidebar 内部：三个页面是条件渲染的，
+  // 切页会卸载整棵子树，放里面一次切页就重置了（与下面的 url 同理）。
+  const [subOpen, setSubOpen] = useState(false);
 
   // 输入框的内容**放在这里，不放 DownloadPage 里**：三个页面是条件渲染的，
   // 切去设置页会让下载页整棵子树卸载，写了一半、还没提交的链接就跟着没了
@@ -46,7 +43,12 @@ export default function App() {
 
   return (
     <div className="flex h-full">
-      <Sidebar page={page} onNavigate={setPage}>
+      <Sidebar
+        page={page}
+        onNavigate={setPage}
+        subOpen={subOpen}
+        onToggleSub={() => setSubOpen((v) => !v)}
+      >
         <StatusBar version="v0.1.0" />
       </Sidebar>
 
@@ -59,7 +61,7 @@ export default function App() {
           className="flex items-center justify-between px-6 pt-5 pb-3 select-none"
         >
           <h1 className="text-[22px] font-semibold" style={{ letterSpacing: "-0.01em" }}>
-            {TITLES[page]}
+            {pageTitle(page)}
           </h1>
           <WindowControls />
         </header>
@@ -69,9 +71,11 @@ export default function App() {
             而百分比高度需要一个**确定高度**的父级；中间多包一层 auto 高的 div，
             h-full 就退化成 auto，那句"粘贴一个视频链接"会贴着输入行而不是居中。 */}
         <div className="flex-1 overflow-y-auto px-6">
-          {page === "download" && <DownloadPage url={url} onUrlChange={setUrl} onAdd={addUrl} />}
-          {page === "videoOps" && <VideoOpsPage />}
-          {page === "settings" && <SettingsPage />}
+          {page.kind === "download" && (
+            <DownloadPage url={url} onUrlChange={setUrl} onAdd={addUrl} />
+          )}
+          {page.kind === "videoOp" && <VideoOpPage op={page.op} />}
+          {page.kind === "settings" && <SettingsPage />}
         </div>
       </main>
 
