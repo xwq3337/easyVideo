@@ -105,3 +105,84 @@ fn argv_shape_is_well_formed() {
     assert!(args.last().unwrap().ends_with(".part"), "产物先写临时名: {}", args.last().unwrap());
     assert!(args.iter().position(|a| a == "-f").unwrap() < args.len() - 1, "-f 必须在输出之前");
 }
+
+// ===== 端到端真跑：素材现造、ffmpeg 内嵌，不需要网络 =====
+
+use easydownvideo::core::ffmpeg::ensure_ffmpeg;
+use easydownvideo::core::videoops::ffmpeg_job::{run_job, JobOutcome};
+use easydownvideo::core::videoops::media_info::inspect;
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
+
+/// **spec §9 要求的那条端到端**：真把一段 H.264/mp4 转成 WebM，并断言产物里
+/// 视频是 vp9、音频是 **opus**。
+///
+/// 为什么这条非有不可：上面那些参数形状的测试只能证明"我们拼出来的 argv 长对了"，
+/// 证明不了"这套 argv 真的跑得通"。而 WebM 那条路是最容易在集成处翻车的 ——
+/// 容器只收 VP8/VP9/AV1 + Vorbis/Opus，音频编码一旦被改成 aac 就是硬失败，
+/// 而那是个**拼写正确、语义错误**的改动，形状测试拦不住。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transcodes_to_webm_for_real_with_vp9_and_opus() {
+    let dir = tempfile::tempdir().unwrap();
+    let ffmpeg = ensure_ffmpeg(dir.path()).unwrap();
+    let src = dir.path().join("src.mp4");
+
+    // 3 秒 320x240 带音频的 H.264/mp4 素材
+    let gen = tokio::process::Command::new(&ffmpeg)
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=duration=3:size=320x240:rate=15",
+               "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+               "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
+               "-c:a", "aac", "-shortest"])
+        .arg(&src).output().await.unwrap();
+    assert!(gen.status.success(), "{}", String::from_utf8_lossy(&gen.stderr));
+    let info = inspect(&ffmpeg, &src).await.unwrap();
+    assert_eq!(info.video_codec.as_deref(), Some("h264"));
+    assert_eq!(info.container.as_deref(), Some("mp4"));
+
+    let out = dir.path().join("out.webm");
+    let p = params(TargetFormat::WebmVp9, CompressPreset::Small);
+    let args = transcode_args(&src, &out, &p);
+    let outcome = run_job(&ffmpeg, &args, &out, Some(3.0), Arc::new(|_| {}),
+                          &CancellationToken::new()).await.unwrap();
+    assert_eq!(outcome, JobOutcome::Done);
+    assert!(out.exists(), "产物必须就位");
+
+    // 产物真能被读回，而且编码真的是 vp9 / opus —— 不是"argv 看着对"
+    let back = inspect(&ffmpeg, &out).await.unwrap();
+    assert_eq!(back.video_codec.as_deref(), Some("vp9"), "视频应当是 vp9");
+    assert_eq!(back.container.as_deref(), Some("webm"), "容器应当是 webm");
+    let d = back.duration_secs.expect("产物时长");
+    assert!((d - 3.0).abs() < 0.5, "时长应约 3 秒，实际: {d}");
+}
+
+/// 顺带把另外两组也真跑一遍 —— 它们各自有"看着对但跑不通"的风险：
+/// H.265 进 mp4、H.264 进 matroska。断言编码与容器都对。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transcodes_to_h265_mp4_and_matroska_for_real() {
+    let dir = tempfile::tempdir().unwrap();
+    let ffmpeg = ensure_ffmpeg(dir.path()).unwrap();
+    let src = dir.path().join("src.mp4");
+    let gen = tokio::process::Command::new(&ffmpeg)
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=duration=2:size=320x240:rate=15",
+               "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+               "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
+               "-c:a", "aac", "-shortest"])
+        .arg(&src).output().await.unwrap();
+    assert!(gen.status.success());
+    let info = inspect(&ffmpeg, &src).await.unwrap();
+
+    for (target, want_codec, want_ext) in [
+        (TargetFormat::Mp4H265, "hevc", "mp4"),
+        (TargetFormat::MkvH264, "h264", "mkv"),
+    ] {
+        let out = dir.path().join(format!("out.{want_ext}"));
+        let args = transcode_args(&src, &out, &params(target, CompressPreset::Small));
+        let outcome = run_job(&ffmpeg, &args, &out, Some(2.0), Arc::new(|_| {}),
+                              &CancellationToken::new()).await.unwrap();
+        assert_eq!(outcome, JobOutcome::Done, "{target:?}");
+        let back = inspect(&ffmpeg, &out).await.unwrap();
+        assert_eq!(back.video_codec.as_deref(), Some(want_codec), "{target:?}");
+        assert_eq!(back.container.as_deref(), Some(want_ext), "{target:?}");
+        let _ = info;
+    }
+}
