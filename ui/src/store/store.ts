@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import type { TaskView } from "../lib/types";
+import type { JobView, TaskView } from "../lib/types";
 import * as ipc from "../lib/ipc";
 import { initialState, reduce, type Action, type UiState } from "./reducer";
 
@@ -62,6 +62,24 @@ function scheduleResyncIfNeeded() {
  * 每个调用点（每个 tick 的重同步、startBridge、addUrl）都不必再接 rejection。
  * 见 item 2 的说明与 final-fix-wave 报告。
  */
+/**
+ * 拉一次全量视频任务。
+ *
+ * **必须挂在 `hydrate()` 里**：RESYNC 是两条通道共用的那一个事件名，前端收到它就整体
+ * 重取。只重取下载任务的话，视频那条通道落后时任务列表会永远停在旧状态。
+ */
+export async function hydrateJobs() {
+  let jobs: JobView[];
+  try {
+    jobs = await ipc.getVideoJobs();
+  } catch (e) {
+    reportReloadFailure(e);
+    return;
+  }
+  reloadFailureReported = false;
+  dispatch({ kind: "hydrateJobs", jobs });
+}
+
 export async function hydrate() {
   let dtos: Awaited<ReturnType<typeof ipc.getTasks>>;
   try {
@@ -84,6 +102,8 @@ export async function hydrate() {
       lastTickAt: 0,
     })),
   });
+  // 视频任务与下载任务共用同一个 resync 信号，所以一起重取。
+  await hydrateJobs();
   // 重同步之后，处于"等待选择"却没有候选副本的行，逐个去问 core 要。
   // 这一步就是"丢掉 ChoicesOffered 之后模态框还能弹出来"的唯一保证。
   for (const t of state.tasks) {
@@ -134,11 +154,16 @@ export async function startBridge() {
   // 监听注册失败（webview 权限之类）也只报一条 toast；hydrate 自带 catch。
   await run(ipc.onEngineEvent((event) => dispatch({ kind: "event", event })));
   await run(ipc.onResync((dropped) => dispatch({ kind: "resyncRequested", dropped })));
+  await run(ipc.onVideoOpEvent((event) => dispatch({ kind: "videoEvent", event })));
   await hydrate();
 }
 
 export function useTaskList(): TaskView[] {
   return useSyncExternalStore(store.subscribe, store.getSnapshot).tasks;
+}
+
+export function useJobList(): JobView[] {
+  return useSyncExternalStore(store.subscribe, store.getSnapshot).jobs;
 }
 
 /** 被「稍后再说」压住、暂不弹选择框的任务 id。 */

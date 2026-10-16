@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { humanizeSeconds, initialState, reduce, selectPendingChoice } from "./reducer";
-import type { ChoiceKindDto, SettingsDto, TaskView } from "../lib/types";
+import type { ChoiceKindDto, JobView, SettingsDto, TaskView } from "../lib/types";
 
 function task(id: number, over: Partial<TaskView> = {}): TaskView {
   return {
@@ -339,5 +339,69 @@ describe("taskRemoved", () => {
     const next = reduce(s, { kind: "event", event: { type: "taskRemoved", id: 99 } });
     expect(next.tasks.map((t) => t.id)).toEqual([1]);
     expect(next.needsResync).toBe(true);
+  });
+});
+
+function job(id: number, over: Partial<JobView> = {}): JobView {
+  return {
+    id,
+    label: "压缩 · 均衡",
+    input: `/in/${id}.mp4`,
+    output: `/out/${id}-压缩.mp4`,
+    state: { kind: "queued" },
+    progress: null,
+    ...over,
+  };
+}
+
+describe("视频任务", () => {
+  it("hydrateJobs 整体替换", () => {
+    const before = { ...initialState, jobs: [job(1), job(2)] };
+    const after = reduce(before, { kind: "hydrateJobs", jobs: [job(3)] });
+    expect(after.jobs.map((j) => j.id)).toEqual([3]);
+  });
+
+  it("stateChanged 只改那一条任务", () => {
+    const before = { ...initialState, jobs: [job(1), job(2)] };
+    const after = reduce(before, {
+      kind: "videoEvent",
+      event: { type: "stateChanged", id: 2, state: { kind: "done" } },
+    });
+    expect(after.jobs[0].state).toEqual({ kind: "queued" });
+    expect(after.jobs[1].state).toEqual({ kind: "done" });
+  });
+
+  it("progress 只改分数，不动状态", () => {
+    const before = { ...initialState, jobs: [job(1, { state: { kind: "running" } })] };
+    const after = reduce(before, {
+      kind: "videoEvent",
+      event: { type: "progress", id: 1, fraction: 0.42 },
+    });
+    expect(after.jobs[0].progress).toBe(0.42);
+    expect(after.jobs[0].state).toEqual({ kind: "running" });
+  });
+
+  it("removed 把那一行删掉", () => {
+    const before = { ...initialState, jobs: [job(1), job(2)] };
+    const after = reduce(before, { kind: "videoEvent", event: { type: "removed", id: 1 } });
+    expect(after.jobs.map((j) => j.id)).toEqual([2]);
+  });
+
+  it("added 只标记需要重同步 —— 行的内容要等全量来", () => {
+    // 事件里只有 id，没有 label/input/output。前端不自己编一行出来：
+    // core 是唯一真相源，编出来的一行在随后 hydrate 时还要被替换掉。
+    const after = reduce(initialState, { kind: "videoEvent", event: { type: "added", id: 5 } });
+    expect(after.needsResync).toBe(true);
+    expect(after.jobs).toEqual([]);
+  });
+
+  it("未知 id 的事件不丢帧，而是标记需要重同步", () => {
+    const before = { ...initialState, jobs: [job(1)] };
+    const after = reduce(before, {
+      kind: "videoEvent",
+      event: { type: "stateChanged", id: 404, state: { kind: "done" } },
+    });
+    expect(after.jobs).toHaveLength(1);
+    expect(after.needsResync).toBe(true);
   });
 });

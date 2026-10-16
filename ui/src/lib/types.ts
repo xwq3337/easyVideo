@@ -87,3 +87,35 @@ export interface TaskView extends TaskDto {
   /** 上一次进度事件的时间戳，用于算速度差。 */
   lastTickAt: number;
 }
+
+// ===== 视频操作 =====
+//
+// 与下载那套刻意分开：事件走自己的通道，DTO 不塞进 TaskDto 的联合里，
+// 免得两边互相污染。
+
+export type JobStateDto =
+  | { kind: "queued" }
+  | { kind: "running" }
+  | { kind: "done" }
+  | { kind: "failed"; message: string }
+  | { kind: "canceled" };
+
+export interface JobDto {
+  id: number;
+  /** 形如 "压缩 · 均衡"，列表直接显示，不在前端拼。 */
+  label: string;
+  input: string;
+  output: string;
+  state: JobStateDto;
+  /** 0–1。null = 时长未知，界面显示不确定态进度条。 */
+  progress: number | null;
+}
+
+/** 界面直接用，不需要额外的本地字段 —— 视频任务没有"正在改名"这种局部态。 */
+export type JobView = JobDto;
+
+export type VideoOpEventDto =
+  | { type: "added"; id: number }
+  | { type: "removed"; id: number }
+  | { type: "progress"; id: number; fraction: number }
+  | { type: "stateChanged"; id: number; state: JobStateDto };

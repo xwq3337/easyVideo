@@ -1,10 +1,23 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { ChoiceDto, ChoiceKindDto, EventDto, SettingsDto, TaskDto } from "./types";
+import type {
+  ChoiceDto,
+  ChoiceKindDto,
+  EventDto,
+  JobDto,
+  SettingsDto,
+  TaskDto,
+  VideoOpEventDto,
+} from "./types";
 
 // 命令名与 src-tauri/src/main.rs 的 invoke_handler![...] 逐字对应；
-// 参数名与 commands.rs 里各命令的形参逐字对应。两边都靠人盯着（没有测试钉得住），
+// 参数名与 commands.rs 里各命令的形参对应。两边都靠人盯着（没有测试钉得住），
 // 写错只会表现为运行时的 "command not found" / 参数缺失。
+//
+// **多词形参要写成 camelCase，不是逐字照抄。** `#[tauri::command]` 默认
+// `argument_case: ArgumentCase::Camel`（tauri-macros 的 wrapper.rs:51），所以 Rust 的
+// `output_dir` / `audio_kbps` 在 JS 侧是 `outputDir` / `audioKbps`。
+// 照抄成 snake_case 会在运行时得到 "missing required key"。
 export const getTasks = () => invoke<TaskDto[]>("get_tasks");
 export const addUrl = (url: string) => invoke<number>("add_url", { url });
 export const pause = (id: number) => invoke<void>("pause", { id });
@@ -18,6 +31,33 @@ export const setChoice = (id: number, choice: ChoiceDto) => invoke<void>("set_ch
 export const getSettings = () => invoke<SettingsDto>("get_settings");
 export const updateSettings = (settings: SettingsDto) => invoke<void>("update_settings", { settings });
 export const pickDownloadDir = () => invoke<string | null>("pick_download_dir");
+
+// ===== 视频操作 =====
+
+export const getVideoJobs = () => invoke<JobDto[]>("get_video_jobs");
+
+export const addCompressJob = (args: {
+  input: string;
+  outputDir: string;
+  preset: string;
+  encoder: string;
+  maxHeight: number | null;
+  crf: number | null;
+  qv: number | null;
+  audioKbps: number | null;
+}) => invoke<number>("add_compress_job", args);
+
+export const cancelVideoJob = (id: number) => invoke<void>("cancel_video_job", { id });
+export const removeVideoJob = (id: number) => invoke<void>("remove_video_job", { id });
+export const pickVideoFile = () => invoke<string | null>("pick_video_file");
+export const probeVideo = (path: string) =>
+  invoke<{ durationSecs: number | null; hasVideo: boolean; sizeBytes: number }>("probe_video", {
+    path,
+  });
+
+/** 视频任务的事件走**自己的通道名**，所以前端按事件名路由，不必嗅探联合类型的 tag。 */
+export const onVideoOpEvent = (cb: (e: VideoOpEventDto) => void) =>
+  listen<VideoOpEventDto>("videoops://event", (ev) => cb(ev.payload));
 
 export const onEngineEvent = (cb: (e: EventDto) => void) =>
   listen<EventDto>("engine://event", (ev) => cb(ev.payload));

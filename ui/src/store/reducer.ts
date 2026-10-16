@@ -1,7 +1,17 @@
-import type { ChoiceKindDto, EventDto, SettingsDto, TaskView } from "../lib/types";
+import type {
+  ChoiceKindDto,
+  EventDto,
+  JobView,
+  SettingsDto,
+  TaskView,
+  VideoOpEventDto,
+} from "../lib/types";
 
 export interface UiState {
   tasks: TaskView[];
+  /** 视频操作任务。与 tasks 同住一个 store，因为 RESYNC 是两条通道共用的：
+   *  任一条落后都整体重取，分成两个 store 反而要维护两条重同步路径。 */
+  jobs: JobView[];
   settings: SettingsDto | null;
   /** 收到过无法对应到已知任务的 id。为 true 时由 store 去拉一次全量。 */
   needsResync: boolean;
@@ -15,6 +25,7 @@ export interface UiState {
 
 export const initialState: UiState = {
   tasks: [],
+  jobs: [],
   settings: null,
   needsResync: false,
   lastDropped: 0,
@@ -44,6 +55,8 @@ export function humanizeSeconds(s: number): string {
 
 export type Action =
   | { kind: "hydrate"; tasks: TaskView[] }
+  | { kind: "hydrateJobs"; jobs: JobView[] }
+  | { kind: "videoEvent"; event: VideoOpEventDto }
   | { kind: "event"; event: EventDto; now?: number } // now 便于测试，默认 Date.now()
   | { kind: "choices"; id: number; choices: ChoiceKindDto }
   | { kind: "settings"; settings: SettingsDto }
@@ -111,6 +124,36 @@ export function reduce(state: UiState, action: Action): UiState {
       };
     }
 
+    case "hydrateJobs": {
+      // 整体替换，不做合并：core 是唯一真相源。
+      // 进度也在里面 —— 视频任务的进度本来就是全局量（core 按 ffmpeg 自己的节奏报），
+      // 不像下载那边那样是"两次事件之间的差"，所以不需要在重同步时归零。
+      return { ...state, jobs: action.jobs, needsResync: false };
+    }
+    case "videoEvent": {
+      const { event } = action;
+      if (event.type === "added") {
+        // 事件里只有 id，没有可显示的内容。不在这里编一行出来 —— 编出来的一行
+        // 在随后的 hydrate 里还要被替换掉，等于凭空多一个中间态。
+        return { ...state, needsResync: true };
+      }
+      if (event.type === "removed") {
+        const exists = state.jobs.some((j) => j.id === event.id);
+        if (!exists) return { ...state, needsResync: true };
+        return { ...state, jobs: state.jobs.filter((j) => j.id !== event.id), needsResync: false };
+      }
+      const known = state.jobs.some((j) => j.id === event.id);
+      if (!known) {
+        // 与下载事件同义：可能事件先于水合到达，记一笔去拉全量。
+        return { ...state, needsResync: true };
+      }
+      const jobs = state.jobs.map((j): JobView => {
+        if (j.id !== event.id) return j;
+        if (event.type === "progress") return { ...j, progress: event.fraction };
+        return { ...j, state: event.state };
+      });
+      return { ...state, jobs, needsResync: false };
+    }
     case "resyncRequested":
       return { ...state, needsResync: true, lastDropped: action.dropped };
 
