@@ -79,7 +79,10 @@ impl JobParams {
     /// 队列那一行显示的标签，形如 "压缩 · 均衡"。
     pub fn label(&self) -> String;
     /// 拼出完整的 ffmpeg 参数。
-    pub fn args(&self, input: &Path, output: &Path) -> Vec<String>;
+    ///
+    /// **要收 `src`**：裁剪的快速档得用源容器决定 `-f`（copy 到别的容器会直接失败）。
+    /// 压缩与转码用不上它，但签名统一 —— 否则调用方得先判断是哪个操作才知道传什么。
+    pub fn args(&self, input: &Path, output: &Path, src: &MediaInfo) -> Vec<String>;
     /// 产物名的后缀，形如 "-压缩"。
     pub fn suffix(&self) -> &'static str;
     /// 产物的扩展名。**不是常量** —— 见下。
