@@ -100,8 +100,22 @@ fn refuses_to_overwrite_the_source_file() {
     assert!(last.ends_with(".part"), "产物应先写临时名，实际: {last}");
 }
 
+/// **产物名以 `.part` 收尾会让 ffmpeg 的格式推断失败。**
+/// 实测：`ffmpeg ... out.mp4.part` 直接报 "Error opening output file ... Invalid argument"，
+/// 因为它按扩展名猜容器，而 `.part` 不是任何已知格式。所以容器必须显式指定。
+/// （`.part` 在 HLS 那边没问题，是因为那里的分片文件由我们自己的代码写，不经 ffmpeg。）
 #[test]
-fn shape_is_container_agnostic_and_never_touches_stdin() {
+fn names_the_container_explicitly_so_the_part_suffix_cannot_break_it() {
+    let args = run(&p(CompressPreset::Balanced, Encoder::Software));
+    let f = args.iter().position(|a| a == "-f").expect("必须显式指定容器格式");
+    assert_eq!(args[f + 1], "mp4");
+    // `-f` 是**输出**选项，必须排在输出文件之前，否则会作用到输入上
+    assert!(f < args.len() - 1, "-f 必须在输出文件之前，实际: {args:?}");
+    assert!(args.last().unwrap().ends_with(".part"));
+}
+
+#[test]
+fn argv_shape_is_well_formed() {
     let args = run(&p(CompressPreset::Balanced, Encoder::Software));
     assert!(has(&args, "-nostdin"), "不阻断 stdin 的话 ffmpeg 会去读它并可能挂住");
     assert!(has(&args, "-hide_banner"));

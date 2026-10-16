@@ -1,5 +1,12 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+
+/// 临时产物名。**唯一的产出方式** —— `compress_args` 把它交给 ffmpeg，
+/// `run_job` 用它做失败清理与成功改名。三处各写一遍 `format!` 迟早会分叉，
+/// 而分叉的后果是清理清不掉、改名改了个不存在的文件。
+pub fn part_path_for(output: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.part", output.to_string_lossy()))
+}
 
 /// 三档质量预设。数值取自 spec 第 6.1 节。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,7 +155,15 @@ pub fn compress_args(input: &Path, output: &Path, p: &CompressParams) -> Vec<Str
     a.push("-b:a".into());
     a.push(format!("{}k", p.audio_kbps.unwrap_or(kbps_default)));
 
+    // **容器必须显式指定。** ffmpeg 默认按扩展名猜容器，而我们的产物以 `.part`
+    // 收尾（先写临时名，成功后再 rename），`.part` 不是任何已知格式 ——
+    // 实测直接报 "Error opening output file ...out.mp4.part. Invalid argument"，
+    // 三个端到端测试全红。写成 `-f mp4` 之后扩展名就不参与推断了。
+    // 容器固定 mp4 本来就是 spec 第 6.3 节的决定，所以这不算新增耦合。
+    a.push("-f".into());
+    a.push("mp4".into());
+
     // 最后一个是输出路径（先写临时名）
-    a.push(format!("{}.part", output.to_string_lossy()));
+    a.push(part_path_for(output).to_string_lossy().into_owned());
     a
 }
