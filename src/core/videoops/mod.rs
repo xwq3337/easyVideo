@@ -3,6 +3,7 @@ pub mod ffmpeg_job;
 pub mod media_info;
 pub mod params;
 pub mod transcode;
+pub mod trim;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
