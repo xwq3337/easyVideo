@@ -280,3 +280,44 @@ async fn honours_the_configured_ffmpeg_override() {
     ops.set_ffmpeg_override(None);
     assert!(ops.probe(src).await.is_ok(), "清掉覆盖值后应回到内嵌那份");
 }
+
+/// **产物名预览与实际落盘必须一致。** 它们走的是同一个 `plan_output_path`，
+/// 这条测试守住它：哪天有人给其中一边加了特例（比如预览忘了算在途任务的占位），
+/// 这里就红 —— 而那个分叉正是产物名预览存在的意义。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_output_matches_the_path_add_job_actually_takes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ffmpeg = ensure_ffmpeg(dir.path()).unwrap();
+    let src = dir.path().join("src.mp4");
+    make_src(&ffmpeg, &src, 20).await; // 慢到第一个任务跑不完
+    let out_dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let ops = VideoOps::new(rt, dir.path().to_path_buf());
+
+    // 还没有任何任务时的预览
+    let planned = ops
+        .plan_output(src.clone(), out_dir.path().to_path_buf(), params())
+        .await
+        .unwrap();
+    assert!(planned.ends_with("src-压缩.mp4"), "实际: {planned}");
+
+    // 入队，比对它真正用的路径
+    let id = ops
+        .add_job(src.clone(), out_dir.path().to_path_buf(), params())
+        .await
+        .unwrap();
+    let real = ops.list_jobs().iter().find(|j| j.id == id).unwrap().output.clone();
+    assert_eq!(std::path::PathBuf::from(&planned), real, "预览与实际必须一致");
+
+    // 再预览一次：这次要绕开刚入队那个（**在途任务也要占位**）
+    let planned2 = ops
+        .plan_output(src.clone(), out_dir.path().to_path_buf(), params())
+        .await
+        .unwrap();
+    assert!(
+        planned2.ends_with("src-压缩 (1).mp4"),
+        "在途任务必须占位，否则第二行会覆盖第一行的产物。实际: {planned2}"
+    );
+
+    ops.cancel(id);
+}

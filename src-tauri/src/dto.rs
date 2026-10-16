@@ -324,7 +324,81 @@ pub struct VideoInfoDto {
     /// `None` = 读不到（损坏文件等）。界面显示"时长未知"，不显示 0。
     pub duration_secs: Option<f64>,
     pub has_video: bool,
+    /// 视频编码，形如 "h264"。取不到时 None，界面显示"编码未知"。
+    pub video_codec: Option<String>,
+    /// 容器，形如 "mp4"。取不到时 None。
+    pub container: Option<String>,
+    /// 文件大小。**不从 MediaInfo 来** —— 那是纯文件系统的事，命令层自己读。
     pub size_bytes: u64,
+}
+
+// ===== 视频操作的入参 =====
+//
+// 一条命令收一个带 tag 的枚举，而不是给每个操作开一条命令：后者要重复
+// input/output_dir 三遍，而"八个位置参数"那股味道在压缩命令上已经尝过了。
+// 用枚举仍然保住编译期类型检查（`set_choice` 已经在用这个模式）。
+
+use easydownvideo::core::videoops::compress::CompressParams;
+use easydownvideo::core::videoops::params::JobParams;
+use easydownvideo::core::videoops::transcode::TranscodeParams;
+use easydownvideo::core::videoops::trim::TrimParams;
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "op", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum JobParamsDto {
+    Compress {
+        preset: String,
+        encoder: String,
+        max_height: Option<u32>,
+        crf: Option<u8>,
+        qv: Option<u8>,
+        audio_kbps: Option<u32>,
+    },
+    Transcode {
+        target: String,
+        preset: String,
+    },
+    Trim {
+        start_secs: f64,
+        #[serde(default)]
+        end_secs: Option<f64>,
+        mode: String,
+    },
+}
+
+impl TryFrom<JobParamsDto> for JobParams {
+    /// `String` 而不是 `anyhow::Error`：src-tauri 没有 anyhow 依赖，而这一层的产物
+    /// 本来就是"给人看的一句话"（命令层直接把它放进 toast）。错误链在这里就格式化成
+    /// `{e:#}`，与命令层的做法一致。
+    type Error = String;
+    fn try_from(d: JobParamsDto) -> Result<Self, Self::Error> {
+        Ok(match d {
+            JobParamsDto::Compress {
+                preset,
+                encoder,
+                max_height,
+                crf,
+                qv,
+                audio_kbps,
+            } => JobParams::Compress(CompressParams {
+                preset: preset.parse().map_err(|e| format!("{e:#}"))?,
+                encoder: encoder.parse().map_err(|e| format!("{e:#}"))?,
+                max_height,
+                crf,
+                qv,
+                audio_kbps,
+            }),
+            JobParamsDto::Transcode { target, preset } => JobParams::Transcode(TranscodeParams {
+                target: target.parse().map_err(|e| format!("{e:#}"))?,
+                preset: preset.parse().map_err(|e| format!("{e:#}"))?,
+            }),
+            JobParamsDto::Trim { start_secs, end_secs, mode } => JobParams::Trim(TrimParams {
+                start: start_secs,
+                end: end_secs,
+                mode: mode.parse().map_err(|e| format!("{e:#}"))?,
+            }),
+        })
+    }
 }
 
 pub fn video_event_dto(ev: VideoOpEvent) -> serde_json::Value {
@@ -346,6 +420,9 @@ pub fn video_event_dto(ev: VideoOpEvent) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use easydownvideo::core::videoops::compress::{CompressPreset, Encoder};
+    use easydownvideo::core::videoops::transcode::TargetFormat;
+    use easydownvideo::core::videoops::trim::TrimMode;
     use easydownvideo::core::events::{ChoiceKind, EngineEvent, ProgressUnit, TaskState};
     use easydownvideo::core::hls::parse::VariantChoice;
     use easydownvideo::core::ytdlp::YtdlpFormat;
@@ -760,5 +837,98 @@ mod tests {
         let v = serde_json::to_value(&j).unwrap();
         assert_eq!(v["progress"], serde_json::Value::Null);
         assert!(v.get("progress").is_some(), "None 必须是 null 而不是缺字段");
+    }
+    /// 带 tag 的参数枚举：wire 形状必须与 TS 镜像逐字一致。
+    /// 这是 `add_video_job` 唯一的入参，错了就是运行时的 "invalid args"。
+    #[test]
+    fn job_params_dto_pins_the_tagged_shape() {
+        let d: JobParamsDto = serde_json::from_str(
+            r#"{"op":"compress","preset":"balanced","encoder":"auto","maxHeight":null,
+                "crf":null,"qv":null,"audioKbps":null}"#,
+        )
+        .unwrap();
+        match JobParams::try_from(d).unwrap() {
+            JobParams::Compress(p) => {
+                assert_eq!(p.preset, CompressPreset::Balanced);
+                assert_eq!(p.encoder, Encoder::Auto);
+                assert_eq!(p.max_height, None);
+            }
+            other => panic!("应转成 Compress，得到 {other:?}"),
+        }
+
+        let d: JobParamsDto =
+            serde_json::from_str(r#"{"op":"transcode","target":"webmvp9","preset":"high"}"#).unwrap();
+        match JobParams::try_from(d).unwrap() {
+            JobParams::Transcode(p) => {
+                assert_eq!(p.target, TargetFormat::WebmVp9);
+                assert_eq!(p.preset, CompressPreset::High);
+            }
+            other => panic!("应转成 Transcode，得到 {other:?}"),
+        }
+
+        // endSecs 缺省 = 到结尾
+        let d: JobParamsDto =
+            serde_json::from_str(r#"{"op":"trim","startSecs":12.5,"mode":"fast"}"#).unwrap();
+        match JobParams::try_from(d).unwrap() {
+            JobParams::Trim(p) => {
+                assert_eq!(p.start, 12.5);
+                assert_eq!(p.end, None);
+                assert_eq!(p.mode, TrimMode::Fast);
+            }
+            other => panic!("应转成 Trim，得到 {other:?}"),
+        }
+    }
+
+    /// 非法入参要在**入队之前**失败，而不是放进队列到 worker 里才炸。
+    ///
+    /// 两处失败点不一样，这是 DTO 的形状决定的、也是刻意的：
+    /// - 未知的 **`op` 标签** → 反序列化时就失败（tag 是枚举判别式）；
+    /// - 未知的**取值**（target / mode / preset）→ `TryFrom` 时失败
+    ///   （它们在 DTO 里是 `String`，形状合法但内容不认）。
+    ///
+    /// 两者都发生在命令层执行期间，也就是**排进队列之前** —— 这才是要保证的那件事。
+    #[test]
+    fn job_params_dto_rejects_unknown_values_before_queueing() {
+        // 未知 tag：反序列化就挂
+        assert!(serde_json::from_str::<JobParamsDto>(r#"{"op":"explode"}"#).is_err());
+
+        // 未知取值：形状合法，到 TryFrom 才挂
+        for bad in [
+            r#"{"op":"transcode","target":"mpeg2","preset":"high"}"#,
+            r#"{"op":"transcode","target":"webmvp9","preset":"huge"}"#,
+            r#"{"op":"trim","startSecs":1,"mode":"quick"}"#,
+            r#"{"op":"compress","preset":"huge","encoder":"auto"}"#,
+            r#"{"op":"compress","preset":"balanced","encoder":"cuda"}"#,
+        ] {
+            let dto: JobParamsDto = serde_json::from_str(bad).unwrap_or_else(|e| {
+                panic!("形状本身应当合法（{bad}），却解析失败: {e}")
+            });
+            assert!(
+                JobParams::try_from(dto).is_err(),
+                "这个取值应当被拒: {bad}"
+            );
+        }
+    }
+
+    /// `VideoInfoDto` 补了容器与编码 —— 转码页要靠它们显示"源：H.264 · mp4"。
+    #[test]
+    fn video_info_dto_carries_container_and_codec() {
+        let v = VideoInfoDto {
+            duration_secs: Some(30.0),
+            has_video: true,
+            video_codec: Some("h264".into()),
+            container: Some("mp4".into()),
+            size_bytes: 1000,
+        };
+        assert_eq!(
+            serde_json::to_value(&v).unwrap(),
+            serde_json::json!({
+                "durationSecs": 30.0,
+                "hasVideo": true,
+                "videoCodec": "h264",
+                "container": "mp4",
+                "sizeBytes": 1000
+            })
+        );
     }
 }

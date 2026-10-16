@@ -7,12 +7,12 @@
 
 use std::path::PathBuf;
 
-use easydownvideo::core::videoops::presets::CompressParams;
+use easydownvideo::core::videoops::params::JobParams;
 use tauri::State;
 
 use crate::dto::{
-    job_dto, settings_dto, settings_from, task_dto, ChoiceDto, ChoiceKindDto, JobDto, SettingsDto,
-    TaskDto, VideoInfoDto,
+    job_dto, settings_dto, settings_from, task_dto, ChoiceDto, ChoiceKindDto, JobDto, JobParamsDto,
+    SettingsDto, TaskDto, VideoInfoDto,
 };
 use crate::state::AppState;
 
@@ -134,35 +134,35 @@ pub fn get_video_jobs(state: State<'_, AppState>) -> Vec<JobDto> {
     state.videoops.list_jobs().into_iter().map(job_dto).collect()
 }
 
-/// 八个形参确实多，但每一个都是界面上一处控件；打包成结构体只会把同一份字段
-/// 在两个 crate 里各写一遍。前端的 ipc.ts 必须与之对应（**多词形参在 JS 侧是
-/// camelCase**，见 ipc.ts 的注释）。
+/// 入队一次视频操作。**一条命令收一个带 tag 的枚举** —— 见 `JobParamsDto` 的说明。
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
-pub async fn add_compress_job(
+pub async fn add_video_job(
     state: State<'_, AppState>,
     input: String,
     output_dir: String,
-    preset: String,
-    encoder: String,
-    max_height: Option<u32>,
-    crf: Option<u8>,
-    qv: Option<u8>,
-    audio_kbps: Option<u32>,
+    params: JobParamsDto,
 ) -> R<u64> {
-    let params = CompressParams {
-        preset: preset.parse().map_err(|e| format!("{e:#}"))?,
-        encoder: encoder.parse().map_err(|e| format!("{e:#}"))?,
-        max_height,
-        crf,
-        qv,
-        audio_kbps,
-    };
-    // 先把 VideoOps 克隆出来再 await：`State` 是个借用，跨 await 持有它会把借用
-    // 连带进 future，而 Tauri 要求 async 命令返回 `Send` future。
-    // VideoOps 内部是 Arc，克隆很便宜。
+    let params = JobParams::try_from(params)?; // 错误已经是给人看的一句话
+    // 先把 VideoOps 克隆出来再 await：State 是个借用，跨 await 持有它会把借用
+    // 连带进 future，而 Tauri 要求 async 命令返回 Send future。内部是 Arc，克隆很便宜。
     let ops = state.videoops.clone();
-    ops.add_compress_job(PathBuf::from(input), PathBuf::from(output_dir), params)
+    ops.add_job(PathBuf::from(input), PathBuf::from(output_dir), params)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// 只算产物名给界面预览。**与 `add_video_job` 走 core 里同一个取名函数** ——
+/// 两处各写一遍的话，预览与实际落盘会在某个边角上分叉。
+#[tauri::command]
+pub async fn plan_output(
+    state: State<'_, AppState>,
+    input: String,
+    output_dir: String,
+    params: JobParamsDto,
+) -> R<String> {
+    let params = JobParams::try_from(params)?; // 错误已经是给人看的一句话
+    let ops = state.videoops.clone();
+    ops.plan_output(PathBuf::from(input), PathBuf::from(output_dir), params)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -210,6 +210,8 @@ pub async fn probe_video(state: State<'_, AppState>, path: String) -> R<VideoInf
     Ok(VideoInfoDto {
         duration_secs: info.duration_secs,
         has_video: info.has_video,
+        video_codec: info.video_codec,
+        container: info.container,
         size_bytes,
     })
 }

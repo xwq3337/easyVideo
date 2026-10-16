@@ -234,6 +234,38 @@ impl VideoOps {
         Ok(id)
     }
 
+    /// 只算产物名，**不入队**。界面用它做产物名预览。
+    ///
+    /// 与 `add_job` 走同一个取名函数 —— 两处各写一遍的话，预览与实际落盘会在某个
+    /// 边角上分叉（比如"在途任务占位"只加了一边），而那正是预览存在的意义。
+    pub async fn plan_output(
+        &self,
+        input: PathBuf,
+        output_dir: PathBuf,
+        params: JobParams,
+    ) -> anyhow::Result<String> {
+        if !input.is_file() {
+            anyhow::bail!("找不到输入文件：{}", input.display());
+        }
+        let ffmpeg = self.ffmpeg()?;
+        let src = media_info::inspect(&ffmpeg, &input).await?;
+        let stem = input
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("video")
+            .to_string();
+        let jobs = self.inner.jobs.lock().unwrap();
+        Ok(Self::plan_output_path(
+            &jobs,
+            &output_dir,
+            &stem,
+            params.suffix(),
+            &params.extension(&src),
+        )
+        .to_string_lossy()
+        .into_owned())
+    }
+
     /// 算产物的完整路径。**`plan_output` 与 `add_job` 都走这里** —— 两处各写一遍的话，
     /// 预览与实际落盘会在某个边角上分叉，而那正是产物名预览存在的意义。
     ///
