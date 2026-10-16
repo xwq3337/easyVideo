@@ -4,6 +4,7 @@ pub mod ffmpeg_job;
 pub mod media_info;
 pub mod merge;
 pub mod params;
+pub mod preview;
 pub mod transcode;
 pub mod trim;
 
