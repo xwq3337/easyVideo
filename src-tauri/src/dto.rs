@@ -327,10 +327,25 @@ pub struct VideoInfoDto {
     pub has_video: bool,
     /// 视频编码，形如 "h264"。取不到时 None，界面显示"编码未知"。
     pub video_codec: Option<String>,
+    /// 音频编码，形如 "aac"。**没有音轨时是 null** —— 合并页要区分
+    /// "编码不同"（拦）与"压根没有音轨"（只警告）。
+    pub audio_codec: Option<String>,
     /// 容器，形如 "mp4"。取不到时 None。
     pub container: Option<String>,
+    /// 画面尺寸。**裁剪页的坐标系就是它**；读不出来时是 null，裁剪页据此禁用开始按钮。
+    pub width: Option<u32>,
+    pub height: Option<u32>,
     /// 文件大小。**不从 MediaInfo 来** —— 那是纯文件系统的事，命令层自己读。
     pub size_bytes: u64,
+}
+
+/// 合并的兼容性结论。**规则只在 core 里一份** —— 前端只负责把它画出来。
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeCheckDto {
+    /// 非空时禁止提交。
+    pub blockers: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 // ===== 视频操作的入参 =====
@@ -340,6 +355,7 @@ pub struct VideoInfoDto {
 // 用枚举仍然保住编译期类型检查（`set_choice` 已经在用这个模式）。
 
 use easydownvideo::core::videoops::compress::CompressParams;
+use easydownvideo::core::videoops::crop::CropParams;
 use easydownvideo::core::videoops::params::JobParams;
 use easydownvideo::core::videoops::transcode::TranscodeParams;
 use easydownvideo::core::videoops::trim::TrimParams;
@@ -364,6 +380,15 @@ pub enum JobParamsDto {
         #[serde(default)]
         end_secs: Option<f64>,
         mode: String,
+    },
+    /// 合并**没有参数** —— 顺序就是 `inputs` 的顺序。
+    Merge,
+    Crop {
+        width: u32,
+        height: u32,
+        x: u32,
+        y: u32,
+        preset: String,
     },
 }
 
@@ -398,6 +423,16 @@ impl TryFrom<JobParamsDto> for JobParams {
                 end: end_secs,
                 mode: mode.parse().map_err(|e| format!("{e:#}"))?,
             }),
+            JobParamsDto::Merge => JobParams::Merge,
+            JobParamsDto::Crop { width, height, x, y, preset } => {
+                JobParams::Crop(CropParams {
+                    width,
+                    height,
+                    x,
+                    y,
+                    preset: preset.parse().map_err(|e| format!("{e:#}"))?,
+                })
+            }
         })
     }
 }
@@ -918,7 +953,10 @@ mod tests {
             duration_secs: Some(30.0),
             has_video: true,
             video_codec: Some("h264".into()),
+            audio_codec: Some("aac".into()),
             container: Some("mp4".into()),
+            width: Some(1280),
+            height: Some(720),
             size_bytes: 1000,
         };
         assert_eq!(
@@ -927,8 +965,81 @@ mod tests {
                 "durationSecs": 30.0,
                 "hasVideo": true,
                 "videoCodec": "h264",
+                "audioCodec": "aac",
                 "container": "mp4",
+                "width": 1280,
+                "height": 720,
                 "sizeBytes": 1000
+            })
+        );
+    }
+
+    /// 新加的两个变体：wire 形状必须与 TS 镜像逐字一致。
+    #[test]
+    fn merge_and_crop_params_pin_the_tagged_shape() {
+        let d: JobParamsDto = serde_json::from_str(r#"{"op":"merge"}"#).unwrap();
+        assert_eq!(JobParams::try_from(d).unwrap(), JobParams::Merge);
+
+        let d: JobParamsDto = serde_json::from_str(
+            r#"{"op":"crop","width":640,"height":360,"x":320,"y":180,"preset":"high"}"#,
+        )
+        .unwrap();
+        match JobParams::try_from(d).unwrap() {
+            JobParams::Crop(p) => {
+                assert_eq!((p.width, p.height, p.x, p.y), (640, 360, 320, 180));
+                assert_eq!(p.preset, CompressPreset::High);
+            }
+            other => panic!("应转成 Crop，得到 {other:?}"),
+        }
+    }
+
+    /// 非法取值要在**入队之前**失败（与上一轮那两个变体同样的分工：
+    /// 未知 tag 在反序列化时挂，未知取值在 TryFrom 时挂）。
+    #[test]
+    fn crop_rejects_unknown_preset_and_missing_fields() {
+        // preset 不认
+        let d: JobParamsDto = serde_json::from_str(
+            r#"{"op":"crop","width":2,"height":2,"x":0,"y":0,"preset":"huge"}"#,
+        )
+        .unwrap();
+        assert!(JobParams::try_from(d).is_err());
+        // 少字段 → 反序列化就挂
+        assert!(serde_json::from_str::<JobParamsDto>(r#"{"op":"crop","width":2}"#).is_err());
+    }
+
+    /// `VideoInfoDto` 补了宽高与音频编码 —— 裁剪页要宽高，合并页要音频编码。
+    #[test]
+    fn video_info_dto_carries_dimensions_and_audio_codec() {
+        let v = VideoInfoDto {
+            duration_secs: Some(30.0),
+            has_video: true,
+            video_codec: Some("h264".into()),
+            audio_codec: Some("aac".into()),
+            container: Some("mp4".into()),
+            width: Some(1280),
+            height: Some(720),
+            size_bytes: 1000,
+        };
+        // 读不出来时必须是 null 而不是缺字段
+        let v = VideoInfoDto { width: None, height: None, audio_codec: None, ..v };
+        let j = serde_json::to_value(&v).unwrap();
+        assert_eq!(j["width"], serde_json::Value::Null);
+        assert_eq!(j["height"], serde_json::Value::Null);
+        assert_eq!(j["audioCodec"], serde_json::Value::Null);
+    }
+
+    /// 合并的检查结果：两个数组都必须在（前端按它们渲染红字与灰字）。
+    #[test]
+    fn merge_check_dto_pins_its_keys() {
+        let c = MergeCheckDto {
+            blockers: vec!["第 2 段的视频编码是 hevc，与第 1 段（h264）不一致".into()],
+            warnings: vec![],
+        };
+        assert_eq!(
+            serde_json::to_value(&c).unwrap(),
+            serde_json::json!({
+                "blockers": ["第 2 段的视频编码是 hevc，与第 1 段（h264）不一致"],
+                "warnings": []
             })
         );
     }

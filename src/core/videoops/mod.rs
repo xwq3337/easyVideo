@@ -312,6 +312,27 @@ impl VideoOps {
         .into_owned())
     }
 
+    /// 合并的兼容性检查。**与 `add_job` 里那次走同一个 `merge::check`** ——
+    /// 两处各写一遍的话，界面放行的组合会被入队拒绝（或反过来），
+    /// 而用户看到的是"按钮能点、点了报错"。
+    pub async fn check_merge(&self, inputs: Vec<PathBuf>) -> anyhow::Result<merge::MergeCheck> {
+        let ffmpeg = self.ffmpeg()?;
+        let mut infos = Vec::with_capacity(inputs.len());
+        for p in &inputs {
+            if !p.is_file() {
+                anyhow::bail!("找不到输入文件：{}", p.display());
+            }
+            infos.push(media_info::inspect(&ffmpeg, p).await?);
+        }
+        Ok(merge::check(&infos))
+    }
+
+    /// 抽一帧给界面做裁剪预览。
+    pub async fn preview(&self, path: PathBuf, at_secs: f64) -> anyhow::Result<String> {
+        let ffmpeg = self.ffmpeg()?;
+        preview::frame_data_url(&ffmpeg, &path, at_secs, preview::PREVIEW_MAX_WIDTH).await
+    }
+
     /// 算产物的完整路径。**`plan_output` 与 `add_job` 都走这里** —— 两处各写一遍的话，
     /// 预览与实际落盘会在某个边角上分叉，而那正是产物名预览存在的意义。
     ///

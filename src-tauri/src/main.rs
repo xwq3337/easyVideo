@@ -91,7 +91,10 @@ fn main() {
             commands::cancel_video_job,
             commands::remove_video_job,
             commands::pick_video_file,
+            commands::pick_video_files,
             commands::probe_video,
+            commands::check_merge,
+            commands::preview_frame,
         ])
         .setup(move |app| {
             // **macOS 上必须保留 decorations。** Tauri 自己的配置文档

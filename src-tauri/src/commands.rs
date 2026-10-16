@@ -12,7 +12,7 @@ use tauri::State;
 
 use crate::dto::{
     job_dto, settings_dto, settings_from, task_dto, ChoiceDto, ChoiceKindDto, JobDto, JobParamsDto,
-    SettingsDto, TaskDto, VideoInfoDto,
+    MergeCheckDto, SettingsDto, TaskDto, VideoInfoDto,
 };
 use crate::state::AppState;
 
@@ -138,7 +138,7 @@ pub fn get_video_jobs(state: State<'_, AppState>) -> Vec<JobDto> {
 #[tauri::command]
 pub async fn add_video_job(
     state: State<'_, AppState>,
-    input: String,
+    inputs: Vec<String>,
     output_dir: String,
     params: JobParamsDto,
 ) -> R<u64> {
@@ -146,7 +146,11 @@ pub async fn add_video_job(
     // 先把 VideoOps 克隆出来再 await：State 是个借用，跨 await 持有它会把借用
     // 连带进 future，而 Tauri 要求 async 命令返回 Send future。内部是 Arc，克隆很便宜。
     let ops = state.videoops.clone();
-    ops.add_job(vec![PathBuf::from(input)], PathBuf::from(output_dir), params)
+    ops.add_job(
+        inputs.into_iter().map(PathBuf::from).collect(),
+        PathBuf::from(output_dir),
+        params,
+    )
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -156,13 +160,17 @@ pub async fn add_video_job(
 #[tauri::command]
 pub async fn plan_output(
     state: State<'_, AppState>,
-    input: String,
+    inputs: Vec<String>,
     output_dir: String,
     params: JobParamsDto,
 ) -> R<String> {
     let params = JobParams::try_from(params)?; // 错误已经是给人看的一句话
     let ops = state.videoops.clone();
-    ops.plan_output(vec![PathBuf::from(input)], PathBuf::from(output_dir), params)
+    ops.plan_output(
+        inputs.into_iter().map(PathBuf::from).collect(),
+        PathBuf::from(output_dir),
+        params,
+    )
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -211,7 +219,45 @@ pub async fn probe_video(state: State<'_, AppState>, path: String) -> R<VideoInf
         duration_secs: info.duration_secs,
         has_video: info.has_video,
         video_codec: info.video_codec,
+        audio_codec: info.audio_codec,
         container: info.container,
+        width: info.width,
+        height: info.height,
         size_bytes,
     })
+}
+
+/// 合并的兼容性检查。界面在文件列表变化时调它，把 blockers 画成红字、warnings 画成灰字。
+#[tauri::command]
+pub async fn check_merge(state: State<'_, AppState>, inputs: Vec<String>) -> R<MergeCheckDto> {
+    let ops = state.videoops.clone();
+    let c = ops
+        .check_merge(inputs.into_iter().map(PathBuf::from).collect())
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(MergeCheckDto { blockers: c.blockers, warnings: c.warnings })
+}
+
+/// 抽一帧给裁剪页做预览，返回可直接塞进 `<img src>` 的 data URL。
+#[tauri::command]
+pub async fn preview_frame(state: State<'_, AppState>, path: String, at_secs: f64) -> R<String> {
+    let ops = state.videoops.clone();
+    ops.preview(PathBuf::from(path), at_secs)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// 多选视频文件（合并用）。与 `pick_video_file` 同理走回调式 API，不阻塞工作线程。
+#[tauri::command]
+pub async fn pick_video_files(app: tauri::AppHandle) -> R<Vec<String>> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .add_filter("视频", &["mp4", "mov", "mkv", "webm", "avi", "m4v", "ts"])
+        .pick_files(move |picked| {
+            let _ = tx.send(picked);
+        });
+    let picked = rx.await.map_err(|e| format!("文件选择被中断：{e}"))?;
+    Ok(picked.unwrap_or_default().into_iter().map(|p| p.to_string()).collect())
 }
