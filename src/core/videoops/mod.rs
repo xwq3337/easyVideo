@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::core::direct::unique_path_avoiding;
 use crate::core::ffmpeg::ensure_ffmpeg;
 use ffmpeg_job::{run_job, JobOutcome};
-use params::JobParams;
+use params::{JobContext, JobParams};
 
 pub type JobId = u64;
 
@@ -187,9 +187,6 @@ impl VideoOps {
                 input.display()
             );
         }
-        // **操作自己的语义校验**（裁剪的时间范围就靠这一步挡住）。
-        // 放在这里而不是命令层：入队校验全在 core，命令层只做薄封装，这条规矩别破。
-        params.validate(&src)?;
         // 真写一个探针文件，而不是查权限位 —— 权限位在 ACL、只读卷、网络盘上都不作数
         let probe = output_dir.join(".easydownvideo-write-probe");
         std::fs::write(&probe, b"")
@@ -205,6 +202,11 @@ impl VideoOps {
         // **取名 + 登记必须在同一个锁里** —— 见 `plan_output_path` 的说明。
         let id = {
             let mut jobs = self.inner.jobs.lock().unwrap();
+            let inputs = vec![input.clone()];
+            let infos = vec![src.clone()];
+            // `extension` 只看首段，所以不必先有 ctx —— 先算 output（它靠 extension），
+            // 再拿 output 的引用构造 ctx。**顺序不能反**：ctx 里要放 output 的引用，
+            // 而 output 要靠 extension 算。
             let output = Self::plan_output_path(
                 &jobs,
                 &output_dir,
@@ -212,7 +214,16 @@ impl VideoOps {
                 params.suffix(),
                 &params.extension(&src),
             );
-            let args = params.args(&input, &output, &src);
+            let ctx = JobContext {
+                inputs: &inputs,
+                infos: &infos,
+                output: &output,
+                scratch: None,
+            };
+            // **操作自己的语义校验**（裁剪的时间范围就靠这一步挡住）。
+            // 放在这里而不是命令层：入队校验全在 core，命令层只做薄封装，这条规矩别破。
+            params.validate(&ctx)?;
+            let args = params.args(&ctx);
             let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
             jobs.insert(
                 id,

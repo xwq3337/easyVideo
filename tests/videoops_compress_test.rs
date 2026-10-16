@@ -175,15 +175,51 @@ fn p_match() -> CompressParams {
 #[test]
 fn job_params_exposes_the_five_capabilities_for_compress() {
     let jp = JobParams::Compress(p(CompressPreset::Balanced, Encoder::Software));
+    let inputs = vec![PathBuf::from("/in/a.mp4")];
+    let infos = vec![src_mp4()];
+    let out = PathBuf::from("/out/a-压缩.mp4.part");
+    let ctx = JobContext { inputs: &inputs, infos: &infos, output: &out, scratch: None };
     assert_eq!(jp.label(), "压缩 · 均衡");
     assert_eq!(jp.suffix(), "-压缩");
     assert_eq!(jp.extension(&src_mp4()), "mp4");
     // 压缩目前没有额外的语义校验
-    assert!(jp.validate(&src_mp4()).is_ok());
+    assert!(jp.validate(&ctx).is_ok());
+    assert_eq!(jp.duration_secs(&ctx), Some(5.0), "分母是首段时长");
     // args 与直接调 compress_args 必须一致 —— 分派层不能顺手改行为
     let want = compress_args(Path::new("/in/a.mp4"), Path::new("/out/a-压缩.mp4.part"), &p_match());
+    assert_eq!(jp.args(&ctx), want);
+}
+
+// ===== JobContext：五个能力从收单个 src 改成收它 =====
+
+use easydownvideo::core::videoops::params::JobContext;
+use std::path::PathBuf;
+
+/// `JobContext::src()` 必须返回**首段**的信息 —— 单输入的操作看的就是它，
+/// 而合并那种多输入的，名字与容器也都按首段定。
+#[test]
+fn job_context_src_is_the_first_input() {
+    let a = src_mp4();
+    let mut b = src_mp4();
+    b.video_codec = Some("hevc".into());
+    let inputs = vec![PathBuf::from("/in/a.mp4"), PathBuf::from("/in/b.mp4")];
+    let infos = vec![a.clone(), b.clone()];
+    let out = PathBuf::from("/out/x.mp4");
+    let ctx = JobContext { inputs: &inputs, infos: &infos, output: &out, scratch: None };
+    assert_eq!(ctx.src(), &a, "取的是首段");
+    assert_eq!(ctx.inputs.len(), 2, "全部输入都在 ctx 里");
+    assert!(ctx.scratch.is_none(), "没有临时文件时是 None");
+}
+
+/// 进度条的分母：单输入的操作取首段时长（合并那支在 Task 4 里加）。
+#[test]
+fn job_context_duration_comes_from_the_first_input() {
+    let inputs = vec![PathBuf::from("/in/a.mp4")];
+    let infos = vec![src_mp4()];
+    let out = PathBuf::from("/out/x.mp4");
+    let ctx = JobContext { inputs: &inputs, infos: &infos, output: &out, scratch: None };
     assert_eq!(
-        jp.args(Path::new("/in/a.mp4"), Path::new("/out/a-压缩.mp4.part"), &src_mp4()),
-        want
+        JobParams::Compress(p_match()).duration_secs(&ctx),
+        Some(5.0)
     );
 }
