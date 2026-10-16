@@ -1,21 +1,57 @@
-import { useEffect, useState } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import { Input } from "@/components/ui/input";
 import * as ipc from "../../lib/ipc";
-import { clampCrop, evenDown, type CropDraft } from "../../lib/opForms";
+import {
+  applyDrag,
+  clampCrop,
+  evenDown,
+  sourceDelta,
+  type CropDraft,
+  type CropGesture,
+} from "../../lib/opForms";
 import { PRESETS } from "../../lib/opDefaults";
 import { formatTimecode, parseTimeInput } from "../../lib/timecode";
 import { run } from "../../store/store";
 import type { JobParamsDto, VideoInfoDto } from "../../lib/types";
 
+/** 四个角的手柄。`nw`/`se` 是西北—东南对角线，另两个是东北—西南。 */
+// 手柄只往框外露 1px：容器有 `overflow-hidden`（挡那个 9999px 的遮罩），
+// 露太多的话框贴到画面边时手柄会被裁掉一半。
+const CORNERS: ReadonlyArray<{ c: "nw" | "ne" | "sw" | "se"; style: CSSProperties }> = [
+  { c: "nw", style: { left: -1, top: -1, cursor: "nwse-resize" } },
+  { c: "ne", style: { right: -1, top: -1, cursor: "nesw-resize" } },
+  { c: "sw", style: { left: -1, bottom: -1, cursor: "nesw-resize" } },
+  { c: "se", style: { right: -1, bottom: -1, cursor: "nwse-resize" } },
+];
+
+type Drag = {
+  gesture: CropGesture;
+  /** 按下那一刻的框 —— 每次都从它算起，不在实时值上累加（累加会漂）。 */
+  from: CropDraft;
+  clientX: number;
+  clientY: number;
+  /** 画面那一块按下时的渲染尺寸。换算分母就是它（不是窗口宽）。 */
+  frame: { width: number; height: number };
+};
+
 /**
- * 画面裁剪：预览图 + 叠加框 + 四个数字 + 时间 + 质量档位。
+ * 画面裁剪：**拖预览图上的框**来定裁剪区域。
  *
- * **它与 ffmpeg 的静默钳制有本质区别**：这里钳完的结果会**写回输入框**，用户看得见
- * 那几个数字变了。实测 ffmpeg 是悄悄来的 —— 源 1920 宽、请求 x=1200 再裁 1280
- * （2480 已超出），它把 x 钳到 640 照常输出，stderr 一条提示都没有；奇数宽度同理
- * （请求 641 得到 640）。所以越界与奇数必须我们自己判、自己说。
+ * 框内拖动 = 移动，四个角 = 缩放（对角固定）。没有数字输入框 —— 当前值以只读的
+ * 一行数字显示在下面。
+ *
+ * **它与 ffmpeg 的静默钳制有本质区别**：越界会**顶住**而不是被悄悄挪走，宽高当场
+ * 取偶。实测 ffmpeg 是反过来的 —— 源 1920 宽、请求 x=1200 再裁 1280（2480 已超出），
+ * 它把 x 钳到 640 照常输出、stderr 一条提示都没有；奇数宽度同理（请求 641 得到 640）。
  *
  * 叠加框用**百分比**定位，所以不必管预览图实际缩到了多少 —— 比例天然对。
+ * 拖动的手势换算与钳制全在 `applyDrag` 里（纯函数，配有测试）。
  */
 export default function CropForm({
   value,
@@ -39,6 +75,10 @@ export default function CropForm({
   const [preview, setPreview] = useState<string | null>(null);
   const [previewErr, setPreviewErr] = useState(false);
   const [atSecs, setAtSecs] = useState<number | null>(null);
+  const [drag, setDrag] = useState<Drag | null>(null);
+
+  /** 量的是**画面那一块**的渲染尺寸 —— client 像素换算成源像素的分母。 */
+  const frameRef = useRef<HTMLDivElement | null>(null);
 
   const box = clampCrop(draft, sw, sh);
 
@@ -67,7 +107,6 @@ export default function CropForm({
     return () => {
       alive = false;
     };
-    // 依赖用算好的秒数而不是 src 对象 —— 后者每帧都是新引用
   }, [inputs[0], timeKey]);
 
   // 合法时把参数交上去；非法时 null（外框禁用开始按钮）。
@@ -76,41 +115,40 @@ export default function CropForm({
     onChange(box ? { op: "crop", ...box, preset } : null);
   }, [box?.width, box?.height, box?.x, box?.y, preset]);
 
-  /**
-   * 改一个数字。**位置当场钳、尺寸留到失焦再钳。**
-   *
-   * 尺寸若也当场钳，打 "1920" 的途中会先被算成 0 再写回输入框（源宽 1920 时
-   * `min(1, 1920)` 取偶就是 0），用户根本没法把数字打完。而左/上**必须**当场钳 ——
-   * "宽改小之后左越界"正是最需要看见的那一下。
-   */
-  function setField(k: keyof CropDraft, raw: number) {
-    const next: CropDraft = { ...draft, [k]: Number.isFinite(raw) ? raw : 0 };
-    const c = clampCrop(next, sw, sh);
-    setDraft(c ? { ...next, x: c.x, y: c.y } : next);
+  function onPointerDown(e: ReactPointerEvent<HTMLElement>, gesture: CropGesture) {
+    if (!box || sw == null || sh == null) return;
+    const rect = frameRef.current?.getBoundingClientRect();
+    if (!rect || rect.width === 0 || rect.height === 0) return;
+    // 指针可能被拖到框外甚至图外，捕获之后事件仍然回到这里
+    e.currentTarget.setPointerCapture(e.pointerId);
+    e.preventDefault();
+    setDrag({
+      gesture,
+      from: box,
+      clientX: e.clientX,
+      clientY: e.clientY,
+      frame: { width: rect.width, height: rect.height },
+    });
   }
 
-  /** 失焦时把尺寸也钳回来 —— 越界/奇数的数字当场变成实际会用的那个。 */
-  function settle() {
-    const c = clampCrop(draft, sw, sh);
-    if (c) setDraft(c);
+  function onPointerMove(e: ReactPointerEvent<HTMLDivElement>) {
+    if (!drag || sw == null || sh == null) return;
+    const d = sourceDelta(
+      e.clientX - drag.clientX,
+      e.clientY - drag.clientY,
+      drag.frame,
+      sw,
+      sh
+    );
+    setDraft(applyDrag(drag.from, drag.gesture, d.dx, d.dy, sw, sh));
   }
 
-  const num = (k: keyof CropDraft, label: string) => (
-    <label className="block">
-      <span className="text-[12px]" style={{ color: "var(--fg-muted)" }}>
-        {label}
-      </span>
-      <Input
-        className="w-24 mt-1"
-        inputMode="numeric"
-        value={String(draft[k])}
-        onChange={(e) => setField(k, Number(e.target.value))}
-        onBlur={settle}
-      />
-    </label>
-  );
+  function endDrag() {
+    setDrag(null);
+  }
 
   const pct = (v: number, whole: number) => `${(v / whole) * 100}%`;
+  const ready = inputs[0] && sw != null && sh != null;
 
   return (
     <>
@@ -126,39 +164,85 @@ export default function CropForm({
         </p>
       )}
 
-      {inputs[0] && preview && (
+      {ready && (
         <div
-          className="relative inline-block mb-3 rounded-xl overflow-hidden"
-          style={{ border: "1px solid var(--line)" }}
+          ref={frameRef}
+          className="relative inline-block mb-3 rounded-xl overflow-hidden select-none"
+          style={{ border: "1px solid var(--line)", touchAction: "none" }}
+          onPointerMove={onPointerMove}
+          onPointerUp={endDrag}
+          onPointerCancel={endDrag}
         >
-          <img src={preview} alt="预览帧" className="block w-full max-w-160" />
-          {/* 框画的是**校验通过之后**的矩形：数字越界时不画一个假的框 */}
-          {box && sw && sh && (
+          {preview ? (
+            <img src={preview} alt="预览帧" className="block w-full max-w-160" draggable={false} />
+          ) : (
+            // 抽帧失败时**仍然能拖**：按源宽高比撑出一块空画布。
+            // 否则「只留拖动」就等于完全没有输入手段了。
             <div
-              className="absolute pointer-events-none"
+              className="block"
               style={{
-                left: pct(box.x, sw),
-                top: pct(box.y, sh),
-                width: pct(box.width, sw),
-                height: pct(box.height, sh),
-                border: "2px solid var(--accent-blue)",
-                boxShadow: "0 0 0 9999px rgba(0,0,0,0.35)",
+                width: 640,
+                maxWidth: "100%",
+                aspectRatio: `${sw} / ${sh}`,
+                background: "var(--bg-subtle)",
               }}
             />
+          )}
+
+          {/* 框画的是**校验通过之后**的矩形：状态非法时不画一个假的框 */}
+          {box && (
+            <div
+              className="absolute"
+              style={{
+                left: pct(box.x, sw!),
+                top: pct(box.y, sh!),
+                width: pct(box.width, sw!),
+                height: pct(box.height, sh!),
+                border: "2px solid var(--accent-blue)",
+                boxShadow: "0 0 0 9999px rgba(0,0,0,0.35)",
+                cursor: drag ? "grabbing" : "move",
+              }}
+              onPointerDown={(e) => onPointerDown(e, { kind: "move" })}
+              title="拖动可移动裁剪区域"
+            >
+              {CORNERS.map(({ c, style }) => (
+                <span
+                  key={c}
+                  className="absolute block size-3 rounded-sm"
+                  style={{
+                    ...style,
+                    background: "var(--accent-blue)",
+                    border: "2px solid var(--bg)",
+                  }}
+                  // 手柄要自己吃掉按下事件，否则会同时触发整框移动
+                  onPointerDown={(e) => {
+                    e.stopPropagation();
+                    onPointerDown(e, { kind: "resize", corner: c });
+                  }}
+                />
+              ))}
+            </div>
           )}
         </div>
       )}
 
-      {inputs[0] && previewErr && (
-        <p className="text-[12px] mb-4" style={{ color: "var(--fg-faint)" }}>
-          取预览失败（不影响裁剪本身，下面照样可以填数字提交）。
+      {ready && box && (
+        <p className="text-[12px] mb-1 tnum" style={{ color: "var(--fg-muted)" }}>
+          宽 {box.width} · 高 {box.height} · 左 {box.x} · 上 {box.y}
         </p>
       )}
 
-      {inputs[0] && (
+      {ready && (
         <p className="text-[12px] mb-4" style={{ color: "var(--fg-faint)" }}>
-          {sw != null && sh != null ? `画面 ${sw}x${sh}` : "画面尺寸未知"} ·
-          预览取自 {formatTimecode(timeKey)} 处
+          框内拖动移动，四个角拖动缩放。越界会顶住、宽高当场取偶 —— 这两件事 ffmpeg
+          是悄悄做掉的，所以在这里先做给你看。
+          {sw != null && sh != null && ` 画面 ${sw}x${sh}。`}
+        </p>
+      )}
+
+      {inputs[0] && previewErr && (
+        <p className="text-[12px] mb-4" style={{ color: "var(--fg-faint)" }}>
+          取预览失败（看不见画面，但框照样能拖 —— 时间拿不准的话可以先换一个预览时间）。
         </p>
       )}
 
@@ -177,17 +261,6 @@ export default function CropForm({
           />
         </label>
       )}
-
-      <div className="flex items-end gap-3 mb-1">
-        {num("width", "宽")}
-        {num("height", "高")}
-        {num("x", "左")}
-        {num("y", "上")}
-      </div>
-      <p className="text-[12px] mb-5" style={{ color: "var(--fg-faint)" }}>
-        宽高必须是偶数：奇数会被编码器静默改成相邻的偶数（请求 641 得到 640），
-        所以这里当场帮你取偶。左/上越界也会当场钳到上限。
-      </p>
 
       <div className="mb-5">
         <div style={{ color: "var(--fg-muted)" }}>质量</div>
@@ -210,7 +283,7 @@ export default function CropForm({
           ))}
         </div>
         <span className="block text-[12px]" style={{ color: "var(--fg-faint)" }}>
-          裁剪要重新编码，所以会比「合并」慢。**时长一点不变** —— 只换画面尺寸。
+          裁剪要重新编码，所以会比「合并」慢。时长一点不变 —— 只换画面尺寸。
         </span>
       </div>
     </>

@@ -128,15 +128,105 @@ export function clampCrop(
   srcH: number | null
 ): CropDraft | null {
   if (srcW == null || srcH == null || srcW < 2 || srcH < 2) return null;
+  // **只把宽高取偶** —— core 的 `validate_crop` 也只要求这两项是偶数。
+  // 曾经连 x/y 一起取偶，那会在拖动时让框一格一格地黏（左边缘在偶数像素之间跳），
+  // 而多出来这条限制没有任何依据。
   const width = Math.min(evenDown(d.width), evenDown(srcW));
   const height = Math.min(evenDown(d.height), evenDown(srcH));
   // 钳完小于 2 像素也不是个合法的框（与 core 的 `validate_crop` 第一条规则一致）。
   // 少了这条，表单刚拿到源尺寸而草稿还是 {0,0,0,0} 的那一帧会交出一个 width=0 的
   // 参数 —— 开始按钮亮着，而 core 一定拒它。
   if (width < 2 || height < 2) return null;
-  const x = Math.min(Math.max(0, evenDown(d.x)), srcW - width);
-  const y = Math.min(Math.max(0, evenDown(d.y)), srcH - height);
+  const x = Math.min(Math.max(0, d.x), srcW - width);
+  const y = Math.min(Math.max(0, d.y), srcH - height);
   return { width, height, x, y };
+}
+
+/**
+ * client 像素增量 → **源像素**增量。
+ *
+ * 分母是**画面那一块**渲染出来的尺寸（`getBoundingClientRect`），不是窗口、也不是
+ * 外层容器 —— 预览图被 `max-w` 缩过，用错分母的话拖动会跟着窗口宽度变快变慢。
+ *
+ * 渲染尺寸为 0 时给 0 而不是除以它：`getBoundingClientRect` 在元素还没布局时全 0，
+ * 除出来的 Infinity 下一帧就是 NaN 坐标，框会直接消失。
+ */
+export function sourceDelta(
+  dx: number,
+  dy: number,
+  frame: { width: number; height: number },
+  srcW: number,
+  srcH: number
+): { dx: number; dy: number } {
+  if (frame.width <= 0 || frame.height <= 0) return { dx: 0, dy: 0 };
+  return { dx: (dx * srcW) / frame.width, dy: (dy * srcH) / frame.height };
+}
+
+/** 拖动的手势：整框移动，或者抓某个角缩放。 */
+export type CropGesture =
+  | { kind: "move" }
+  | { kind: "resize"; corner: "nw" | "ne" | "sw" | "se" };
+
+const clampTo = (v: number, lo: number, hi: number) => Math.min(Math.max(v, lo), hi);
+
+/** 裁剪框的最小边长。2 是 `validate_crop` 的技术下限，也是 h264/yuv420p 的下限。 */
+const MIN_CROP = 2;
+
+/**
+ * 拖动之后的新裁剪框。**纯函数** —— 组件只负责把 client 像素换算成源像素再喂进来。
+ *
+ * 这是这次改动的全部逻辑，也是唯一能被测试钉住的部分（这个仓库不做 DOM 测试）：
+ * 对角固定、越界顶住而不翻转、宽高当场取偶。
+ *
+ * **对角固定**：拖右下角时左上那个角一动不动，拖左上角时右下不动。少了它，
+ * 缩放会连着位置一起漂，用户的手感是"框在滑走"而不是"我在拉这个角"。
+ *
+ * **越界顶住而不翻转**：把右下角一路拖过左上角时，宽高停在 2 像素，不变成负的、
+ * 也不翻到反方向去。翻转会让「继续往回拖」变成「框从另一边长出来」。
+ */
+export function applyDrag(
+  start: CropDraft,
+  g: CropGesture,
+  dx: number,
+  dy: number,
+  srcW: number,
+  srcH: number
+): CropDraft {
+  // 源像素的增量在缩放后的图上通常带小数，先取整：界面上的数字永远是整数
+  const mx = Math.round(dx);
+  const my = Math.round(dy);
+
+  if (g.kind === "move") {
+    return {
+      ...start,
+      x: clampTo(start.x + mx, 0, Math.max(0, srcW - start.width)),
+      y: clampTo(start.y + my, 0, Math.max(0, srcH - start.height)),
+    };
+  }
+
+  const west = g.corner === "nw" || g.corner === "sw";
+  const north = g.corner === "nw" || g.corner === "ne";
+  // 不动的那个角就是它的位置基准
+  const right = start.x + start.width;
+  const bottom = start.y + start.height;
+
+  const width = clampTo(
+    evenDown(west ? start.width - mx : start.width + mx),
+    MIN_CROP,
+    Math.max(MIN_CROP, evenDown(west ? right : srcW - start.x))
+  );
+  const height = clampTo(
+    evenDown(north ? start.height - my : start.height + my),
+    MIN_CROP,
+    Math.max(MIN_CROP, evenDown(north ? bottom : srcH - start.y))
+  );
+
+  return {
+    width,
+    height,
+    x: west ? right - width : start.x,
+    y: north ? bottom - height : start.y,
+  };
 }
 
 // ===== 合并列表的排序 =====

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyDrag,
   clampCrop,
   compressQuality,
   evenDown,
@@ -7,6 +8,7 @@ import {
   moveUp,
   planKey,
   realignPicks,
+  sourceDelta,
   trimFormReduce,
   trimParamsOf,
 } from "./opForms";
@@ -40,6 +42,13 @@ describe("evenDown / clampCrop", () => {
     expect(clampCrop({ width: 640, height: 360, x: 0, y: 0 }, null, null)).toBeNull();
   });
 
+  it("x/y **不**取偶 —— core 的 validate_crop 只要求宽高是偶数", () => {
+    // 早期这里把位置也取偶了。拖动时那会让框一格一格地黏（左边缘在偶数像素之间跳），
+    // 而 core 根本不要求它 —— 白白多一条限制。
+    expect(clampCrop({ width: 640, height: 360, x: 5, y: 7 }, 1920, 1080))
+      .toEqual({ width: 640, height: 360, x: 5, y: 7 });
+  });
+
   it("钳完小于 2 像素时也返回 null —— 那不是个合法的裁剪框", () => {
     // 表单刚拿到源尺寸、还没把草稿填成整个画面时，草稿是 {0,0,0,0}。若不判这一条，
     // 中间那一帧会把宽高为 0 的参数交上去，开始按钮亮着，而 core 一定拒它。
@@ -48,6 +57,84 @@ describe("evenDown / clampCrop", () => {
     expect(clampCrop({ width: 1, height: 100, x: 0, y: 0 }, 1920, 1080)).toBeNull();
     expect(clampCrop({ width: 2, height: 2, x: 0, y: 0 }, 1920, 1080))
       .toEqual({ width: 2, height: 2, x: 0, y: 0 });
+  });
+});
+
+describe("applyDrag", () => {
+  const start = { width: 640, height: 360, x: 100, y: 100 }; // 右边缘 740、下边缘 460
+
+  it("移动：尺寸一点不变，位置被钳在画面里", () => {
+    expect(applyDrag(start, { kind: "move" }, 50, 20, 1920, 1080))
+      .toEqual({ width: 640, height: 360, x: 150, y: 120 });
+    // 顶到右下角
+    expect(applyDrag(start, { kind: "move" }, 99999, 99999, 1920, 1080))
+      .toEqual({ width: 640, height: 360, x: 1280, y: 720 });
+    // 顶到左上角
+    expect(applyDrag(start, { kind: "move" }, -99999, -99999, 1920, 1080))
+      .toEqual({ width: 640, height: 360, x: 0, y: 0 });
+  });
+
+  it("缩放：**对角固定**，只有被拖的那两条边动", () => {
+    // 拖右下角：左上不动
+    expect(applyDrag(start, { kind: "resize", corner: "se" }, 60, 40, 1920, 1080))
+      .toEqual({ width: 700, height: 400, x: 100, y: 100 });
+    // 拖左上角：右下不动（740/460 是那两个不动的边）
+    const nw = applyDrag(start, { kind: "resize", corner: "nw" }, 60, 40, 1920, 1080);
+    expect(nw).toEqual({ width: 580, height: 320, x: 160, y: 140 });
+    expect(nw.x + nw.width).toBe(740);
+    expect(nw.y + nw.height).toBe(460);
+    // 拖右上角：左边与下边不动
+    const ne = applyDrag(start, { kind: "resize", corner: "ne" }, 60, 40, 1920, 1080);
+    expect(ne).toEqual({ width: 700, height: 320, x: 100, y: 140 });
+    expect(ne.y + ne.height).toBe(460);
+    // 拖左下角：右边与上边不动
+    const sw = applyDrag(start, { kind: "resize", corner: "sw" }, 60, 40, 1920, 1080);
+    expect(sw).toEqual({ width: 580, height: 400, x: 160, y: 100 });
+    expect(sw.x + sw.width).toBe(740);
+  });
+
+  it("缩放：越界顶住，**不翻转**成反向的框", () => {
+    // 往右下角外面拖：宽度顶到 1920-100 = 1820
+    const pulled = applyDrag(start, { kind: "resize", corner: "se" }, 99999, 99999, 1920, 1080);
+    expect(pulled).toEqual({ width: 1820, height: 980, x: 100, y: 100 });
+    // 把右下角往回拖过头：宽高停在最小值 2，位置不越过另一条边
+    const crushed = applyDrag(start, { kind: "resize", corner: "se" }, -99999, -99999, 1920, 1080);
+    expect(crushed).toEqual({ width: 2, height: 2, x: 100, y: 100 });
+    // 左上角往回拖过头：右下那条边固定，所以 x 顶到 738（= 740 - 2）
+    const crushedNw = applyDrag(start, { kind: "resize", corner: "nw" }, 99999, 99999, 1920, 1080);
+    expect(crushedNw).toEqual({ width: 2, height: 2, x: 738, y: 458 });
+    // 左上角越过画面左上：x 停在 0，宽就是 740
+    const pinnedNw = applyDrag(start, { kind: "resize", corner: "nw" }, -99999, -99999, 1920, 1080);
+    expect(pinnedNw).toEqual({ width: 740, height: 460, x: 0, y: 0 });
+  });
+
+  it("缩放结果里的宽高**永远是偶数** —— ffmpeg 会静默取偶，我们当场取", () => {
+    // 拖 1 像素：宽高从 640/360 变成 641/361，取偶回到 640/360（宽高不变，位置也不动）
+    expect(applyDrag(start, { kind: "resize", corner: "se" }, 1, 1, 1920, 1080)).toEqual(start);
+    expect(applyDrag(start, { kind: "resize", corner: "se" }, 2, 2, 1920, 1080))
+      .toEqual({ width: 642, height: 362, x: 100, y: 100 });
+  });
+
+  it("小数增量先取整 —— 界面上的数字永远是整数", () => {
+    expect(applyDrag(start, { kind: "move" }, 10.4, 10.6, 1920, 1080))
+      .toEqual({ width: 640, height: 360, x: 110, y: 111 });
+  });
+});
+
+describe("sourceDelta", () => {
+  it("client 像素 → **源像素**：分母是画面那一块渲染出来的尺寸", () => {
+    // 1920 宽的源在 640 宽的框里显示 → 1 个 client 像素 = 3 个源像素
+    expect(sourceDelta(10, 10, { width: 640, height: 360 }, 1920, 1080))
+      .toEqual({ dx: 30, dy: 30 });
+    // 放大到 1280 → 1 个 client 像素是 1.5 个源像素
+    expect(sourceDelta(10, 10, { width: 1280, height: 720 }, 1920, 1080))
+      .toEqual({ dx: 15, dy: 15 });
+  });
+
+  it("渲染尺寸为 0 时给 0 而不是 Infinity/NaN", () => {
+    // getBoundingClientRect 在元素还没布局时会全 0。除以 0 得到 Infinity，
+    // 下一帧就成了 NaN 坐标 —— 框会直接消失
+    expect(sourceDelta(10, 10, { width: 0, height: 0 }, 1920, 1080)).toEqual({ dx: 0, dy: 0 });
   });
 });
 
