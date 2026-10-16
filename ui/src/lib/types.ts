@@ -119,3 +119,35 @@ export type VideoOpEventDto =
   | { type: "removed"; id: number }
   | { type: "progress"; id: number; fraction: number }
   | { type: "stateChanged"; id: number; state: JobStateDto };
+
+// ===== 视频操作（其二）：转码与裁剪 =====
+
+/** `probe_video` 的返回。编码/容器取不到时为 null —— 界面显示"未知"，不编。 */
+export interface VideoInfoDto {
+  durationSecs: number | null;
+  hasVideo: boolean;
+  videoCodec: string | null;
+  container: string | null;
+  sizeBytes: number;
+}
+
+/**
+ * 视频操作的入参。**带 `op` 判别标签**，与 Rust 侧的 `JobParamsDto` 一一对应
+ * （`#[serde(tag = "op", rename_all_fields = "camelCase")]`）。
+ *
+ * 加一个操作就在这里加一个成员，`switch` 会替你找齐所有该改的地方。
+ * 注意取值（target / mode / preset）在 core 那边是 `String`，非法取值要到
+ * 入队时才被拒 —— 前端据此在提交前先把明显的错误挡掉。
+ */
+export type JobParamsDto =
+  | {
+      op: "compress";
+      preset: string;
+      encoder: string;
+      maxHeight: number | null;
+      crf: number | null;
+      qv: number | null;
+      audioKbps: number | null;
+    }
+  | { op: "transcode"; target: string; preset: string }
+  | { op: "trim"; startSecs: number; endSecs: number | null; mode: string };

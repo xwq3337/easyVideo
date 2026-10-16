@@ -9,9 +9,9 @@ export type VideoOp = "compress" | "transcode" | "merge" | "trim" | "crop";
 
 export const VIDEO_OPS: ReadonlyArray<{ op: VideoOp; label: string; ready: boolean }> = [
   { op: "compress", label: "压缩", ready: true },
-  { op: "transcode", label: "转码", ready: false },
+  { op: "transcode", label: "转码", ready: true },
   { op: "merge", label: "合并", ready: false },
-  { op: "trim", label: "裁剪视频", ready: false },
+  { op: "trim", label: "裁剪视频", ready: true },
   { op: "crop", label: "画面裁剪", ready: false },
 ];
 

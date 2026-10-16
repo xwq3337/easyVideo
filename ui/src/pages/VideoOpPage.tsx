@@ -74,10 +74,11 @@ export default function VideoOpPage({ op }: { op: VideoOp }) {
     setBusy(true);
     try {
       const q = quality.trim() === "" ? null : Number(quality);
+      // 临时形状：本任务只把命令面切到 addVideoJob，让树保持可构建；
+      // 下面这个页面本身会在下一个任务里拆成外框 + 三个表单。
       const id = await run(
-        ipc.addCompressJob({
-          input,
-          outputDir,
+        ipc.addVideoJob(input, outputDir, {
+          op: "compress",
           preset,
           encoder,
           maxHeight: maxHeight === 0 ? null : maxHeight,

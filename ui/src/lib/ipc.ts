@@ -5,8 +5,10 @@ import type {
   ChoiceKindDto,
   EventDto,
   JobDto,
+  JobParamsDto,
   SettingsDto,
   TaskDto,
+  VideoInfoDto,
   VideoOpEventDto,
 } from "./types";
 
@@ -36,24 +38,17 @@ export const pickDownloadDir = () => invoke<string | null>("pick_download_dir");
 
 export const getVideoJobs = () => invoke<JobDto[]>("get_video_jobs");
 
-export const addCompressJob = (args: {
-  input: string;
-  outputDir: string;
-  preset: string;
-  encoder: string;
-  maxHeight: number | null;
-  crf: number | null;
-  qv: number | null;
-  audioKbps: number | null;
-}) => invoke<number>("add_compress_job", args);
+export const addVideoJob = (input: string, outputDir: string, params: JobParamsDto) =>
+  invoke<number>("add_video_job", { input, outputDir, params });
+
+/** 只算产物名给界面预览。**与 addVideoJob 走 core 里同一个取名函数** —— 见 core 的说明。 */
+export const planOutput = (input: string, outputDir: string, params: JobParamsDto) =>
+  invoke<string>("plan_output", { input, outputDir, params });
 
 export const cancelVideoJob = (id: number) => invoke<void>("cancel_video_job", { id });
 export const removeVideoJob = (id: number) => invoke<void>("remove_video_job", { id });
 export const pickVideoFile = () => invoke<string | null>("pick_video_file");
-export const probeVideo = (path: string) =>
-  invoke<{ durationSecs: number | null; hasVideo: boolean; sizeBytes: number }>("probe_video", {
-    path,
-  });
+export const probeVideo = (path: string) => invoke<VideoInfoDto>("probe_video", { path });
 
 /** 视频任务的事件走**自己的通道名**，所以前端按事件名路由，不必嗅探联合类型的 tag。 */
 export const onVideoOpEvent = (cb: (e: VideoOpEventDto) => void) =>
