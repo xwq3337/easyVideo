@@ -10,7 +10,6 @@
 
 use std::sync::Arc;
 
-use easydownvideo::core::events::EngineEvent;
 use tokio::sync::broadcast;
 
 

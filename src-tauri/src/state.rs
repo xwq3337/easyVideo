@@ -7,10 +7,14 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use easydownvideo::core::engine::Engine;
+use easydownvideo::core::videoops::VideoOps;
 use easydownvideo::settings::Settings;
 
 pub struct AppState {
     pub engine: Engine,
+    /// 视频操作子系统。**与下载引擎完全独立** —— 不共用任务表、队列、并发槽，
+    /// 也不共用事件通道。转码吃满 CPU，不该把下载的并发槽占住。
+    pub videoops: VideoOps,
     pub settings: Mutex<Settings>,
 }
 
@@ -25,4 +29,8 @@ impl AppState {
 
 pub fn build_engine(rt: tokio::runtime::Handle, settings: Settings, data_dir: PathBuf) -> Engine {
     Engine::new(rt, settings, data_dir)
+}
+
+pub fn build_videoops(rt: tokio::runtime::Handle, data_dir: PathBuf) -> VideoOps {
+    VideoOps::new(rt, data_dir)
 }

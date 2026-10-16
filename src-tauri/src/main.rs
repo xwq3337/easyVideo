@@ -50,6 +50,9 @@ fn main() {
         data_dir.clone(),
     );
 
+    let videoops =
+        easydownvideo_tauri::state::build_videoops(rt.handle().clone(), data_dir.clone());
+
     // 断点恢复:扫描上次未完成的任务并重新入队(与 egui 版的 main 一致)。
     for m in easydownvideo::core::task::scan_resume(&settings.download_dir) {
         tracing::info!("resuming task {} ({})", m.id, m.filename);
@@ -58,6 +61,7 @@ fn main() {
 
     let app_state = AppState {
         engine: engine.clone(),
+        videoops: videoops.clone(),
         settings: std::sync::Mutex::new(settings),
     };
 
@@ -78,6 +82,12 @@ fn main() {
             commands::get_settings,
             commands::update_settings,
             commands::pick_download_dir,
+            commands::get_video_jobs,
+            commands::add_compress_job,
+            commands::cancel_video_job,
+            commands::remove_video_job,
+            commands::pick_video_file,
+            commands::probe_video,
         ])
         .setup(move |app| {
             // **macOS 上必须保留 decorations。** Tauri 自己的配置文档
@@ -96,12 +106,19 @@ fn main() {
 
             // 事件桥:用同一个 engine 再订阅一路接收器。
             let sink: Arc<tauri::AppHandle> = Arc::new(app.handle().clone());
-            let rx = engine.events();
             tauri::async_runtime::spawn(bridge::run(
-                sink,
-                rx,
+                sink.clone(),
+                engine.events(),
                 easydownvideo_tauri::dto::download_event_json,
                 bridge::EVENT,
+            ));
+            // 第二条通道：视频操作。**共用同一个 RESYNC 事件名** —— 任一条落后都整体重取，
+            // 宁可多取一次，也不要漏（漏一个 Done 就是那一行永久停在"运行中"）。
+            tauri::async_runtime::spawn(bridge::run(
+                sink,
+                videoops.events(),
+                easydownvideo_tauri::dto::video_event_dto,
+                bridge::VIDEO_EVENT,
             ));
             Ok(())
         })

@@ -5,10 +5,14 @@
 //! 所以本层没有单测（`cargo check --workspace` 加 Task 12 的手动验收覆盖它），
 //! 与规格 §7 的测试策略一致。
 
+use std::path::PathBuf;
+
+use easydownvideo::core::videoops::presets::CompressParams;
 use tauri::State;
 
 use crate::dto::{
-    settings_dto, settings_from, task_dto, ChoiceDto, ChoiceKindDto, SettingsDto, TaskDto,
+    job_dto, settings_dto, settings_from, task_dto, ChoiceDto, ChoiceKindDto, JobDto, SettingsDto,
+    TaskDto, VideoInfoDto,
 };
 use crate::state::AppState;
 
@@ -118,4 +122,94 @@ pub async fn pick_download_dir(app: tauri::AppHandle) -> R<Option<String>> {
         .await
         .map_err(|e| format!("目录选择被中断：{e}"))?;
     Ok(picked.map(|p| p.to_string()))
+}
+
+// ===== 视频操作 =====
+//
+// 与上面那些一样是薄封装：业务逻辑全在 core 的 videoops 里，这里只做
+// 「取 State、调它、转 DTO」。
+
+#[tauri::command]
+pub fn get_video_jobs(state: State<'_, AppState>) -> Vec<JobDto> {
+    state.videoops.list_jobs().into_iter().map(job_dto).collect()
+}
+
+/// 八个形参确实多，但每一个都是界面上一处控件；打包成结构体只会把同一份字段
+/// 在两个 crate 里各写一遍。前端的 ipc.ts 必须与之对应（**多词形参在 JS 侧是
+/// camelCase**，见 ipc.ts 的注释）。
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn add_compress_job(
+    state: State<'_, AppState>,
+    input: String,
+    output_dir: String,
+    preset: String,
+    encoder: String,
+    max_height: Option<u32>,
+    crf: Option<u8>,
+    qv: Option<u8>,
+    audio_kbps: Option<u32>,
+) -> R<u64> {
+    let params = CompressParams {
+        preset: preset.parse().map_err(|e| format!("{e:#}"))?,
+        encoder: encoder.parse().map_err(|e| format!("{e:#}"))?,
+        max_height,
+        crf,
+        qv,
+        audio_kbps,
+    };
+    // 先把 VideoOps 克隆出来再 await：`State` 是个借用，跨 await 持有它会把借用
+    // 连带进 future，而 Tauri 要求 async 命令返回 `Send` future。
+    // VideoOps 内部是 Arc，克隆很便宜。
+    let ops = state.videoops.clone();
+    ops.add_compress_job(PathBuf::from(input), PathBuf::from(output_dir), params)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+pub fn cancel_video_job(state: State<'_, AppState>, id: u64) {
+    state.videoops.cancel(id);
+}
+
+/// 与 `remove_task` 同样返回 `Result` 而不是 `bool`：前端全走 `run()` 那一条错误路径。
+#[tauri::command]
+pub fn remove_video_job(state: State<'_, AppState>, id: u64) -> R<()> {
+    if state.videoops.remove(id) {
+        Ok(())
+    } else {
+        Err("无法移除：它可能仍在运行，也可能已不在列表里".to_string())
+    }
+}
+
+/// 选一个视频文件。与 `pick_download_dir` 同理走回调式 API，不阻塞工作线程。
+#[tauri::command]
+pub async fn pick_video_file(app: tauri::AppHandle) -> R<Option<String>> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .add_filter("视频", &["mp4", "mov", "mkv", "webm", "avi", "m4v", "ts"])
+        .pick_file(move |picked| {
+            let _ = tx.send(picked);
+        });
+    let picked = rx.await.map_err(|e| format!("文件选择被中断：{e}"))?;
+    Ok(picked.map(|p| p.to_string()))
+}
+
+#[tauri::command]
+pub async fn probe_video(state: State<'_, AppState>, path: String) -> R<VideoInfoDto> {
+    let p = PathBuf::from(path);
+    // 文件大小在这里取：`probe` 只负责"ffmpeg 读得懂的那部分"，而大小是纯文件系统的事。
+    // 也顺手把"文件根本读不到"变成一条清楚的错误，而不是一个 0 字节的结果。
+    let size_bytes = std::fs::metadata(&p)
+        .map_err(|e| format!("读不到文件 {}：{e}", p.display()))?
+        .len();
+    let ops = state.videoops.clone();
+    let info = ops.probe(p).await.map_err(|e| format!("{e:#}"))?;
+    Ok(VideoInfoDto {
+        duration_secs: info.duration_secs,
+        has_video: info.has_video,
+        size_bytes,
+    })
 }
