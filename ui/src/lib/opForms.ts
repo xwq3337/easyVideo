@@ -130,6 +130,10 @@ export function clampCrop(
   if (srcW == null || srcH == null || srcW < 2 || srcH < 2) return null;
   const width = Math.min(evenDown(d.width), evenDown(srcW));
   const height = Math.min(evenDown(d.height), evenDown(srcH));
+  // 钳完小于 2 像素也不是个合法的框（与 core 的 `validate_crop` 第一条规则一致）。
+  // 少了这条，表单刚拿到源尺寸而草稿还是 {0,0,0,0} 的那一帧会交出一个 width=0 的
+  // 参数 —— 开始按钮亮着，而 core 一定拒它。
+  if (width < 2 || height < 2) return null;
   const x = Math.min(Math.max(0, evenDown(d.x)), srcW - width);
   const y = Math.min(Math.max(0, evenDown(d.y)), srcH - height);
   return { width, height, x, y };

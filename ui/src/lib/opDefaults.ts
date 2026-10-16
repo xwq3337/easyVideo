@@ -26,10 +26,13 @@ export function defaultParams(op: VideoOp): JobParamsDto {
       return { op: "transcode", target: "mp4h264", preset: "balanced" };
     case "trim":
       return { op: "trim", startSecs: 0, endSecs: null, mode: "fast" };
-    default:
-      // merge / crop 还没做，走不到这里（侧边栏不给导航、VideoOpPage 也会先拦下）。
-      // 给一个合法的占位，免得类型上留个洞。
-      return { ...DEFAULT_COMPRESS };
+    case "merge":
+      // 合并**没有参数** —— 顺序就是已选文件的顺序
+      return { op: "merge" };
+    case "crop":
+      // 宽高默认 0：表单拿到源尺寸后会把它填满整个画面（`CropForm` 那个 effect）。
+      // 这里填不了真实的源尺寸 —— 选文件之前根本不知道源有多大。
+      return { op: "crop", width: 0, height: 0, x: 0, y: 0, preset: "balanced" };
   }
 }
 

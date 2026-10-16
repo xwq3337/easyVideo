@@ -38,6 +38,16 @@ describe("evenDown / clampCrop", () => {
   it("源尺寸未知时返回 null —— 界面据此禁用开始按钮并说明原因", () => {
     expect(clampCrop({ width: 640, height: 360, x: 0, y: 0 }, null, null)).toBeNull();
   });
+
+  it("钳完小于 2 像素时也返回 null —— 那不是个合法的裁剪框", () => {
+    // 表单刚拿到源尺寸、还没把草稿填成整个画面时，草稿是 {0,0,0,0}。若不判这一条，
+    // 中间那一帧会把宽高为 0 的参数交上去，开始按钮亮着，而 core 一定拒它。
+    // （与 core 的 `validate_crop` 第一条规则一致：宽高至少 2 像素。）
+    expect(clampCrop({ width: 0, height: 0, x: 0, y: 0 }, 1920, 1080)).toBeNull();
+    expect(clampCrop({ width: 1, height: 100, x: 0, y: 0 }, 1920, 1080)).toBeNull();
+    expect(clampCrop({ width: 2, height: 2, x: 0, y: 0 }, 1920, 1080))
+      .toEqual({ width: 2, height: 2, x: 0, y: 0 });
+  });
 });
 
 describe("moveUp / moveDown", () => {
