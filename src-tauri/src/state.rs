@@ -23,6 +23,9 @@ impl AppState {
     /// 都是引擎在用的；只写文件不改引擎，界面上的改动要等下次重启才生效。
     pub fn apply_settings(&self, s: Settings) {
         *self.settings.lock().unwrap() = s.clone();
+        // ffmpeg 路径覆盖是全局设置，两个子系统都要跟着换 —— 只推给下载引擎的话，
+        // 用户改了设置会看到"下载用了新 ffmpeg、压缩还在用旧的"。
+        self.videoops.set_ffmpeg_override(s.ffmpeg_path_override.clone());
         self.engine.update_settings(s);
     }
 }
@@ -33,4 +36,16 @@ pub fn build_engine(rt: tokio::runtime::Handle, settings: Settings, data_dir: Pa
 
 pub fn build_videoops(rt: tokio::runtime::Handle, data_dir: PathBuf) -> VideoOps {
     VideoOps::new(rt, data_dir)
+}
+
+/// 建好之后立刻把设置里的 ffmpeg 覆盖推给它 —— 否则重启后要等用户重新保存一次设置
+/// 才会生效。
+pub fn build_videoops_with_settings(
+    rt: tokio::runtime::Handle,
+    data_dir: PathBuf,
+    settings: &Settings,
+) -> VideoOps {
+    let ops = VideoOps::new(rt, data_dir);
+    ops.set_ffmpeg_override(settings.ffmpeg_path_override.clone());
+    ops
 }

@@ -149,3 +149,36 @@ async fn cancel_kills_the_process_and_removes_the_partial_file() {
     assert!(!part.exists(), "取消后必须删掉半截产物 —— 否则用户会看到一个打不开的 mp4");
     assert!(!out.exists());
 }
+
+/// 改名是**唯一**一个曾经会留下半截产物的失败路径。
+///
+/// spec §7 写死了"失败或取消绝不留下半截文件"：产物留在盘上，用户会在目录里看到
+/// 一个打不开的 `<名字>-压缩.mp4.part`，而列表里那一行写着"失败"。其余路径
+/// （ffmpeg 非零退出、取消、spawn 失败）都会清理，只有这里的 `?` 直接抛了出去。
+///
+/// 触发方式：目标位置上放一个**非空目录**，rename 必然失败。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_rename_does_not_leave_the_part_file_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let ffmpeg = ensure_ffmpeg(dir.path()).unwrap();
+    let src = dir.path().join("src.mp4");
+    let gen = tokio::process::Command::new(&ffmpeg)
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=duration=2:size=320x240:rate=15",
+               "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30"]).arg(&src).output().await.unwrap();
+    assert!(gen.status.success());
+
+    let out = dir.path().join("out.mp4");
+    std::fs::create_dir(&out).unwrap();
+    std::fs::write(out.join("occupied"), b"x").unwrap(); // 非空，rename 必失败
+
+    let args = compress_args(&src, &out, &params(CompressPreset::Balanced));
+    let err = run_job(&ffmpeg, &args, &out, Some(2.0), Arc::new(|_| {}), &CancellationToken::new())
+        .await;
+    assert!(err.is_err(), "改名到非空目录上必须失败");
+
+    let part = easydownvideo::core::videoops::presets::part_path_for(&out);
+    assert!(
+        !part.exists(),
+        "改名失败时也必须删掉 .part —— 否则用户会在目录里看到一个打不开的半截文件，实际: {part:?}"
+    );
+}

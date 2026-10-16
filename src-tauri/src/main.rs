@@ -50,8 +50,11 @@ fn main() {
         data_dir.clone(),
     );
 
-    let videoops =
-        easydownvideo_tauri::state::build_videoops(rt.handle().clone(), data_dir.clone());
+    let videoops = easydownvideo_tauri::state::build_videoops_with_settings(
+        rt.handle().clone(),
+        data_dir.clone(),
+        &settings,
+    );
 
     // 断点恢复:扫描上次未完成的任务并重新入队(与 egui 版的 main 一致)。
     for m in easydownvideo::core::task::scan_resume(&settings.download_dir) {

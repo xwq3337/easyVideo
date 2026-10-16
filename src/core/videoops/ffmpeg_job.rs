@@ -91,8 +91,17 @@ pub async fn run_job(
                 return Err(anyhow!("ffmpeg 失败: {}", summarize_stderr(&stderr)));
             }
             // 成功：`.part` → 目标名。同一文件系统内 rename 原子，所以"改过名"等价于"完整"。
-            std::fs::rename(&part_path, output)
-                .with_context(|| format!("产物改名失败: {} → {}", part_path.display(), output.display()))?;
+            if let Err(e) = std::fs::rename(&part_path, output) {
+                // **改名失败也要删掉临时文件** —— 这是唯一一条曾经会留下半截产物的路径。
+                // spec §7 写死了"失败或取消绝不留下半截文件"：留着它，用户会在目录里
+                // 看到一个打不开的 `<名字>-压缩.mp4.part`，而列表里那一行写着"失败"。
+                std::fs::remove_file(&part_path).ok();
+                return Err(anyhow!(
+                    "产物改名失败: {} → {}: {e}",
+                    part_path.display(),
+                    output.display()
+                ));
+            }
             Ok(JobOutcome::Done)
         }
         _ = cancel.cancelled() => {

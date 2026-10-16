@@ -67,6 +67,8 @@ struct Inner {
     /// 解出来的 ffmpeg 路径。解一次就记住 —— `ensure_ffmpeg` 会校验哈希，
     /// 但那是每次几 MB 的读盘，不该每个任务都做一遍。
     ffmpeg: Mutex<Option<PathBuf>>,
+    /// 设置页里的「ffmpeg 路径覆盖」。非空时**优先于**内嵌那份。
+    ffmpeg_override: Mutex<Option<PathBuf>>,
     jobs: Mutex<HashMap<JobId, JobEntry>>,
     queue: Mutex<VecDeque<JobId>>,
     tx: broadcast::Sender<VideoOpEvent>,
@@ -90,6 +92,7 @@ impl VideoOps {
                 rt,
                 data_dir,
                 ffmpeg: Mutex::new(None),
+                ffmpeg_override: Mutex::new(None),
                 jobs: Mutex::new(HashMap::new()),
                 queue: Mutex::new(VecDeque::new()),
                 tx,
@@ -102,8 +105,20 @@ impl VideoOps {
         self.inner.tx.subscribe()
     }
 
-    /// 解出内嵌 ffmpeg（`ensure_ffmpeg` 会校验哈希、复用已解出的那份）。
+    /// 用户在设置页指定的 ffmpeg。非空时它**压过**内嵌那份 —— 设置页的文案是
+    /// "ffmpeg 路径覆盖（留空则用内嵌的）"，那是个全局承诺：用户设它往往正是因为
+    /// 内嵌那份在他机器上跑不起来。只有下载那一半认它的话，他的下载正常、
+    /// 每一次压缩都失败，而错误看着毫不相干。
+    pub fn set_ffmpeg_override(&self, p: Option<PathBuf>) {
+        *self.inner.ffmpeg_override.lock().unwrap() = p;
+    }
+
+    /// 解出要用的 ffmpeg：覆盖优先，其次内嵌（`ensure_ffmpeg` 会校验哈希、复用已解出的那份）。
     fn ffmpeg(&self) -> anyhow::Result<PathBuf> {
+        // 覆盖**先**看：可能刚设上，而缓存里还留着内嵌那份
+        if let Some(p) = self.inner.ffmpeg_override.lock().unwrap().as_ref() {
+            return Ok(p.clone());
+        }
         if let Some(p) = self.inner.ffmpeg.lock().unwrap().as_ref() {
             return Ok(p.clone());
         }
@@ -178,25 +193,37 @@ impl VideoOps {
             .and_then(|s| s.to_str())
             .unwrap_or("video")
             .to_string();
-        // 重名让路成 " (1)"、" (2)" —— 与下载那边的约定一致（同一个 helper）。
-        // **绝不覆盖源文件**：源文件若正好叫 `<stem>-压缩.mp4`，这里会自动让到下一个名字。
-        let output = unique_path_avoiding(&output_dir, &format!("{stem}-压缩.mp4"), |_| false);
-        let args = compress_args(&input, &output, &params);
 
-        let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
-        let label = format!("压缩 · {}", preset_label(params.preset));
-        self.inner.jobs.lock().unwrap().insert(
-            id,
-            JobEntry {
-                label,
-                input,
-                output,
-                args,
-                state: JobState::Queued,
-                progress: None,
-                cancel: CancellationToken::new(),
-            },
-        );
+        // **取名 + 登记必须在同一个锁里，而且 `taken` 要问的是"有没有别的在途任务
+        // 已经占了它"。** 只问文件系统是不够的：产物要等任务真跑完才存在，于是两个
+        // 都还没跑完的任务会拿到同一个"这个文件不存在"的答案，随后后完成的那次
+        // rename 会静默覆盖先完成的那份 —— 界面上两行都显示"已完成"、都指着同一个
+        // 路径，而用户真正想要的那个变体已经没了。
+        // 下载那边有同样的教训（`engine.rs` 的 `reserved_paths` 就是为它存在的）。
+        //
+        // 重名让路成 " (1)"、" (2)"，与下载那边同一个 helper、同一个约定。
+        // **绝不覆盖源文件**：源文件若正好叫 `<stem>-压缩.mp4`，这里也会让到下一位。
+        let id = {
+            let mut jobs = self.inner.jobs.lock().unwrap();
+            let output = unique_path_avoiding(&output_dir, &format!("{stem}-压缩.mp4"), |c| {
+                jobs.values().any(|j| j.output == c)
+            });
+            let args = compress_args(&input, &output, &params);
+            let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
+            jobs.insert(
+                id,
+                JobEntry {
+                    label: format!("压缩 · {}", preset_label(params.preset)),
+                    input,
+                    output,
+                    args,
+                    state: JobState::Queued,
+                    progress: None,
+                    cancel: CancellationToken::new(),
+                },
+            );
+            id
+        };
         self.inner.queue.lock().unwrap().push_back(id);
         let _ = self.inner.tx.send(VideoOpEvent::Added { id });
         self.pump();

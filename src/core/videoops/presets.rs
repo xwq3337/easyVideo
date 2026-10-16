@@ -143,11 +143,16 @@ pub fn compress_args(input: &Path, output: &Path, p: &CompressParams) -> Vec<Str
         }
     }
 
-    // -2 让宽度按比例算出并取偶数。写成固定宽度会拉伸画面；
+    // `-2` 让宽度按比例算出并取偶数。写成固定宽度会拉伸画面；
     // 写成奇数宽度则某些编码器直接拒绝。
+    //
+    // **`min()` 不能省。** 裸的 `scale=-2:{h}` 会把比它小的源**放大**：
+    // 实测 426x240 的源选 720p 会变成 1280x720、体积是源文件的 4.2 倍 ——
+    // 而用户点的是"压缩"，拿到一个更大的文件就是白干（spec §6.1 就是为这件事
+    // 校准 q:v 的）。字段的语义是"最长边不超过它"，那就必须真的封顶。
     if let Some(h) = p.max_height {
         a.push("-vf".into());
-        a.push(format!("scale=-2:{h}"));
+        a.push(format!("scale=-2:'min({h},ih)'"));
     }
 
     a.push("-c:a".into());

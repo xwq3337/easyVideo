@@ -68,13 +68,21 @@ fn advanced_fields_fall_back_to_the_preset() {
 }
 
 #[test]
-fn max_height_adds_a_scale_filter_keeping_aspect() {
+fn max_height_caps_but_never_upscales() {
     let mut params = p(CompressPreset::Balanced, Encoder::Software);
     params.max_height = Some(720);
     let args = run(&params);
     let vf = args.iter().position(|a| a == "-vf").expect("限制分辨率时要加 -vf");
-    // -2 让宽度按比例自动算并取偶数：写成固定宽度会拉伸画面，写成奇数某些编码器会直接失败
-    assert_eq!(args[vf + 1], "scale=-2:720");
+    // -2 让宽度按比例自动算并取偶数：写成固定宽度会拉伸画面，写成奇数某些编码器会直接失败。
+    //
+    // **`min()` 是必须的。** 裸的 `scale=-2:720` 会把 426x240 的源**放大**到
+    // 1280x720 —— 实测产物体积是源文件的 4.2 倍，而用户点的是"压缩"。
+    // 字段的语义是"最长边不超过它"（见 CompressParams 的文档），那就必须真的封顶。
+    assert_eq!(args[vf + 1], "scale=-2:'min(720,ih)'");
+    assert!(
+        !args.iter().any(|a| a == "scale=-2:720"),
+        "裸的 scale=-2:h 会把小源放大，产物比源文件还大。实际: {args:?}"
+    );
     // 不限制时不该出现 -vf（多余的滤镜会多一次无谓的拷贝）
     assert!(!has(&run(&p(CompressPreset::Balanced, Encoder::Software)), "-vf"));
 }

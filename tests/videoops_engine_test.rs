@@ -214,3 +214,68 @@ async fn remove_only_works_on_terminal_jobs() {
     assert!(ops.remove(id), "终态任务应能移除");
     assert!(ops.list_jobs().is_empty());
 }
+
+/// **两个在途任务不能指向同一个产物路径。**
+///
+/// `unique_path_avoiding` 的第三个参数是"已经被谁占了吗"。只问文件系统是不够的：
+/// 产物要等任务真跑完才存在，所以两个都还没跑完的任务会拿到**同一个**"这个文件不存在"
+/// 的答案，随后后完成的那次 rename 会静默覆盖先完成的那份 —— 界面上两行都显示
+/// "已完成"、都指着同一个路径，而用户真正想要的那个变体已经没了。
+/// 下载那边有同样的教训（`engine.rs` 的 `reserved_paths` 就是为它存在的）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_in_flight_jobs_never_share_an_output_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let ffmpeg = ensure_ffmpeg(dir.path()).unwrap();
+    let src = dir.path().join("第一集.mp4");
+    // 20 秒，保证第一个任务在我们加第二个的时候还没跑完
+    make_src(&ffmpeg, &src, 20).await;
+    let out_dir = tempfile::tempdir().unwrap();
+
+    let rt = tokio::runtime::Handle::current();
+    let ops = VideoOps::new(rt, dir.path().to_path_buf());
+    ops.events(); // 订阅一下，反正 worker 会发
+
+    let first = ops.add_compress_job(src.clone(), out_dir.path().to_path_buf(), params()).await.unwrap();
+    let second = ops.add_compress_job(src.clone(), out_dir.path().to_path_buf(), params()).await.unwrap();
+
+    let jobs = ops.list_jobs();
+    let a = jobs.iter().find(|j| j.id == first).unwrap();
+    let b = jobs.iter().find(|j| j.id == second).unwrap();
+    assert_ne!(
+        a.output, b.output,
+        "两个在途任务指向了同一个产物路径，后完成的会静默覆盖先完成的：{:?}",
+        a.output
+    );
+
+    ops.cancel(first);
+    ops.cancel(second);
+}
+
+/// **`ffmpeg_path_override` 对视频操作也必须生效。**
+///
+/// 设置页把它标成"ffmpeg 路径覆盖（留空则用内嵌的）"—— 那是个全局承诺。用户设它
+/// 往往正是因为内嵌那份在他机器上跑不起来（架构不符、被 Gatekeeper 拦等）：
+/// 只认下载那一半的话，他的下载正常、每一次压缩都失败，而错误看着毫不相干。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn honours_the_configured_ffmpeg_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let ffmpeg = ensure_ffmpeg(dir.path()).unwrap();
+    let src = dir.path().join("src.mp4");
+    make_src(&ffmpeg, &src, 1).await;
+
+    let rt = tokio::runtime::Handle::current();
+    let ops = VideoOps::new(rt, dir.path().to_path_buf());
+    // 先确认：没有覆盖时它用的是内嵌那份
+    assert!(ops.probe(src.clone()).await.is_ok());
+
+    // 覆盖值指向一个不存在的文件 —— 若它**没有**被采纳，下面这一步仍然会成功
+    ops.set_ffmpeg_override(Some(dir.path().join("definitely-not-ffmpeg")));
+    assert!(
+        ops.probe(src.clone()).await.is_err(),
+        "覆盖值没有被采纳 —— 它仍然在用内嵌那份"
+    );
+
+    // 清掉覆盖值应当回到内嵌那份
+    ops.set_ffmpeg_override(None);
+    assert!(ops.probe(src).await.is_ok(), "清掉覆盖值后应回到内嵌那份");
+}
