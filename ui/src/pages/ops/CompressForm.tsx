@@ -8,6 +8,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { DEFAULT_COMPRESS, PRESETS } from "../../lib/opDefaults";
+import { compressQuality } from "../../lib/opForms";
 import type { JobParamsDto } from "../../lib/types";
 
 const ENCODERS = [
@@ -39,16 +40,22 @@ export default function CompressForm({
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [quality, setQuality] = useState("");
 
-  /** 补一个字段并交上去。 */
+  /**
+   * 补一个字段并交上去。
+   *
+   * **每次都按"当前编码器 + 当前画质文本"重新解释 crf/qv** —— 不能只在打字那一刻算。
+   * 早先就是这么错的：打完 40 再切编码器，只更新了 encoder，于是输入框里还写着 40，
+   * 提交却用档位默认值（界面上写着用它、实际没用，是最坏的一种）。
+   */
   function update(patch: Partial<CompressParams>) {
-    onChange({ ...v, ...patch });
+    const next = { ...v, ...patch };
+    onChange({ ...next, ...compressQuality(next.encoder, quality) });
   }
 
-  /** 画质输入框变了：文本留在本地，派生值（crf 或 qv）进 params。 */
+  /** 画质文本变了：文本留本地，派生值（crf 或 qv）进 params。 */
   function onQuality(text: string) {
     setQuality(text);
-    const q = text.trim() === "" ? null : Number(text);
-    update({ crf: v.encoder === "hardware" ? null : q, qv: v.encoder === "hardware" ? q : null });
+    onChange({ ...v, ...compressQuality(v.encoder, text) });
   }
 
   return (

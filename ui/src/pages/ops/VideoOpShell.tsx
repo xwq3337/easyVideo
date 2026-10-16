@@ -5,6 +5,7 @@ import JobList from "../../components/JobList";
 import * as ipc from "../../lib/ipc";
 import { formatSize } from "../../lib/format";
 import { formatTimecode } from "../../lib/timecode";
+import { planKey } from "../../lib/opForms";
 import { run, useSettings } from "../../store/store";
 import type { JobParamsDto, VideoInfoDto } from "../../lib/types";
 import { opLabel, type VideoOp } from "../../lib/videoOps";
@@ -52,21 +53,13 @@ export default function VideoOpShell({
     if (i) setInfo(i);
   }
 
-  // **只在影响产物名的东西变化时重算**：源文件、操作、以及参数里决定扩展名的那两项
-  // （转码的 target、裁剪的 mode）。时间与画质不影响名字，改它们不触发 ——
-  // 否则用户每敲一个数字就要跑一次 `ffmpeg -i`。
-  const namer =
-    params === null
-      ? null
-      : JSON.stringify([
-          input,
-          op,
-          params.op === "transcode" ? params.target : null,
-          params.op === "trim" ? params.mode : null,
-        ]);
+  // **只在影响产物名的东西变化时重算** —— 键的构成在 `planKey` 里，并配有测试。
+  // 其中**保存目录必须在**：它是产物名的一部分（重名让路就是在它里面找空位），
+  // 漏了它的话用户改了保存位置、预览还指着旧目录。
+  const namer = planKey(input, op, params, outputDir);
 
   useEffect(() => {
-    if (!input || !outputDir || params === null) {
+    if (namer === null || !input || !outputDir || params === null) {
       setPlanned(null);
       return;
     }
@@ -77,9 +70,8 @@ export default function VideoOpShell({
     return () => {
       alive = false;
     };
-    // 依赖刻意是上面那个拼出来的字符串，不是 [input, outputDir, params] ——
-    // 后者的每个成员都可能在每帧重建，会把 effect 变成死循环。
-    // eslint 之外的规矩：真实的依赖语义由 `namer` 这个字符串代表。
+    // 依赖是这个字符串而不是 [input, outputDir, params] —— 后者每帧都是新对象，
+    // 会把 effect 变成死循环。
   }, [namer]);
 
   async function start() {
