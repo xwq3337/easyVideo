@@ -299,7 +299,8 @@ impl From<&JobState> for JobStateDto {
 pub struct JobDto {
     pub id: u64,
     pub label: String,
-    pub input: String,
+    /// **一组**：合并把 N 个文件按这个顺序拼起来，界面据此显示"共 N 个文件"。
+    pub inputs: Vec<String>,
     pub output: String,
     pub state: JobStateDto,
     /// `None` = 时长未知，界面显示不确定态进度条。**必须是 null 而不是缺字段。**
@@ -310,7 +311,7 @@ pub fn job_dto(j: JobSnapshot) -> JobDto {
     JobDto {
         id: j.id,
         label: j.label,
-        input: j.input.to_string_lossy().into_owned(),
+        inputs: j.inputs.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
         output: j.output.to_string_lossy().into_owned(),
         state: JobStateDto::from(&j.state),
         progress: j.progress,
@@ -809,7 +810,7 @@ mod tests {
         let j = job_dto(JobSnapshot {
             id: 7,
             label: "压缩 · 均衡".into(),
-            input: std::path::PathBuf::from("/in/a.mp4"),
+            inputs: vec![std::path::PathBuf::from("/in/a.mp4")],
             output: std::path::PathBuf::from("/out/a-压缩.mp4"),
             state: JobState::Running,
             progress: Some(0.5),
@@ -819,7 +820,7 @@ mod tests {
             serde_json::json!({
                 "id": 7,
                 "label": "压缩 · 均衡",
-                "input": "/in/a.mp4",
+                "inputs": ["/in/a.mp4"],
                 "output": "/out/a-压缩.mp4",
                 "state": { "kind": "running" },
                 "progress": 0.5
@@ -829,7 +830,7 @@ mod tests {
         let j = job_dto(JobSnapshot {
             id: 8,
             label: "压缩 · 小体积".into(),
-            input: "/in/b.mp4".into(),
+            inputs: vec!["/in/b.mp4".into(), "/in/c.mp4".into()],
             output: "/out/b-压缩.mp4".into(),
             state: JobState::Queued,
             progress: None,

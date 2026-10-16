@@ -104,7 +104,8 @@ export interface JobDto {
   id: number;
   /** 形如 "压缩 · 均衡"，列表直接显示，不在前端拼。 */
   label: string;
-  input: string;
+  /** **一组**：合并按这个顺序拼；单输入的操作只有一个元素。 */
+  inputs: string[];
   output: string;
   state: JobStateDto;
   /** 0–1。null = 时长未知，界面显示不确定态进度条。 */

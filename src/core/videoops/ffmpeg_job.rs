@@ -33,12 +33,31 @@ pub fn parse_progress_fraction(line: &str, duration_secs: f64) -> Option<f64> {
     Some(frac.clamp(0.0, 1.0))
 }
 
+/// 退出时删掉这次任务用过的临时文件。
+///
+/// 放在一个 `Drop` 里而不是逐个返回点手动删：`run_job` 有四个返回点（成功、
+/// ffmpeg 非零退出、取消、spawn 失败），逐个记得删迟早漏一个 —— 而"漏一个"的
+/// 表现就是用户的磁盘上多出一个没人认领的文件。
+struct ScratchGuard(Option<std::path::PathBuf>);
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0 {
+            std::fs::remove_file(p).ok();
+        }
+    }
+}
+
 /// 跑一次 ffmpeg，全程可被 `cancel` 打断。**成功时产物就位在 `output`。**
 ///
 /// 临时名（`<output>.part`）由本函数自己推导 —— 与 `compress_args` 用的是同一个
 /// `part_path_for`，所以"ffmpeg 写到哪"与"我们清理/改名哪一个"不可能对不上。
 /// rename 也在这里做：**"原子地产出"是一个动作**，拆给调用方做的话，
 /// 每个调用方都要自己记得改名，而且失败时留下半截 `.part` 的责任也跟着散开。
+///
+/// `scratch` 是**这次任务用过的临时文件**（合并的 concat 列表），在所有退出路径上
+/// 由 `ScratchGuard` 删掉。它已经负责 `.part` 的清理了，"这次任务用过的临时文件"
+/// 是同一份责任，不该散到第二个地方。
 ///
 /// 收尾顺序**固定**：先 kill、再等它真的退出、最后才删产物。顺序反了的话，
 /// kill 只是发信号，进程可能还有一次写在做 —— 不等它就删，它随后会把半截文件
@@ -48,9 +67,11 @@ pub async fn run_job(
     args: &[String],
     output: &Path,
     duration_secs: Option<f64>,
+    scratch: Option<&Path>,
     on_progress: Arc<dyn Fn(f64) + Send + Sync>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<JobOutcome> {
+    let _scratch = ScratchGuard(scratch.map(|p| p.to_path_buf()));
     let part_path = crate::core::videoops::params::part_path_for(output);
     let mut cmd = tokio::process::Command::new(ffmpeg);
     cmd.args(args);

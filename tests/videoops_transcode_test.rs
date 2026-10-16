@@ -142,7 +142,7 @@ async fn transcodes_to_webm_for_real_with_vp9_and_opus() {
     let out = dir.path().join("out.webm");
     let p = params(TargetFormat::WebmVp9, CompressPreset::Small);
     let args = transcode_args(&src, &out, &p);
-    let outcome = run_job(&ffmpeg, &args, &out, Some(3.0), Arc::new(|_| {}),
+    let outcome = run_job(&ffmpeg, &args, &out, Some(3.0), None, Arc::new(|_| {}),
                           &CancellationToken::new()).await.unwrap();
     assert_eq!(outcome, JobOutcome::Done);
     assert!(out.exists(), "产物必须就位");
@@ -177,7 +177,7 @@ async fn transcodes_to_h265_mp4_and_matroska_for_real() {
     ] {
         let out = dir.path().join(format!("out.{want_ext}"));
         let args = transcode_args(&src, &out, &params(target, CompressPreset::Small));
-        let outcome = run_job(&ffmpeg, &args, &out, Some(2.0), Arc::new(|_| {}),
+        let outcome = run_job(&ffmpeg, &args, &out, Some(2.0), None, Arc::new(|_| {}),
                               &CancellationToken::new()).await.unwrap();
         assert_eq!(outcome, JobOutcome::Done, "{target:?}");
         let back = inspect(&ffmpeg, &out).await.unwrap();

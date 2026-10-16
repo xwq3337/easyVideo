@@ -73,7 +73,7 @@ async fn compresses_a_real_file_end_to_end() {
     let seen: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = seen.clone();
     let outcome = run_job(
-        &ffmpeg, &args, &out, duration,
+        &ffmpeg, &args, &out, duration, None,
         Arc::new(move |f| sink.lock().unwrap().push(f)),
         &CancellationToken::new(),
     ).await.unwrap();
@@ -112,7 +112,7 @@ async fn handles_paths_with_quotes_spaces_and_cjk() {
     let out = sub.join("源 文件-压缩.mp4");
     let part = sub.join("源 文件-压缩.mp4.part");
     let args = compress_args(&src, &out, &params(CompressPreset::Balanced));
-    let outcome = run_job(&ffmpeg, &args, &out, Some(2.0), Arc::new(|_| {}), &CancellationToken::new())
+    let outcome = run_job(&ffmpeg, &args, &out, Some(2.0), None, Arc::new(|_| {}), &CancellationToken::new())
         .await.unwrap();
     assert_eq!(outcome, JobOutcome::Done);
     assert!(out.exists());
@@ -147,7 +147,7 @@ async fn cancel_kills_the_process_and_removes_the_partial_file() {
         t.cancel();
     });
 
-    let outcome = run_job(&ffmpeg, &args, &out, Some(20.0), Arc::new(|_| {}), &token).await.unwrap();
+    let outcome = run_job(&ffmpeg, &args, &out, Some(20.0), None, Arc::new(|_| {}), &token).await.unwrap();
     assert_eq!(outcome, JobOutcome::Interrupted);
     assert!(!part.exists(), "取消后必须删掉半截产物 —— 否则用户会看到一个打不开的 mp4");
     assert!(!out.exists());
@@ -175,7 +175,7 @@ async fn a_failed_rename_does_not_leave_the_part_file_behind() {
     std::fs::write(out.join("occupied"), b"x").unwrap(); // 非空，rename 必失败
 
     let args = compress_args(&src, &out, &params(CompressPreset::Balanced));
-    let err = run_job(&ffmpeg, &args, &out, Some(2.0), Arc::new(|_| {}), &CancellationToken::new())
+    let err = run_job(&ffmpeg, &args, &out, Some(2.0), None, Arc::new(|_| {}), &CancellationToken::new())
         .await;
     assert!(err.is_err(), "改名到非空目录上必须失败");
 
@@ -184,4 +184,62 @@ async fn a_failed_rename_does_not_leave_the_part_file_behind() {
         !part.exists(),
         "改名失败时也必须删掉 .part —— 否则用户会在目录里看到一个打不开的半截文件，实际: {part:?}"
     );
+}
+
+/// **`run_job` 负责把这次任务用过的临时文件清干净** —— 成功与取消都要清。
+///
+/// 合并要一个 concat 列表文件；它写在应用数据目录里，不往用户的输出目录里丢东西，
+/// 但也不能因为任务失败就永远留在那儿。
+///
+/// 这里用一个内容无关紧要的临时文件代替真实列表：要验的是**清理**，
+/// 不是列表的生成（那是下一个任务）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scratch_file_is_removed_on_success_and_on_cancel() {
+    let dir = tempfile::tempdir().unwrap();
+    let ffmpeg = ensure_ffmpeg(dir.path()).unwrap();
+    let src = dir.path().join("src.mp4");
+    let gen = tokio::process::Command::new(&ffmpeg)
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=duration=8:size=320x240:rate=15",
+               "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30"])
+        .arg(&src).output().await.unwrap();
+    assert!(gen.status.success());
+
+    // ① 成功路径
+    let out = dir.path().join("ok.mp4");
+    let scratch = dir.path().join("scratch.txt");
+    std::fs::write(&scratch, b"whatever").unwrap();
+    let args = compress_args(&src, &out, &params(CompressPreset::Small));
+    let outcome = run_job(&ffmpeg, &args, &out, Some(8.0), Some(&scratch),
+                          Arc::new(|_| {}), &CancellationToken::new()).await.unwrap();
+    assert_eq!(outcome, JobOutcome::Done);
+    assert!(!scratch.exists(), "成功后临时文件必须被删掉");
+
+    // ② 取消路径
+    let out2 = dir.path().join("cancelled.mp4");
+    let scratch2 = dir.path().join("scratch2.txt");
+    std::fs::write(&scratch2, b"whatever").unwrap();
+    let token = CancellationToken::new();
+    token.cancel();
+    let _ = run_job(&ffmpeg, &args, &out2, Some(8.0), Some(&scratch2),
+                    Arc::new(|_| {}), &token).await;
+    assert!(!scratch2.exists(), "取消后临时文件同样要被删掉");
+}
+
+/// 没给 scratch 时照常工作（压缩/转码/裁剪都不需要临时文件）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_job_works_without_a_scratch_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let ffmpeg = ensure_ffmpeg(dir.path()).unwrap();
+    let src = dir.path().join("src.mp4");
+    let gen = tokio::process::Command::new(&ffmpeg)
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=duration=2:size=320x240:rate=15",
+               "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30"])
+        .arg(&src).output().await.unwrap();
+    assert!(gen.status.success());
+    let out = dir.path().join("out.mp4");
+    let args = compress_args(&src, &out, &params(CompressPreset::Small));
+    let outcome = run_job(&ffmpeg, &args, &out, Some(2.0), None,
+                          Arc::new(|_| {}), &CancellationToken::new()).await.unwrap();
+    assert_eq!(outcome, JobOutcome::Done);
+    assert!(out.exists());
 }

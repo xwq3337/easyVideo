@@ -182,7 +182,7 @@ async fn fast_trim_cut_is_frame_accurate_on_a_sparse_gop_source() {
     let out = dir.path().join("cut.mp4");
     let t = TrimParams { start: 12.5, end: Some(20.0), mode: TrimMode::Fast };
     let args = trim_args(&src_path, &out, &t, &info);
-    let outcome = run_job(&ffmpeg, &args, &out, Some(30.0), Arc::new(|_| {}),
+    let outcome = run_job(&ffmpeg, &args, &out, Some(30.0), None, Arc::new(|_| {}),
                           &CancellationToken::new()).await.unwrap();
     assert_eq!(outcome, JobOutcome::Done);
 
@@ -208,7 +208,7 @@ async fn accurate_trim_runs_and_has_the_right_duration() {
     let out = dir.path().join("cut.mp4");
     let t = TrimParams { start: 5.0, end: Some(9.0), mode: TrimMode::Accurate };
     let args = trim_args(&src_path, &out, &t, &info);
-    let outcome = run_job(&ffmpeg, &args, &out, Some(30.0), Arc::new(|_| {}),
+    let outcome = run_job(&ffmpeg, &args, &out, Some(30.0), None, Arc::new(|_| {}),
                           &CancellationToken::new()).await.unwrap();
     assert_eq!(outcome, JobOutcome::Done);
     assert!(out.exists());

@@ -28,9 +28,14 @@ export default function JobRow({ job }: { job: JobView }) {
         </span>
       </div>
 
-      {/* 源文件路径：文件名往往不透明，靠它认人（与 TaskRow 摆 URL 同理） */}
-      <div className="truncate text-[12px]" style={{ color: "var(--fg-muted)" }} title={job.input}>
-        {job.input}
+      {/* 源文件路径：文件名往往不透明，靠它认人（与 TaskRow 摆 URL 同理）。
+          合并有多个源，一行摆不下 —— 那时显示"共 N 个文件"，完整的留给 title。 */}
+      <div
+        className="truncate text-[12px]"
+        style={{ color: "var(--fg-muted)" }}
+        title={job.inputs.join("\n")}
+      >
+        {job.inputs.length === 1 ? job.inputs[0] : `共 ${job.inputs.length} 个文件`}
       </div>
 
       <div

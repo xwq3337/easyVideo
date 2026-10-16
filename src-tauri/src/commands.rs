@@ -146,7 +146,7 @@ pub async fn add_video_job(
     // 先把 VideoOps 克隆出来再 await：State 是个借用，跨 await 持有它会把借用
     // 连带进 future，而 Tauri 要求 async 命令返回 Send future。内部是 Arc，克隆很便宜。
     let ops = state.videoops.clone();
-    ops.add_job(PathBuf::from(input), PathBuf::from(output_dir), params)
+    ops.add_job(vec![PathBuf::from(input)], PathBuf::from(output_dir), params)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -162,7 +162,7 @@ pub async fn plan_output(
 ) -> R<String> {
     let params = JobParams::try_from(params)?; // 错误已经是给人看的一句话
     let ops = state.videoops.clone();
-    ops.plan_output(PathBuf::from(input), PathBuf::from(output_dir), params)
+    ops.plan_output(vec![PathBuf::from(input)], PathBuf::from(output_dir), params)
         .await
         .map_err(|e| format!("{e:#}"))
 }

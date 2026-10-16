@@ -34,7 +34,8 @@ pub enum JobState {
 pub struct JobSnapshot {
     pub id: JobId,
     pub label: String,
-    pub input: PathBuf,
+    /// **一组**而不是一个：合并要把 N 个文件按这个顺序拼起来。
+    pub inputs: Vec<PathBuf>,
     pub output: PathBuf,
     pub state: JobState,
     pub progress: Option<f64>,
@@ -54,11 +55,19 @@ fn is_terminal(s: &JobState) -> bool {
 
 struct JobEntry {
     label: String,
-    input: PathBuf,
+    inputs: Vec<PathBuf>,
     output: PathBuf,
     /// 已经拼好的 ffmpeg 参数。入队时算一次就够了 —— 参数只由用户的选择决定，
     /// 之后不会再变；放在 worker 里重算只会多一处可能与校验时不一致的地方。
     args: Vec<String>,
+    /// 本次任务要写的临时文件：路径 + **内容**。内容在入队时就算好
+    /// （`concat_list` 是纯函数），worker 只负责写。
+    /// 排队中被取消的任务从没写过它，所以没有可清理的东西。
+    scratch: Option<(PathBuf, String)>,
+    /// 进度条的分母，**入队时就算好**（`params.duration_secs(ctx)`）。
+    /// 不放进 worker 去现算：那时 entry 里已经没有逐段的媒体信息了，
+    /// 而合并要的是**各段之和**。
+    duration: Option<f64>,
     state: JobState,
     progress: Option<f64>,
     cancel: CancellationToken,
@@ -137,7 +146,7 @@ impl VideoOps {
             .map(|(id, j)| JobSnapshot {
                 id: *id,
                 label: j.label.clone(),
-                input: j.input.clone(),
+                inputs: j.inputs.clone(),
                 output: j.output.clone(),
                 state: j.state.clone(),
                 progress: j.progress,
@@ -168,23 +177,29 @@ impl VideoOps {
     /// 比直接报错坏得多。
     pub async fn add_job(
         &self,
-        input: PathBuf,
+        inputs: Vec<PathBuf>,
         output_dir: PathBuf,
         params: JobParams,
     ) -> anyhow::Result<JobId> {
-        if !input.is_file() {
-            anyhow::bail!("找不到输入文件：{}", input.display());
+        if inputs.is_empty() {
+            anyhow::bail!("没有选文件");
+        }
+        for p in &inputs {
+            if !p.is_file() {
+                anyhow::bail!("找不到输入文件：{}", p.display());
+            }
         }
         if !output_dir.is_dir() {
             anyhow::bail!("输出目录不存在：{}", output_dir.display());
         }
         let ffmpeg = self.ffmpeg()?;
-        // 要**整份** MediaInfo 而不只是 has_video：产物扩展名与裁剪的 -f 都看源容器
-        let src = media_info::inspect(&ffmpeg, &input).await?;
+        // 只探**首段**：单输入的操作看的就是它，而"按首段定名字与容器"对合并也成立。
+        // 逐段的媒体信息留给合并自己的兼容性校验（`check_merge` 会全探一遍）。
+        let src = media_info::inspect(&ffmpeg, &inputs[0]).await?;
         if !src.has_video {
             anyhow::bail!(
                 "这个文件里读不到视频流（可能是纯音频，或者文件已损坏）：{}",
-                input.display()
+                inputs[0].display()
             );
         }
         // 真写一个探针文件，而不是查权限位 —— 权限位在 ACL、只读卷、网络盘上都不作数
@@ -193,7 +208,7 @@ impl VideoOps {
             .map_err(|e| anyhow::anyhow!("输出目录不可写（{}）：{e}", output_dir.display()))?;
         std::fs::remove_file(&probe).ok();
 
-        let stem = input
+        let stem = inputs[0]
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("video")
@@ -202,7 +217,6 @@ impl VideoOps {
         // **取名 + 登记必须在同一个锁里** —— 见 `plan_output_path` 的说明。
         let id = {
             let mut jobs = self.inner.jobs.lock().unwrap();
-            let inputs = vec![input.clone()];
             let infos = vec![src.clone()];
             // `extension` 只看首段，所以不必先有 ctx —— 先算 output（它靠 extension），
             // 再拿 output 的引用构造 ctx。**顺序不能反**：ctx 里要放 output 的引用，
@@ -214,24 +228,32 @@ impl VideoOps {
                 params.suffix(),
                 &params.extension(&src),
             );
+            // 需要临时文件的操作（目前只有合并）在这里把**路径与内容**都备好：
+            // 内容是纯函数算的，worker 只负责写。排队中被取消的任务从没写过它。
+            // 合并那支在下一个任务里接上 —— 它依赖的 `merge` 模块那时才存在。
+            let scratch: Option<(PathBuf, String)> = None;
+            let scratch_path = scratch.as_ref().map(|(p, _)| p.as_path());
             let ctx = JobContext {
                 inputs: &inputs,
                 infos: &infos,
                 output: &output,
-                scratch: None,
+                scratch: scratch_path,
             };
             // **操作自己的语义校验**（裁剪的时间范围就靠这一步挡住）。
             // 放在这里而不是命令层：入队校验全在 core，命令层只做薄封装，这条规矩别破。
             params.validate(&ctx)?;
-            let args = params.args(&ctx);
+            let duration = params.duration_secs(&ctx);
+            let args = params.args(&ctx); // ctx 的最后一处使用 —— 之后才能把 scratch 移进 entry
             let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
             jobs.insert(
                 id,
                 JobEntry {
                     label: params.label(),
-                    input,
+                    inputs,
                     output,
                     args,
+                    scratch,
+                    duration,
                     state: JobState::Queued,
                     progress: None,
                     cancel: CancellationToken::new(),
@@ -251,16 +273,20 @@ impl VideoOps {
     /// 边角上分叉（比如"在途任务占位"只加了一边），而那正是预览存在的意义。
     pub async fn plan_output(
         &self,
-        input: PathBuf,
+        inputs: Vec<PathBuf>,
         output_dir: PathBuf,
         params: JobParams,
     ) -> anyhow::Result<String> {
-        if !input.is_file() {
-            anyhow::bail!("找不到输入文件：{}", input.display());
+        if inputs.is_empty() {
+            anyhow::bail!("没有选文件");
+        }
+        if !inputs[0].is_file() {
+            anyhow::bail!("找不到输入文件：{}", inputs[0].display());
         }
         let ffmpeg = self.ffmpeg()?;
-        let src = media_info::inspect(&ffmpeg, &input).await?;
-        let stem = input
+        // 只探首段 —— 产物名与容器都按它定（与 `add_job` 同一套规则）
+        let src = media_info::inspect(&ffmpeg, &inputs[0]).await?;
+        let stem = inputs[0]
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("video")
@@ -376,16 +402,20 @@ impl VideoOps {
             let engine = self.clone();
             let tx = self.inner.tx.clone();
             self.inner.rt.spawn(async move {
-                let Some(input) = engine.job_input(id) else {
+                if !engine.job_exists(id) {
                     return; // 起 worker 之前就被移除了，没有收尾可言
-                };
+                }
                 let outcome = async {
                     let ffmpeg = engine.ffmpeg()?;
-                    // 时长只为进度条服务，拿不到就退化成不确定态，绝不阻断任务。
-                    let duration = media_info::inspect(&ffmpeg, &input)
-                        .await
-                        .ok()
-                        .and_then(|m| m.duration_secs);
+                    // 临时文件由 worker 写：排队中被取消的任务从没写过它。
+                    // 删由 `run_job` 负责（成功、失败、取消三条路都删）。
+                    let scratch = engine.job_scratch(id);
+                    if let Some((path, content)) = &scratch {
+                        std::fs::write(path, content)?;
+                    }
+                    // 分母**入队时就算好了** —— 那会儿 entry 里还有逐段的媒体信息，
+                    // 而合并要的是各段之和。这里现算只能拿到首段。
+                    let duration = engine.job_duration(id);
                     let tx_progress = tx.clone();
                     // 进度要**同时**落进内存状态与发事件：只发事件的话，重同步之后
                     // 列表里读到的进度会退回上一次事件的值（水合读的是 JobEntry）。
@@ -394,7 +424,16 @@ impl VideoOps {
                         engine_progress.note_progress(id, f);
                         let _ = tx_progress.send(VideoOpEvent::Progress { id, fraction: f });
                     });
-                    run_job(&ffmpeg, &args, &output, duration, on_progress, &cancel).await
+                    run_job(
+                        &ffmpeg,
+                        &args,
+                        &output,
+                        duration,
+                        scratch.as_ref().map(|(p, _)| p.as_path()),
+                        on_progress,
+                        &cancel,
+                    )
+                    .await
                 }
                 .await;
 
@@ -409,8 +448,17 @@ impl VideoOps {
         }
     }
 
-    fn job_input(&self, id: JobId) -> Option<PathBuf> {
-        self.inner.jobs.lock().unwrap().get(&id).map(|j| j.input.clone())
+    /// worker 起跑前确认任务还在 —— 排队期间被移除的没有收尾可言。
+    fn job_exists(&self, id: JobId) -> bool {
+        self.inner.jobs.lock().unwrap().contains_key(&id)
+    }
+
+    fn job_scratch(&self, id: JobId) -> Option<(PathBuf, String)> {
+        self.inner.jobs.lock().unwrap().get(&id).and_then(|j| j.scratch.clone())
+    }
+
+    fn job_duration(&self, id: JobId) -> Option<f64> {
+        self.inner.jobs.lock().unwrap().get(&id).and_then(|j| j.duration)
     }
 
     /// 进度落进内存状态。列表水合时读的就是它。
