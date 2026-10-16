@@ -13,9 +13,13 @@ use std::sync::Arc;
 use easydownvideo::core::events::EngineEvent;
 use tokio::sync::broadcast;
 
-use crate::dto::{event_dto, EventDto};
 
 pub const EVENT: &str = "engine://event";
+/// 视频操作那条通道。两条通道各用各的事件名，前端按名字路由，
+/// 不必在一个联合类型里同时处理两套东西。
+pub const VIDEO_EVENT: &str = "videoops://event";
+/// **两条通道共用**这一个 resync 信号：任一条落后都整体重取（下载任务 + 视频任务）。
+/// 宁可多取一次，也不要漏 —— 漏掉一个 Done 就是那一行永久停在"运行中"。
 pub const RESYNC: &str = "engine://resync";
 
 /// 桥的出口。抽成 trait 是为了让 `Lagged` 分支可测——直接依赖 `AppHandle` 的话，
@@ -47,7 +51,7 @@ impl EventSink for tauri::AppHandle {
 ///
 /// 丢掉的这些消息**信息不会丢**，这正是可以放心丢的理由：
 /// 状态与进度由 `get_tasks()` 补齐，候选列表由 `pending_choice(id)` 补齐（见 plan 的 T7/T11）。
-fn drain_stale(rx: &mut broadcast::Receiver<EngineEvent>) -> u64 {
+fn drain_stale<E: Clone>(rx: &mut broadcast::Receiver<E>) -> u64 {
     let mut dropped = 0;
     loop {
         match rx.try_recv() {
@@ -61,16 +65,24 @@ fn drain_stale(rx: &mut broadcast::Receiver<EngineEvent>) -> u64 {
     dropped
 }
 
-pub async fn run<S: EventSink>(sink: Arc<S>, mut rx: broadcast::Receiver<EngineEvent>) {
+/// 一条通道的转发循环。
+///
+/// **泛化而不是复制一份**：`Lagged → 排空残余 → 发 resync` 那套推理（连同它防的那个
+/// "旧事件晚于全量快照落地、把正确状态盖回去"的缺陷）是整个桥存在的理由。
+/// 复制第二份就等于给了它一处将来只改一边的机会，而漏改的那一边会静默退化成
+/// egui 版那个毛病。两条通道各调一次本函数即可。
+pub async fn run<S, E>(
+    sink: Arc<S>,
+    mut rx: broadcast::Receiver<E>,
+    to_json: fn(E) -> serde_json::Value,
+    event_name: &'static str,
+) where
+    S: EventSink,
+    E: Clone + Send + 'static,
+{
     loop {
         match rx.recv().await {
-            Ok(ev) => {
-                let dto: EventDto = event_dto(ev);
-                match serde_json::to_value(dto) {
-                    Ok(v) => sink.emit(EVENT, v),
-                    Err(e) => tracing::warn!("事件序列化失败: {e}"),
-                }
-            }
+            Ok(ev) => sink.emit(event_name, to_json(ev)),
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 // 先排空、后发 resync：`dropped` 报的是前端**永远看不到**的总条数
                 // （被覆盖掉的 n 条 + 排在 resync 之前、被我们主动丢弃的残余）。
@@ -108,7 +120,7 @@ mod tests {
         let (tx, rx) = broadcast::channel(16);
         let sink = fake();
         let task_sink = sink.clone();
-        let handle = tokio::spawn(run(task_sink, rx));
+        let handle = tokio::spawn(run(task_sink, rx, crate::dto::download_event_json, EVENT));
 
         tx.send(EngineEvent::StateChanged {
             id: 1,
@@ -138,7 +150,7 @@ mod tests {
         let (tx, rx) = broadcast::channel(2);
         let sink = fake();
         let task_sink = sink.clone();
-        let handle = tokio::spawn(run(task_sink, rx));
+        let handle = tokio::spawn(run(task_sink, rx, crate::dto::download_event_json, EVENT));
 
         for i in 0..8u64 {
             let _ = tx.send(EngineEvent::Progress {
@@ -158,6 +170,29 @@ mod tests {
         assert!(resyncs[0].1["dropped"].as_u64().unwrap() > 0);
 
         // 而且 resync 必须**在最后**——前端收到它才会整体重取，之后不该再有旧事件
+        assert_eq!(got.last().unwrap().0, RESYNC);
+    }
+
+    /// 泛化之后，第二条通道必须和下载那条一样：落后时发 resync，而不是静默丢事件。
+    /// 这是"只有一份实现"这句话的验收 —— 少了它，泛化只是形式上的。
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_video_bus_gets_the_same_lag_treatment() {
+        use easydownvideo::core::videoops::VideoOpEvent;
+        let (tx, rx) = broadcast::channel(2);
+        let sink = fake();
+        let task_sink = sink.clone();
+        let handle = tokio::spawn(run(task_sink, rx, crate::dto::video_event_dto, VIDEO_EVENT));
+
+        for i in 0..8u64 {
+            let _ = tx.send(VideoOpEvent::Progress { id: i, fraction: 0.1 });
+        }
+        drop(tx);
+        handle.await.unwrap();
+
+        let got = sink.0.lock().unwrap();
+        let resyncs: Vec<_> = got.iter().filter(|(name, _)| name == RESYNC).collect();
+        assert_eq!(resyncs.len(), 1, "视频通道落后时也必须发恰好一次 resync");
+        assert!(resyncs[0].1["dropped"].as_u64().unwrap() > 0);
         assert_eq!(got.last().unwrap().0, RESYNC);
     }
 }

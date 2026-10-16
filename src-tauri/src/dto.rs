@@ -249,6 +249,100 @@ pub fn settings_from(s: SettingsDto) -> Settings {
     }
 }
 
+/// 下载事件转 JSON。桥泛化成"接受一个 `fn(E) -> Value` 的映射函数"之后，
+/// 这个转换就得有人做 —— 放在这里与 `video_event_dto` 对称，两边都由 dto 拥有线格式。
+pub fn download_event_json(ev: EngineEvent) -> serde_json::Value {
+    match serde_json::to_value(event_dto(ev)) {
+        Ok(v) => v,
+        Err(e) => {
+            // 理论上到不了这里（EventDto 里没有 non-string map key 或 NaN），
+            // 但原实现有这条日志，泛化时不该顺手把它丢掉。
+            tracing::warn!("事件序列化失败: {e}");
+            serde_json::Value::Null
+        }
+    }
+}
+
+// ===== 视频操作 =====
+//
+// 与下载那边**刻意分开**：`EventDto` 是下载契约的一部分，往里加视频变体会让两边的
+// 类型互相污染，也会逼前端在一个联合类型里同时处理两套东西。所以视频事件直接转
+// JSON 交给桥（`video_event_dto`），字段风格仍与下载事件一致（`type` 内部标签 +
+// camelCase 字段），前端的路由方式也就跟着一致。
+
+use easydownvideo::core::videoops::{JobSnapshot, JobState, VideoOpEvent};
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum JobStateDto {
+    Queued,
+    Running,
+    Done,
+    Failed { message: String },
+    Canceled,
+}
+
+impl From<&JobState> for JobStateDto {
+    fn from(s: &JobState) -> Self {
+        match s {
+            JobState::Queued => Self::Queued,
+            JobState::Running => Self::Running,
+            JobState::Done => Self::Done,
+            JobState::Failed(m) => Self::Failed { message: m.clone() },
+            JobState::Canceled => Self::Canceled,
+        }
+    }
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct JobDto {
+    pub id: u64,
+    pub label: String,
+    pub input: String,
+    pub output: String,
+    pub state: JobStateDto,
+    /// `None` = 时长未知，界面显示不确定态进度条。**必须是 null 而不是缺字段。**
+    pub progress: Option<f64>,
+}
+
+pub fn job_dto(j: JobSnapshot) -> JobDto {
+    JobDto {
+        id: j.id,
+        label: j.label,
+        input: j.input.to_string_lossy().into_owned(),
+        output: j.output.to_string_lossy().into_owned(),
+        state: JobStateDto::from(&j.state),
+        progress: j.progress,
+    }
+}
+
+/// 读一个视频的基本信息（界面上的预览，不是任务）。
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoInfoDto {
+    /// `None` = 读不到（损坏文件等）。界面显示"时长未知"，不显示 0。
+    pub duration_secs: Option<f64>,
+    pub has_video: bool,
+    pub size_bytes: u64,
+}
+
+pub fn video_event_dto(ev: VideoOpEvent) -> serde_json::Value {
+    match ev {
+        VideoOpEvent::Added { id } => serde_json::json!({ "type": "added", "id": id }),
+        VideoOpEvent::Removed { id } => serde_json::json!({ "type": "removed", "id": id }),
+        VideoOpEvent::Progress { id, fraction } => {
+            serde_json::json!({ "type": "progress", "id": id, "fraction": fraction })
+        }
+        VideoOpEvent::StateChanged { id, state } => serde_json::json!({
+            "type": "stateChanged",
+            "id": id,
+            "state": serde_json::to_value(JobStateDto::from(&state))
+                .unwrap_or(serde_json::Value::Null),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,5 +698,67 @@ mod tests {
             serde_json::to_value(&d).unwrap(),
             serde_json::json!({ "type": "taskRemoved", "id": 42 })
         );
+    }
+    /// 视频任务事件的 wire 形状。与下载事件一样走**整个对象相等**，
+    /// 漏键或改名都要在这里变红。
+    #[test]
+    fn video_job_events_pin_their_keys() {
+        let j = video_event_dto(VideoOpEvent::StateChanged {
+            id: 3,
+            state: JobState::Failed("ffmpeg 失败".into()),
+        });
+        assert_eq!(
+            j,
+            serde_json::json!({
+                "type": "stateChanged",
+                "id": 3,
+                "state": { "kind": "failed", "message": "ffmpeg 失败" }
+            })
+        );
+
+        let j = video_event_dto(VideoOpEvent::Progress { id: 3, fraction: 0.25 });
+        assert_eq!(j, serde_json::json!({ "type": "progress", "id": 3, "fraction": 0.25 }));
+
+        let j = video_event_dto(VideoOpEvent::Added { id: 9 });
+        assert_eq!(j, serde_json::json!({ "type": "added", "id": 9 }));
+        let j = video_event_dto(VideoOpEvent::Removed { id: 9 });
+        assert_eq!(j, serde_json::json!({ "type": "removed", "id": 9 }));
+    }
+
+    /// 任务快照的每一个键都要钉住。`progress` 为 `None` 时必须是 `null` 而不是缺字段
+    /// —— 前端写的是 `number | null`。
+    #[test]
+    fn job_dto_ships_exactly_the_contract_keys() {
+        let j = job_dto(JobSnapshot {
+            id: 7,
+            label: "压缩 · 均衡".into(),
+            input: std::path::PathBuf::from("/in/a.mp4"),
+            output: std::path::PathBuf::from("/out/a-压缩.mp4"),
+            state: JobState::Running,
+            progress: Some(0.5),
+        });
+        assert_eq!(
+            serde_json::to_value(&j).unwrap(),
+            serde_json::json!({
+                "id": 7,
+                "label": "压缩 · 均衡",
+                "input": "/in/a.mp4",
+                "output": "/out/a-压缩.mp4",
+                "state": { "kind": "running" },
+                "progress": 0.5
+            })
+        );
+
+        let j = job_dto(JobSnapshot {
+            id: 8,
+            label: "压缩 · 小体积".into(),
+            input: "/in/b.mp4".into(),
+            output: "/out/b-压缩.mp4".into(),
+            state: JobState::Queued,
+            progress: None,
+        });
+        let v = serde_json::to_value(&j).unwrap();
+        assert_eq!(v["progress"], serde_json::Value::Null);
+        assert!(v.get("progress").is_some(), "None 必须是 null 而不是缺字段");
     }
 }

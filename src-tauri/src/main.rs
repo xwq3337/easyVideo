@@ -97,7 +97,12 @@ fn main() {
             // 事件桥:用同一个 engine 再订阅一路接收器。
             let sink: Arc<tauri::AppHandle> = Arc::new(app.handle().clone());
             let rx = engine.events();
-            tauri::async_runtime::spawn(bridge::run(sink, rx));
+            tauri::async_runtime::spawn(bridge::run(
+                sink,
+                rx,
+                easydownvideo_tauri::dto::download_event_json,
+                bridge::EVENT,
+            ));
             Ok(())
         })
         .run(tauri::generate_context!())
