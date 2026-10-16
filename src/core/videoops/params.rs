@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::core::videoops::compress::{compress_args, preset_label, CompressParams};
+use crate::core::videoops::crop::{crop_args, validate_crop, CropParams};
 use crate::core::videoops::media_info::MediaInfo;
 use crate::core::videoops::merge::{merge_args, merge_extension};
 use crate::core::videoops::transcode::{
@@ -49,6 +50,7 @@ pub enum JobParams {
     /// 合并**没有参数** —— 顺序就是 `ctx.inputs` 的顺序。
     /// 它不是"省了一步"，而是"参数与输入该分开"的直接结果。
     Merge,
+    Crop(CropParams),
 }
 
 impl JobParams {
@@ -60,6 +62,7 @@ impl JobParams {
             JobParams::Transcode(p) => format!("转码 · {}", target_label(p.target)),
             JobParams::Trim(p) => format!("裁剪 · {}", mode_label(p.mode)),
             JobParams::Merge => "合并".to_string(),
+            JobParams::Crop(_) => "裁剪画面".to_string(),
         }
     }
 
@@ -70,6 +73,8 @@ impl JobParams {
             JobParams::Transcode(_) => "-转码",
             JobParams::Trim(_) => "-裁剪",
             JobParams::Merge => "-合并",
+            // **不是 "-裁剪"** —— 那个已经被「裁剪视频」占了，两个产物名会分不清
+            JobParams::Crop(_) => "-画面裁剪",
         }
     }
 
@@ -87,6 +92,8 @@ impl JobParams {
             JobParams::Trim(p) => trim_extension(p, src),
             // 容器沿用首段；认不出来退 matroska
             JobParams::Merge => merge_extension(src),
+            // 重编码的操作统一出 mp4（与压缩页、裁剪视频的精确档一致）
+            JobParams::Crop(_) => "mp4".to_string(),
         }
     }
 
@@ -108,6 +115,7 @@ impl JobParams {
                 ctx.output,
                 ctx.src(),
             ),
+            JobParams::Crop(p) => crop_args(&ctx.inputs[0], ctx.output, p),
         }
     }
 
@@ -133,6 +141,9 @@ impl JobParams {
                 }
                 Ok(())
             }
+            // 越界与奇数必须在这里挡住：ffmpeg 两者都**静默改掉**（x 钳到贴边、
+            // 奇偶取偶），命令行退出码是 0、stderr 是空的 —— 用户拿到的是另一个画面
+            JobParams::Crop(p) => validate_crop(p, ctx.src()),
         }
     }
 
@@ -144,9 +155,12 @@ impl JobParams {
     /// 好让新增变体在编译期就提醒。）
     pub fn duration_secs(&self, ctx: &JobContext) -> Option<f64> {
         match self {
-            JobParams::Compress(_) | JobParams::Transcode(_) | JobParams::Trim(_) => {
-                ctx.src().duration_secs
-            }
+            // 单输入的操作：取首段的时长。裁剪画面**不改时长**，所以它的分母
+            // 就是源时长 —— 进度条照着源跑完，正好。
+            JobParams::Compress(_)
+            | JobParams::Transcode(_)
+            | JobParams::Trim(_)
+            | JobParams::Crop(_) => ctx.src().duration_secs,
             // **各段之和**：concat 产物的时长就是它们相加。用首段时长会让进度条在
             // 第一段结束时就走到 100%，后面几段看起来像卡住了。
             // 任一段读不出来就整体退化成本来就有的不确定态 —— 不编一个数出来。

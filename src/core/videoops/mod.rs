@@ -1,4 +1,5 @@
 pub mod compress;
+pub mod crop;
 pub mod ffmpeg_job;
 pub mod media_info;
 pub mod merge;
