@@ -1,3 +1,6 @@
+// release 下不要附带控制台窗口（Windows 控制台子系统）；debug 保留它方便看日志。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! 组装层:把 core 引擎、自建 tokio runtime、事件桥和命令层接成一个能跑的应用。
 //!
 //! **这里是另一个 crate root。** 所有模块都通过 `easydownvideo_tauri::...` 访问,
