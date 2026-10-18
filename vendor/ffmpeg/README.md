@@ -43,6 +43,9 @@ macOS 那个 63 MB 不触发硬限，但两个加起来压缩后约 67 MiB，每
 
 手动取：`scripts/fetch-ffmpeg.sh macos-aarch64`（或 `windows-x86_64`）。
 
+**Windows 构建需要 bash**（Git Bash / MSYS2）：`build.rs` 是用 `bash` 跑上面那个脚本的。
+用 Git Bash 构建即可；若没有 bash，编译会在 build script 阶段停下并说明原因。
+
 ## 许可证：这两个构建都是 **GPL**
 
 macOS 构建的 `ffmpeg -version` 里含 `--enable-gpl --enable-version3`（Windows 的 essentials 构建同为 GPL）。

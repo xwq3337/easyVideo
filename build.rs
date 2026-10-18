@@ -53,7 +53,12 @@ fn main() {
         .arg(&script)
         .arg(dir)
         .status()
-        .unwrap_or_else(|e| panic!("跑不起来 {}：{e}", script.display()));
+        .unwrap_or_else(|e| {
+            panic!(
+                "跑不起来 {}：{e}\n这个脚本要用 bash —— Windows 上请用 Git Bash / MSYS2 构建。",
+                script.display()
+            )
+        });
     if !status.success() {
         panic!(
             "取回 vendor/ffmpeg/{dir}/{file} 失败（{status}）。这个文件是 `include_bytes!` \
