@@ -8,3 +8,8 @@ ui/dist/
 
 # tauri-build 生成的 ACL schema
 src-tauri/gen/schemas/
+
+# 内嵌 ffmpeg：不进 git（GitHub 单文件 100 MB 硬上限）。
+# 首次构建时由 build.rs → scripts/fetch-ffmpeg.sh 取回，见 vendor/ffmpeg/README.md
+/vendor/ffmpeg/*/ffmpeg
+/vendor/ffmpeg/*/ffmpeg.exe
