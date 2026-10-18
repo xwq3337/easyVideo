@@ -10,16 +10,20 @@ Rust + Tauri 跨平台桌面视频下载器（个人工具）。
 - 设置中更改保存位置、线程数、同时任务数、外观（跟随系统/浅色/深色）
 
 ## 构建
+```shell
 npm install            # Tauri CLI
 npm --prefix ui install
 npm run tauri build    # 产出 .app + .dmg（macOS）
                        # 产物：target/release/bundle/macos/EasyDownVideo.app
-                       #       target/release/bundle/dmg/EasyDownVideo_0.1.0_aarch64.dmg
-
+                       # target/release/bundle/dmg/EasyDownVideo_0.1.0_aarch64.dmg
+```
 ## 开发
+```shell
 npm run tauri dev
-
+```
 ## 测试
+```shell
 cargo test                  # core（只跑这个，快）
 cargo test --workspace      # 连 src-tauri 一起
 npm --prefix ui test        # 前端的 reducer 与格式化
+```
