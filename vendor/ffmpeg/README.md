@@ -44,7 +44,10 @@ macOS 那个 63 MB 不触发硬限，但两个加起来压缩后约 67 MiB，每
 手动取：`scripts/fetch-ffmpeg.sh macos-aarch64`（或 `windows-x86_64`）。
 
 **Windows 构建需要 bash**（Git Bash / MSYS2）：`build.rs` 是用 `bash` 跑上面那个脚本的。
-用 Git Bash 构建即可；若没有 bash，编译会在 build script 阶段停下并说明原因。
+`build.rs` 会主动找 Git for Windows / MSYS2 自带的 bash，**不会直接用 PATH 里的 `bash`**
+——Windows 的 PATH 通常先命中 `C:\Windows\System32\bash.exe`（WSL 启动器），没装 WSL
+发行版时它以 1 退出且一行脚本都不执行，看起来像下载失败。找不到时可用环境变量
+`EASYVIDEO_BASH` 指定 bash 的完整路径。若没有 bash，编译会在 build script 阶段停下并说明原因。
 
 ## 许可证：这两个构建都是 **GPL**
 
