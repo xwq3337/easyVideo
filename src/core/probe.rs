@@ -71,9 +71,20 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-pub async fn probe(client: &reqwest::Client, url: &str) -> anyhow::Result<ProbeOutcome> {
-    let resp = client
-        .get(url)
+/// `headers` 是浏览器扩展捕获到的请求头（Referer/Cookie/UA…）。
+///
+/// **探测请求必须带上它们**：很多站点的 m3u8 直链只在带 Referer 时才返回播放列表，
+/// 不带的话这里会拿到 403，任务会被误判成"网页地址"再交给 yt-dlp 绕一圈。
+pub async fn probe(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &[(String, String)],
+) -> anyhow::Result<ProbeOutcome> {
+    let mut req = client.get(url);
+    if !headers.is_empty() {
+        req = req.headers(crate::core::request::header_map(headers));
+    }
+    let resp = req
         .header("Range", "bytes=0-63")
         .send()
         .await

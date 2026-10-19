@@ -18,7 +18,7 @@ async fn detects_direct_video_with_range() {
         .mount(&server)
         .await;
     let url = format!("{}/a/b/video.mp4", server.uri());
-    match probe(&client(), &url).await.unwrap() {
+    match probe(&client(), &url, &[]).await.unwrap() {
         ProbeOutcome::Direct { size, accepts_ranges, filename, .. } => {
             assert_eq!(size, Some(1048576));
             assert!(accepts_ranges);
@@ -41,7 +41,7 @@ async fn detects_hls_by_body_prefix() {
         .mount(&server)
         .await;
     let url = format!("{}/index.m3u8", server.uri());
-    match probe(&client(), &url).await.unwrap() {
+    match probe(&client(), &url, &[]).await.unwrap() {
         ProbeOutcome::Hls { .. } => {}
         other => panic!("expected Hls, got {:?}", other),
     }
@@ -59,7 +59,7 @@ async fn detects_webpage_by_content_type() {
         .mount(&server)
         .await;
     let url = format!("{}/page", server.uri());
-    match probe(&client(), &url).await.unwrap() {
+    match probe(&client(), &url, &[]).await.unwrap() {
         ProbeOutcome::WebPage => {}
         other => panic!("expected WebPage, got {:?}", other),
     }
@@ -79,7 +79,7 @@ async fn ignores_ignored_range_and_falls_back() {
         .mount(&server)
         .await;
     let url = format!("{}/file.mkv", server.uri());
-    match probe(&client(), &url).await.unwrap() {
+    match probe(&client(), &url, &[]).await.unwrap() {
         ProbeOutcome::Direct { size, accepts_ranges, .. } => {
             assert_eq!(size, Some(2048));
             assert!(!accepts_ranges);
@@ -100,7 +100,7 @@ async fn url_without_filename_uses_default() {
         )
         .mount(&server)
         .await;
-    let outcome = probe(&client(), &server.uri()).await.unwrap();
+    let outcome = probe(&client(), &server.uri(), &[]).await.unwrap();
     match outcome {
         ProbeOutcome::Direct { filename, .. } => assert_eq!(filename, "video.mp4"),
         other => panic!("expected Direct, got {:?}", other),

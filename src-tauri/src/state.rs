@@ -10,12 +10,17 @@ use easydownvideo::core::engine::Engine;
 use easydownvideo::core::videoops::VideoOps;
 use easydownvideo::settings::Settings;
 
+use crate::extension_api::LocalApi;
+
 pub struct AppState {
     pub engine: Engine,
     /// 视频操作子系统。**与下载引擎完全独立** —— 不共用任务表、队列、并发槽，
     /// 也不共用事件通道。转码吃满 CPU，不该把下载的并发槽占住。
     pub videoops: VideoOps,
     pub settings: Mutex<Settings>,
+    /// 浏览器扩展用的本地 HTTP 接口。生命周期独立于设置：改端口/令牌时
+    /// 只有它会重启监听，下载引擎不受影响。
+    pub local_api: LocalApi,
 }
 
 impl AppState {

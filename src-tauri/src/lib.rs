@@ -6,4 +6,5 @@
 pub mod bridge;
 pub mod commands;
 pub mod dto;
+pub mod extension_api;
 pub mod state;

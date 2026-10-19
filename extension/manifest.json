@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "EasyVideo 视频捕获",
+  "version": "1.0.0",
+  "description": "捕获网页中的 HLS 与视频文件，并发送到 easyVideo 客户端下载。",
+  "permissions": [
+    "webRequest",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*",
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "EasyVideo 视频捕获"
+  },
+  "options_page": "options.html"
+}

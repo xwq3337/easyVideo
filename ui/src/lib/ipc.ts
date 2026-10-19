@@ -4,6 +4,7 @@ import type {
   ChoiceDto,
   ChoiceKindDto,
   EventDto,
+  ExtensionConfigDto,
   JobDto,
   JobParamsDto,
   MergeCheckDto,
@@ -34,6 +35,19 @@ export const setChoice = (id: number, choice: ChoiceDto) => invoke<void>("set_ch
 export const getSettings = () => invoke<SettingsDto>("get_settings");
 export const updateSettings = (settings: SettingsDto) => invoke<void>("update_settings", { settings });
 export const pickDownloadDir = () => invoke<string | null>("pick_download_dir");
+
+// ===== 浏览器扩展 =====
+
+export const getExtensionConfig = () =>
+  invoke<ExtensionConfigDto>("get_extension_config");
+
+/** 保存并**立即重启监听**。返回 core 校验/规范化之后的值。 */
+export const updateExtensionConfig = (config: ExtensionConfigDto) =>
+  invoke<ExtensionConfigDto>("update_extension_config", { config });
+
+/** 只换令牌，端口不变。扩展必须同步更新，否则下载请求会得到 401。 */
+export const regenerateExtensionToken = () =>
+  invoke<ExtensionConfigDto>("regenerate_extension_token");
 
 // ===== 视频操作 =====
 

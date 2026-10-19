@@ -223,7 +223,14 @@ describe("reduce", () => {
     const cached: ChoiceKindDto = {
       kind: "ytdlpFormats",
       ytdlpFormats: [
-        { id: "137", ext: "mp4", note: "1080p", filesize: 123, url: "https://example.com/v" },
+        {
+          id: "137",
+          ext: "mp4",
+          note: "1080p",
+          filesize: 123,
+          url: "https://example.com/v",
+          hasAudio: true,
+        },
       ],
     };
     const before = { ...initialState, tasks: [task(1), task(2)] };

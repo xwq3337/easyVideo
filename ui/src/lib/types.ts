@@ -51,6 +51,8 @@ export interface FormatDto {
   note: string;
   filesize: number | null;
   url: string;
+  /** 选中后是否会有声音；false 时界面标"仅视频"。 */
+  hasAudio: boolean;
 }
 
 // `ChoiceKindDto` 是**结构体变体**，不是新类型变体。dto.rs 里若用新类型变体
@@ -166,4 +168,19 @@ export interface MergeCheckDto {
   /** 非空时禁止提交。 */
   blockers: string[];
   warnings: string[];
+}
+
+// ===== 浏览器扩展 =====
+
+/**
+ * 本地 HTTP 接口的配置。与 `src-tauri/src/extension_api.rs` 的
+ * `ExtensionConfigDto` 对应（`#[serde(rename_all = "camelCase")]`）。
+ *
+ * 它**不在** `SettingsDto` 里：端口/令牌改动要立刻重启监听，而保存下载设置
+ * 是另一条路径，两者不该绑在一次 IPC 上。
+ */
+export interface ExtensionConfigDto {
+  port: number;
+  /** 48 位十六进制随机串。扩展用 `Authorization: Bearer <token>` 发下载请求。 */
+  token: string;
 }

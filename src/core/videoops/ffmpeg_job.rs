@@ -73,7 +73,7 @@ pub async fn run_job(
 ) -> anyhow::Result<JobOutcome> {
     let _scratch = ScratchGuard(scratch.map(|p| p.to_path_buf()));
     let part_path = crate::core::videoops::params::part_path_for(output);
-    let mut cmd = tokio::process::Command::new(ffmpeg);
+    let mut cmd = crate::core::process::hidden_command(ffmpeg);
     cmd.args(args);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     // 兜底：future 因为别的原因被 drop（例如整个 runtime 收尾）时，Child 一并 drop，

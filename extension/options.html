@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EasyVideo 视频捕获 - 设置</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body class="options-body">
+  <main class="options-page">
+    <header class="options-header">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="20" height="20">
+          <path d="M8 5.8v12.4L18.4 12 8 5.8Z" fill="currentColor"></path>
+        </svg>
+      </span>
+      <div>
+        <h1>EasyVideo 视频捕获</h1>
+        <p>浏览器扩展设置</p>
+      </div>
+    </header>
+
+    <section class="options-card">
+      <h2>连接设置</h2>
+      <p class="card-lead">扩展会把捕获到的视频发送到本机运行的 easyVideo 客户端。</p>
+
+      <form id="settingsForm" novalidate>
+        <div class="field">
+          <label for="port">端口</label>
+          <input id="port" name="port" type="number" min="1024" max="65535" step="1"
+                 inputmode="numeric" value="27853" autocomplete="off">
+          <p class="field-hint">默认端口 27853，需要与 easyVideo 客户端中的监听端口一致。</p>
+        </div>
+
+        <div class="field">
+          <label for="token">访问令牌</label>
+          <div class="token-row">
+            <input id="token" name="token" type="password" autocomplete="off"
+                   spellcheck="false" placeholder="粘贴访问令牌">
+            <button id="toggleTokenButton" class="button button-secondary" type="button"
+                    aria-pressed="false">显示</button>
+          </div>
+          <p class="field-hint">
+            令牌显示在 easyVideo 的 <strong>设置 → 浏览器扩展</strong> 中。
+            扩展只会把它保存在本机的浏览器存储里。
+          </p>
+        </div>
+
+        <div id="status" class="status hidden" role="status" aria-live="polite"></div>
+
+        <div class="options-actions">
+          <button id="testConnectionButton" class="button button-secondary" type="button">
+            测试连接
+          </button>
+          <button id="saveButton" class="button button-primary" type="submit">保存</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="options-tip">
+      <h2>使用提示</h2>
+      <ol>
+        <li>先启动 easyVideo 客户端，并确认端口与上方填写的一致。</li>
+        <li>在浏览器中播放网页视频，扩展会自动捕获 HLS 播放列表或常见视频文件。</li>
+        <li>点击工具栏中的扩展图标，在列表里点击“下载”；也可以用“下载当前页面”交给 yt-dlp 处理。</li>
+      </ol>
+    </section>
+
+    <footer class="options-footer">EasyVideo 视频捕获 v1.0.0</footer>
+  </main>
+
+  <script src="options.js"></script>
+</body>
+</html>

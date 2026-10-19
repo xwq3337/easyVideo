@@ -47,6 +47,7 @@ async fn downloads_in_blocks_and_merges() {
         &format!("{}/f.bin", server.uri()),
         &final_path,
         dir.path(),
+        &[],
         Some(1024),
         true,
         2,
@@ -85,6 +86,7 @@ async fn resumes_completed_parts() {
         &format!("{}/f.bin", server.uri()),
         &final_path,
         dir.path(),
+        &[],
         Some(1024),
         true,
         2,
@@ -123,7 +125,7 @@ async fn rerun_does_not_accumulate_byte_progress() {
 
     download_direct(
         &reqwest::Client::new(), &url, &final_path, dir.path(),
-        Some(1024), true, 2, 512, &progress, CancellationToken::new(),
+        &[], Some(1024), true, 2, 512, &progress, CancellationToken::new(),
     ).await.unwrap();
     assert_eq!(progress.snapshot(), (1024, 1024), "第一次运行结束后 downloaded 必须等于 total");
     assert_eq!(progress.bytes(), 1024, "首次下载：字节数与 downloaded 一致");
@@ -132,7 +134,7 @@ async fn rerun_does_not_accumulate_byte_progress() {
     // 第二次运行：同一任务目录、同一 handle
     download_direct(
         &reqwest::Client::new(), &url, &final_path, dir.path(),
-        Some(1024), true, 2, 512, &progress, CancellationToken::new(),
+        &[], Some(1024), true, 2, 512, &progress, CancellationToken::new(),
     ).await.unwrap();
     assert_eq!(
         progress.snapshot(),
@@ -159,6 +161,7 @@ async fn cancel_stops_download() {
         &format!("{}/slow.bin", server.uri()),
         &dir.path().join("slow.bin"),
         dir.path(),
+        &[],
         Some(4096),
         false,
         1,

@@ -56,7 +56,9 @@ async fn downloads_segments_and_builds_concat_plan() {
     let plan = download_media(
         &reqwest::Client::new(),
         &media,
+        &format!("{}/master.m3u8", server.uri()),
         dir.path(),
+        &[],
         4,
         &progress,
         CancellationToken::new(),
@@ -76,6 +78,92 @@ async fn downloads_segments_and_builds_concat_plan() {
     // concat 列表已生成
     let list = std::fs::read_to_string(&plan.list_file).unwrap();
     assert!(list.contains("file '"));
+}
+
+/// 播放列表把分片指向另一个主机时，页面 Cookie 不能跟过去；Referer 仍要保留。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cross_host_segments_do_not_receive_page_credentials() {
+    let playlist_server = MockServer::start().await;
+    let cdn = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/seg0.ts"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![7u8; 10]))
+        .mount(&cdn)
+        .await;
+
+    // wiremock 只绑 127.0.0.1，两个实例仅端口不同。Cookie 按主机（不含端口）作用域，
+    // 同主机换端口不该剥除凭证，所以这里用 localhost 指同一台 CDN 形成真正的主机差异。
+    let media = media_no_crypto(&[format!(
+        "http://localhost:{}/seg0.ts",
+        cdn.address().port()
+    )]);
+    let dir = tempfile::tempdir().unwrap();
+    download_media(
+        &reqwest::Client::new(),
+        &media,
+        &format!("{}/master.m3u8", playlist_server.uri()),
+        dir.path(),
+        &[
+            ("cookie".into(), "session=SECRET".into()),
+            ("referer".into(), "https://www.example.com/watch".into()),
+        ],
+        1,
+        &ProgressHandle::new(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let requests = cdn.received_requests().await.expect("cdn requests");
+    assert_eq!(requests.len(), 1);
+    assert!(
+        !requests[0].headers.contains_key("cookie"),
+        "跨主机分片请求不能带页面 Cookie"
+    );
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("referer")
+            .and_then(|v| v.to_str().ok()),
+        Some("https://www.example.com/watch"),
+        "Referer 必须保留 —— CDN 的防盗链靠它"
+    );
+}
+
+/// 同主机的分片仍然要带上登录 Cookie，否则受保护的播放列表会 403。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_host_segments_keep_page_credentials() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/seg0.ts"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![7u8; 10]))
+        .mount(&server)
+        .await;
+
+    let media = media_no_crypto(&[format!("{}/seg0.ts", server.uri())]);
+    let dir = tempfile::tempdir().unwrap();
+    download_media(
+        &reqwest::Client::new(),
+        &media,
+        &format!("{}/master.m3u8", server.uri()),
+        dir.path(),
+        &[("cookie".into(), "session=SECRET".into())],
+        1,
+        &ProgressHandle::new(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("cookie")
+            .and_then(|v| v.to_str().ok()),
+        Some("session=SECRET"),
+        "同主机必须保留页面 Cookie"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -100,7 +188,9 @@ async fn resumes_existing_segments() {
     let plan = download_media(
         &reqwest::Client::new(),
         &media,
+        &format!("{}/master.m3u8", server.uri()),
         dir.path(),
+        &[],
         2,
         &progress,
         CancellationToken::new(),
@@ -145,7 +235,9 @@ async fn rerun_does_not_accumulate_segment_progress() {
     download_media(
         &reqwest::Client::new(),
         &media,
+        &format!("{}/master.m3u8", server.uri()),
         dir.path(),
+        &[],
         2,
         &progress,
         CancellationToken::new(),
@@ -162,7 +254,9 @@ async fn rerun_does_not_accumulate_segment_progress() {
     download_media(
         &reqwest::Client::new(),
         &media,
+        &format!("{}/master.m3u8", server.uri()),
         dir.path(),
+        &[],
         2,
         &progress,
         CancellationToken::new(),
@@ -197,7 +291,9 @@ async fn retries_failed_segment() {
     let plan = download_media(
         &reqwest::Client::new(),
         &media,
+        &format!("{}/master.m3u8", server.uri()),
         dir.path(),
+        &[],
         1,
         &ProgressHandle::new(),
         CancellationToken::new(),
@@ -278,7 +374,9 @@ async fn decrypts_with_derived_iv_across_an_init_offset() {
     let plan = download_media(
         &reqwest::Client::new(),
         &media,
+        &format!("{}/master.m3u8", server.uri()),
         dir.path(),
+        &[],
         4,
         &ProgressHandle::new(),
         CancellationToken::new(),
@@ -325,7 +423,9 @@ async fn truncated_leftover_segment_is_not_treated_as_complete() {
     let plan = download_media(
         &reqwest::Client::new(),
         &media,
+        &format!("{}/master.m3u8", server.uri()),
         dir.path(),
+        &[],
         1,
         &ProgressHandle::new(),
         CancellationToken::new(),
@@ -376,7 +476,9 @@ async fn concat_list_uses_escaped_paths() {
     let plan = download_media(
         &reqwest::Client::new(),
         &media,
+        &format!("{}/master.m3u8", server.uri()),
         &task_dir,
+        &[],
         1,
         &ProgressHandle::new(),
         CancellationToken::new(),

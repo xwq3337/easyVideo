@@ -11,6 +11,8 @@ fn manifest_roundtrips_and_scans() {
         filename: "v.mp4".into(),
         download_dir: root.path().join("done"),
         kind: ManifestKind::Direct { size: Some(123) },
+        headers: Vec::new(),
+        audio: None,
     };
     write_manifest(&dir, &m).unwrap();
 
@@ -61,6 +63,8 @@ fn scan_ignores_dirs_without_task_prefix() {
             filename: "v.mp4".into(),
             download_dir: root.path().join("done"),
             kind: ManifestKind::Direct { size: None },
+            headers: Vec::new(),
+            audio: None,
         },
     )
     .unwrap();
@@ -87,6 +91,8 @@ fn manifest_roundtrips_hls_kind() {
         filename: "video.mp4".into(),
         download_dir: root.path().join("done"),
         kind: ManifestKind::Hls { playlist_url: "https://cdn.example.com/master.m3u8".into() },
+        headers: Vec::new(),
+        audio: None,
     };
     write_manifest(&dir, &m).unwrap();
 

@@ -270,7 +270,7 @@ pub fn parse_media_info(stderr: &str, path: &Path) -> MediaInfo {
 /// 为 None，由调用方决定怎么处理（入队校验会据此拒绝它）。
 pub async fn inspect(ffmpeg: &Path, input: &Path) -> anyhow::Result<MediaInfo> {
     // 不带输出文件：ffmpeg 打印完流信息就以非零码退出，这正是我们要的
-    let out = tokio::process::Command::new(ffmpeg)
+    let out = crate::core::process::hidden_command(ffmpeg)
         .arg("-hide_banner")
         .arg("-i")
         .arg(input)

@@ -91,6 +91,11 @@ export default function ChoiceDialog() {
               >
                 <span>
                   {f.note}（.{f.ext}）
+                  {!f.hasAudio && (
+                    <span className="ml-1.5" style={{ color: "var(--fg-faint)" }}>
+                      仅视频
+                    </span>
+                  )}
                 </span>
                 <span className="tnum" style={{ color: "var(--fg-muted)" }}>
                   {f.filesize ? formatSize(f.filesize) : "大小未知"}

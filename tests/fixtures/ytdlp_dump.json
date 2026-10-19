@@ -2,9 +2,9 @@
   "id": "abc123",
   "title": "demo",
   "formats": [
-    { "format_id": "18", "ext": "mp4", "resolution": "640x360", "format_note": "360p", "filesize": 1000000, "vcodec": "avc1.42001E", "url": "https://cdn.example.com/v/18.mp4" },
-    { "format_id": "22", "ext": "mp4", "resolution": "1280x720", "format_note": "720p", "filesize": null, "filesize_approx": 2000000, "vcodec": "avc1.64001F", "url": "https://cdn.example.com/v/22.mp4" },
-    { "format_id": "139", "ext": "m4a", "resolution": null, "format_note": "audio", "filesize": 100000, "vcodec": "none", "url": "https://cdn.example.com/a/139.m4a" },
-    { "format_id": "hls-1", "ext": "mp4", "resolution": "1920x1080", "protocol": "m3u8_native", "vcodec": "avc1.640028", "url": "https://cdn.example.com/hls/master.m3u8" }
+    { "format_id": "18", "ext": "mp4", "resolution": "640x360", "format_note": "360p", "filesize": 1000000, "vcodec": "avc1.42001E", "acodec": "mp4a.40.2", "http_headers": { "User-Agent": "FixtureUA/1.0", "Referer": "https://example.com/watch", "Accept-Encoding": "gzip" }, "url": "https://cdn.example.com/v/18.mp4" },
+    { "format_id": "22", "ext": "mp4", "resolution": "1280x720", "format_note": "720p", "filesize": null, "filesize_approx": 2000000, "vcodec": "avc1.64001F", "acodec": "mp4a.40.2", "url": "https://cdn.example.com/v/22.mp4" },
+    { "format_id": "139", "ext": "m4a", "resolution": null, "format_note": "audio", "filesize": 100000, "vcodec": "none", "acodec": "mp4a.40.2", "url": "https://cdn.example.com/a/139.m4a" },
+    { "format_id": "hls-1", "ext": "mp4", "resolution": "1920x1080", "protocol": "m3u8_native", "vcodec": "avc1.640028", "acodec": "mp4a.40.2", "url": "https://cdn.example.com/hls/master.m3u8" }
   ]
 }

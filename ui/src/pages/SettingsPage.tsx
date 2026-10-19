@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import type { SettingsDto } from "../lib/types";
+import { useEffect, useRef, useState } from "react";
+import type { ExtensionConfigDto, SettingsDto } from "../lib/types";
 import * as ipc from "../lib/ipc";
 import { loadSettings, run, useSettings } from "../store/store";
 import { readThemeMode, setThemeMode, type ThemeMode } from "../lib/theme";
@@ -17,6 +17,8 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 const SEGMENT_CONCURRENCY = { min: 1, max: 16 } as const;
 const MAX_ACTIVE_TASKS = { min: 1, max: 8 } as const;
+/** 与 extension_api.rs 的 `validated` 保持一致；这里只是提前挡一下。 */
+const EXTENSION_PORT = { min: 1024, max: 65535 } as const;
 
 /**
  * 与 core 的 `settings::BROWSERS` 必须一致 —— 这份名单只是为了把选项画出来，
@@ -54,9 +56,113 @@ export default function SettingsPage() {
   const [theme, setTheme] = useState<ThemeMode>(readThemeMode());
   const [error, setError] = useState<string | null>(null);
 
+  // 扩展配置是**另一份**落盘文件，与 draft 分开：主设置页的「保存」不碰它。
+  const [extension, setExtension] = useState<ExtensionConfigDto | null>(null);
+  const [extensionError, setExtensionError] = useState<string | null>(null);
+  const [extensionStatus, setExtensionStatus] = useState<string | null>(null);
+  const [extensionBusy, setExtensionBusy] = useState(false);
+  const tokenRow = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     if (current) setDraft({ ...current });
   }, [current]);
+
+  useEffect(() => {
+    let alive = true;
+    ipc
+      .getExtensionConfig()
+      .then((cfg) => {
+        if (alive) setExtension(cfg);
+      })
+      .catch((e) => {
+        if (alive) setExtensionError(String(e));
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  async function copyToken() {
+    if (!extension) return;
+    try {
+      await navigator.clipboard.writeText(extension.token);
+      setExtensionStatus("访问令牌已复制");
+      return;
+    } catch {
+      // 某些 webview 里 Clipboard API 不可用：退回选中 + execCommand。
+    }
+    const input = tokenRow.current?.querySelector("input");
+    input?.focus();
+    input?.select();
+    try {
+      document.execCommand("copy");
+      setExtensionStatus("访问令牌已复制");
+    } catch {
+      setExtensionStatus("复制失败，请手动选中令牌复制");
+    }
+  }
+
+  async function saveExtension() {
+    if (!extension) return;
+    setExtensionBusy(true);
+    setExtensionError(null);
+    setExtensionStatus(null);
+    try {
+      const saved = await ipc.updateExtensionConfig(extension);
+      setExtension(saved);
+      setExtensionStatus(`已保存，正在监听 127.0.0.1:${saved.port}`);
+    } catch (e) {
+      setExtensionError(String(e));
+    } finally {
+      setExtensionBusy(false);
+    }
+  }
+
+  async function regenerateToken() {
+    if (!extension) return;
+    if (!window.confirm("重新生成后，浏览器扩展里必须填入新令牌才能继续下载。继续吗？")) {
+      return;
+    }
+    setExtensionBusy(true);
+    setExtensionError(null);
+    setExtensionStatus(null);
+    try {
+      const next = await ipc.regenerateExtensionToken();
+      setExtension(next);
+      setExtensionStatus("已生成新令牌。请把它粘贴到浏览器扩展的设置页。");
+    } catch (e) {
+      setExtensionError(String(e));
+    } finally {
+      setExtensionBusy(false);
+    }
+  }
+
+  async function testExtension() {
+    if (!extension) return;
+    setExtensionBusy(true);
+    setExtensionError(null);
+    setExtensionStatus(null);
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 3000);
+    try {
+      const resp = await fetch(`http://127.0.0.1:${extension.port}/api/v1/ping`, {
+        signal: controller.signal,
+      });
+      const data = (await resp.json()) as { ok?: boolean; version?: string };
+      if (resp.ok && data.ok) {
+        setExtensionStatus(`连接成功：easyVideo ${data.version ?? ""}`.trim());
+      } else {
+        setExtensionError(`端口 ${extension.port} 有响应，但不是 easyVideo 的接口`);
+      }
+    } catch {
+      setExtensionError(
+        `连不上 127.0.0.1:${extension.port}。请确认端口已保存，且 easyVideo 正在运行。`
+      );
+    } finally {
+      window.clearTimeout(timer);
+      setExtensionBusy(false);
+    }
+  }
 
   async function pick() {
     const picked = await run(ipc.pickDownloadDir());
@@ -263,6 +369,110 @@ export default function SettingsPage() {
       <Button variant="primary" onClick={() => void save()}>
         保存
       </Button>
+
+      {/* ===== 浏览器扩展 ===== */}
+      {/*
+        这一块**不受上面「保存」管辖**：它有自己的落盘文件与命令。视觉上必须与
+        下载设置隔开，否则用户改完端口点上面的保存，会以为已经生效。
+      */}
+      {extension && (
+        <div
+          className="mt-8 pt-6 border-t"
+          style={{ borderColor: "var(--line)" }}
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <div style={{ color: "var(--fg-muted)" }}>浏览器扩展</div>
+              <span className="text-[12px]" style={{ color: "var(--fg-faint)" }}>
+                在浏览器里捕获视频链接，点击下载时发送到本应用。
+              </span>
+            </div>
+            <Button
+              className="shrink-0"
+              onClick={() => void testExtension()}
+              disabled={extensionBusy}
+            >
+              测试连接
+            </Button>
+          </div>
+
+          <label className="block mt-4">
+            <span className="text-[13px]" style={{ color: "var(--fg-muted)" }}>
+              监听端口（1024–65535）
+            </span>
+            <Input
+              type="number"
+              className="w-32 mt-1.5"
+              value={extension.port}
+              onChange={(e) =>
+                setExtension((p) =>
+                  p
+                    ? {
+                        ...p,
+                        port: clampInt(
+                          e.target.value,
+                          EXTENSION_PORT.min,
+                          EXTENSION_PORT.max,
+                          EXTENSION_PORT.min
+                        ),
+                      }
+                    : p
+                )
+              }
+            />
+            <span className="block text-[12px]" style={{ color: "var(--fg-faint)" }}>
+              默认 27853。改端口后，扩展选项里也要填同一个值。
+            </span>
+          </label>
+
+          <div className="mt-4" ref={tokenRow}>
+            <span className="text-[13px]" style={{ color: "var(--fg-muted)" }}>
+              访问令牌
+            </span>
+            <div className="flex gap-2 mt-1.5">
+              <Input
+                readOnly
+                className="font-mono text-[12px]"
+                value={extension.token}
+                onFocus={(e) => e.currentTarget.select()}
+              />
+              <Button className="shrink-0" onClick={() => void copyToken()}>
+                复制
+              </Button>
+              <Button
+                className="shrink-0"
+                onClick={() => void regenerateToken()}
+                disabled={extensionBusy}
+              >
+                重新生成
+              </Button>
+            </div>
+            <span className="block text-[12px]" style={{ color: "var(--fg-faint)" }}>
+              把它粘贴到扩展的设置页。令牌只保存在本机。
+            </span>
+          </div>
+
+          <div className="flex items-center gap-3 mt-4">
+            <Button
+              variant="primary"
+              onClick={() => void saveExtension()}
+              disabled={extensionBusy}
+            >
+              保存扩展设置
+            </Button>
+            {extensionStatus && (
+              <span className="text-[12px]" style={{ color: "var(--accent-ok)" }}>
+                {extensionStatus}
+              </span>
+            )}
+            {extensionError && (
+              <span className="text-[12px]" style={{ color: "var(--accent-err)" }}>
+                {extensionError}
+              </span>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

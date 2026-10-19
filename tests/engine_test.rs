@@ -389,6 +389,8 @@ async fn resumed_ids_do_not_collide_with_new_tasks() {
         filename: "a.mp4".into(),
         download_dir: dir.path().to_path_buf(),
         kind: ManifestKind::Direct { size: Some(10) },
+        headers: Vec::new(),
+        audio: None,
     });
 
     let fresh = engine.add_url("https://example.com/b.mp4".into());
@@ -474,6 +476,8 @@ async fn cancel_queued_resumed_task_removes_its_manifest() {
         filename: "a.mp4".into(),
         download_dir: dir.path().to_path_buf(),
         kind: ManifestKind::Direct { size: Some(10) },
+        headers: Vec::new(),
+        audio: None,
     });
     // **前提断言**：manifest 确实已经落盘。没有这一条，下面的断言可能因为"压根没写过"而假通过。
     assert_eq!(
@@ -514,6 +518,8 @@ async fn cancelling_a_resumed_task_after_moving_the_dir_cleans_the_old_one() {
         filename: "a.mp4".into(),
         download_dir: old_dir.clone(),
         kind: ManifestKind::Direct { size: Some(10) },
+        headers: Vec::new(),
+        audio: None,
     });
     // **前提断言**：manifest 确实落在旧目录里，否则这个测试不成立
     assert_eq!(
@@ -1518,5 +1524,132 @@ async fn remove_is_rejected_while_a_worker_is_still_alive() {
             .iter()
             .any(|m| m.id == id),
         "移除后盘上仍有它的 manifest，重启会把这个任务复活"
+    );
+}
+
+/// DASH 合并的端到端回归：视频轨 + 独立音频轨 → 一个**有声音**的 mp4。
+///
+/// 这条链路覆盖了 B 站 403 修复的后半段：选中纯视频格式后 `TaskEntry` 上会带
+/// `audio`，worker 必须把两条轨都下下来再调 ffmpeg 合成。只测 `parse_formats`
+/// 看不出"引擎有没有真的用上那对字段"。
+///
+/// 用 `resume(manifest)` 注入 audio（`pending_choice` 是私有的），所以不需要
+/// 伪造 yt-dlp 可执行文件，也不碰全局 PATH。
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn video_only_format_downloads_audio_and_muxes_mp4() {
+    use easydownvideo::core::ffmpeg::ensure_ffmpeg;
+    use easydownvideo::core::process::hidden_command;
+    use easydownvideo::core::ytdlp::YtdlpAudio;
+    use std::process::Stdio;
+
+    let data = tempfile::tempdir().unwrap();
+    let ffmpeg = ensure_ffmpeg(data.path()).unwrap();
+    let fixtures = tempfile::tempdir().unwrap();
+    let video_fixture = fixtures.path().join("video.mp4");
+    let audio_fixture = fixtures.path().join("audio.m4a");
+
+    // 现场生成两条真实的轨道：mpeg4 视频 + AAC 音频。两者都能被 `-c copy`
+    // 塞进 mp4，避免依赖外部样本文件。
+    for (args, out) in [
+        (
+            vec![
+                "-y", "-f", "lavfi", "-i", "testsrc=size=128x96:rate=10",
+                "-t", "1", "-c:v", "mpeg4", "-q:v", "5",
+            ],
+            &video_fixture,
+        ),
+        (
+            vec![
+                "-y", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100",
+                "-t", "1", "-c:a", "aac", "-b:a", "64k",
+            ],
+            &audio_fixture,
+        ),
+    ] {
+        let status = hidden_command(&ffmpeg)
+            .args(&args)
+            .arg(out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success(), "生成测试轨道失败: {args:?}");
+    }
+
+    let video_bytes = std::fs::read(&video_fixture).unwrap();
+    let audio_bytes = std::fs::read(&audio_fixture).unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/video.mp4"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "video/mp4")
+                .set_body_bytes(video_bytes.clone()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/audio.m4a"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "audio/mp4")
+                .set_body_bytes(audio_bytes.clone()),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let engine = Engine::new(rt, settings_with(dir.path()), data.path().to_path_buf());
+    let mut rx = engine.events();
+    let id = 77u64;
+    engine.resume(TaskManifest {
+        id,
+        url: format!("{}/video.mp4", server.uri()),
+        filename: "merged.mp4".into(),
+        download_dir: dir.path().to_path_buf(),
+        kind: ManifestKind::Direct {
+            size: Some(video_bytes.len() as u64),
+        },
+        headers: Vec::new(),
+        audio: Some(YtdlpAudio {
+            url: format!("{}/audio.m4a", server.uri()),
+            ext: "m4a".into(),
+            filesize: Some(audio_bytes.len() as u64),
+            filesize_approx: None,
+            headers: Vec::new(),
+        }),
+    });
+
+    wait_state(&mut rx, id, TaskState::Merging, 30).await;
+    wait_state(&mut rx, id, TaskState::Done, 60).await;
+
+    let output = dir.path().join("merged.mp4");
+    assert!(output.exists(), "合并后的 mp4 不存在");
+
+    // 用 ffmpeg 自己确认成品里视频、音频两条流都在 —— 只检查文件非空
+    // 无法发现"只 map 了视频"这种回归。
+    let probe = hidden_command(&ffmpeg)
+        .arg("-hide_banner")
+        .arg("-i")
+        .arg(&output)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&probe.stderr);
+    assert!(
+        stderr.contains("Video:") && stderr.contains("Audio:"),
+        "成品必须同时含视频与音频流，实际 ffmpeg 输出:\n{stderr}"
+    );
+    assert!(
+        easydownvideo::core::task::scan_resume(dir.path()).is_empty(),
+        "任务完成后 manifest 不能留在盘上"
     );
 }

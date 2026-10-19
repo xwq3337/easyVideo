@@ -11,6 +11,15 @@ pub struct TaskManifest {
     pub filename: String,
     pub download_dir: PathBuf,
     pub kind: ManifestKind,
+    /// 浏览器扩展捕获到的请求头。**必须带 `#[serde(default)]`**：旧版本的
+    /// manifest.json 里没有这个键，缺了它整份清单反序列化失败，重启后这些任务
+    /// 就再也续不上了（`scan_resume` 会静默跳过它们）。
+    #[serde(default)]
+    pub headers: crate::core::request::Headers,
+    /// 选中 yt-dlp 纯视频格式时配套的音频轨。恢复任务后仍要把音频下完并合并，
+    /// 否则用户会得到一个无声的视频。旧 manifest 没有这个键 —— `default` 必须保留。
+    #[serde(default)]
+    pub audio: Option<crate::core::ytdlp::YtdlpAudio>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

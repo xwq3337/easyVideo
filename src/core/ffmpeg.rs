@@ -56,7 +56,7 @@ pub fn build_remux(
     list: &Path,
     output: &Path,
 ) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(ffmpeg);
+    let mut cmd = crate::core::process::hidden_command(ffmpeg);
     cmd.arg("-y")
         .arg("-f").arg("concat")
         .arg("-safe").arg("0")
@@ -91,6 +91,48 @@ pub enum RemuxOutcome {
     Interrupted,
 }
 
+/// 把 DASH 的视频轨与音频轨无损合成一个 mp4。
+///
+/// B 站（以及所有 DASH 站点）的高清格式是 video-only 的 `.m4s` + 独立的 `.m4a`，
+/// 只下视频轨会得到无声文件，所以 `-map` 明确各取一条流，`-c copy` 不做任何重编码，
+/// `+faststart` 让 moov 前置、浏览器/播放器可以边下边播。
+pub fn build_mux(
+    ffmpeg: &Path,
+    video: &Path,
+    audio: &Path,
+    output: &Path,
+) -> tokio::process::Command {
+    let mut cmd = crate::core::process::hidden_command(ffmpeg);
+    cmd.arg("-y")
+        .arg("-i")
+        .arg(video)
+        .arg("-i")
+        .arg(audio)
+        .arg("-map")
+        .arg("0:v:0")
+        .arg("-map")
+        .arg("1:a:0")
+        .arg("-c")
+        .arg("copy")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg(output);
+    // 与 build_remux 同一个理由：调用点拿不到 Command，兜底的 kill_on_drop 只能设在这里。
+    cmd.kill_on_drop(true);
+    cmd
+}
+
+pub async fn mux_video_audio(
+    ffmpeg: &Path,
+    video: &Path,
+    audio: &Path,
+    output: &Path,
+    cancel: &CancellationToken,
+) -> anyhow::Result<RemuxOutcome> {
+    let cmd = build_mux(ffmpeg, video, audio, output);
+    run_ffmpeg(cmd, output, cancel).await
+}
+
 /// 合并成 mp4，全程可被 `cancel` 打断。
 ///
 /// 合并可能很久（`-c copy` 要把整个文件搬一遍），而界面在 `Merging` 上同样给出暂停按钮，
@@ -102,7 +144,15 @@ pub async fn remux_to_mp4(
     output: &Path,
     cancel: &CancellationToken,
 ) -> anyhow::Result<RemuxOutcome> {
-    let mut cmd = build_remux(ffmpeg, &plan.list_file, output);
+    let cmd = build_remux(ffmpeg, &plan.list_file, output);
+    run_ffmpeg(cmd, output, cancel).await
+}
+
+async fn run_ffmpeg(
+    mut cmd: tokio::process::Command,
+    output: &Path,
+    cancel: &CancellationToken,
+) -> anyhow::Result<RemuxOutcome> {
     cmd.stdout(Stdio::null()).stderr(Stdio::piped());
     let mut child = cmd.spawn().context("spawn ffmpeg")?;
 
@@ -122,6 +172,10 @@ pub async fn remux_to_mp4(
             let status = status.context("wait ffmpeg")?;
             let stderr = drain.await.unwrap_or_default();
             if !status.success() {
+                // 失败时 ffmpeg 往往已经写了一半产物。把它留在最终路径上，
+                // 用户会看到一个打不开的 mp4；重试还会因唯一性检查改名成
+                // `name (1).mp4`，损坏文件反而一直占着原名。失败就删掉。
+                std::fs::remove_file(output).ok();
                 return Err(anyhow!(
                     "ffmpeg failed: {}",
                     String::from_utf8_lossy(&stderr)

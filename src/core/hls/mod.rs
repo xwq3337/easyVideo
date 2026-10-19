@@ -35,13 +35,25 @@ pub fn escape_concat_path(path: &str) -> String {
 pub async fn download_media(
     client: &reqwest::Client,
     media: &MediaInfo,
+    playlist_url: &str,
     task_dir: &Path,
+    headers: &[(String, String)],
     concurrency: usize,
     progress: &ProgressHandle,
     cancel: CancellationToken,
 ) -> anyhow::Result<ConcatPlan> {
     use std::sync::Arc;
     std::fs::create_dir_all(task_dir).context("create task dir")?;
+    // 分片与密钥的请求同样要带上浏览器扩展抓到的 Referer/UA ——
+    // CDN 通常只校验其中某一类，漏掉就表现为"播放列表能下、分片全 403"。
+    //
+    // 但 Cookie/Authorization 属于**页面所在的域**。播放列表把分片或密钥指向
+    // 另一个主机（CDN、对象存储、第三方密钥服务）时，原样带过去就是跨站泄露；
+    // 浏览器不会这么做。跨主机只保留不敏感的上下文头。
+    let same_map = Arc::new(crate::core::request::header_map(headers));
+    let cross_map = Arc::new(crate::core::request::header_map(
+        &crate::core::request::strip_credentials(headers),
+    ));
 
     // HLS 进度按"已下分片数/总分片数"计数，GUI 用 ProgressUnit 决定展示格式
     progress.set_unit(crate::core::events::ProgressUnit::Segments);
@@ -74,6 +86,15 @@ pub async fn download_media(
         let progress = progress.clone();
         let cancel = cancel.clone();
         let keys = keys.clone();
+        // 按目标主机选头：同主机用全量，跨主机剥掉凭据。
+        let seg_map = if crate::core::request::same_host(&seg_uri, playlist_url) {
+            same_map.clone()
+        } else {
+            cross_map.clone()
+        };
+        let same_map_for_key = same_map.clone();
+        let cross_map_for_key = cross_map.clone();
+        let playlist_url = playlist_url.to_string();
         let permit = sem.clone().acquire_owned().await?;
         handles.push(tokio::spawn(async move {
             let _permit = permit;
@@ -85,7 +106,7 @@ pub async fn download_media(
             if cancel.is_cancelled() {
                 return Err(anyhow!("canceled"));
             }
-            let ciphertext = fetch_bytes(&client, &seg_uri, &cancel).await?;
+            let ciphertext = fetch_bytes(&client, &seg_uri, &seg_map, &cancel).await?;
             // 字节计数按**网络上传过来的密文长度**记，且必须在下面的 match 之前 ——
             // 无加密分支会把 ciphertext 整体 move 进 data。解密后的长度不等于下载量
             // （CBC 去填充会少几个字节），速度要反映的是真实吞吐。
@@ -97,7 +118,12 @@ pub async fn download_media(
                         if let Some(k) = cache.get(uri) {
                             *k
                         } else {
-                            let raw = fetch_bytes(&client, uri, &cancel).await?;
+                            let key_map = if crate::core::request::same_host(uri, &playlist_url) {
+                                &same_map_for_key
+                            } else {
+                                &cross_map_for_key
+                            };
+                            let raw = fetch_bytes(&client, uri, key_map, &cancel).await?;
                             let k: [u8; 16] = raw
                                 .try_into()
                                 .map_err(|_| anyhow!("key length != 16"))?;
@@ -147,6 +173,7 @@ pub async fn download_media(
 async fn fetch_bytes(
     client: &reqwest::Client,
     uri: &str,
+    headers: &reqwest::header::HeaderMap,
     cancel: &CancellationToken,
 ) -> anyhow::Result<Vec<u8>> {
     // 重试 3 次：指数退避 1s/2s/4s
@@ -155,7 +182,7 @@ async fn fetch_bytes(
         if cancel.is_cancelled() {
             anyhow::bail!("canceled");
         }
-        match fetch_once(client, uri).await {
+        match fetch_once(client, uri, headers).await {
             Ok(bytes) => return Ok(bytes),
             Err(e) => {
                 last_err = Some(e);
@@ -173,8 +200,17 @@ async fn fetch_bytes(
     Err(last_err.unwrap())
 }
 
-async fn fetch_once(client: &reqwest::Client, uri: &str) -> anyhow::Result<Vec<u8>> {
-    let resp = client.get(uri).send().await?.error_for_status()?;
+async fn fetch_once(
+    client: &reqwest::Client,
+    uri: &str,
+    headers: &reqwest::header::HeaderMap,
+) -> anyhow::Result<Vec<u8>> {
+    let resp = client
+        .get(uri)
+        .headers(headers.clone())
+        .send()
+        .await?
+        .error_for_status()?;
     let mut stream = resp.bytes_stream();
     let mut out = Vec::new();
     while let Some(chunk) = stream.next().await {

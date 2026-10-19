@@ -64,6 +64,7 @@ pub async fn download_direct(
     url: &str,
     final_path: &Path,
     task_dir: &Path,
+    headers: &[(String, String)],
     size: Option<u64>,
     accepts_ranges: bool,
     concurrency: usize,
@@ -72,6 +73,9 @@ pub async fn download_direct(
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(task_dir).context("create task dir")?;
+    // 每条分块请求都要带浏览器扩展抓到的头（Referer / Cookie / UA）。
+    // HeaderMap 内部是 Arc，克隆很便宜；在循环外建一次，循环里只 clone。
+    let header_map = crate::core::request::header_map(headers);
     let blocks = match (size, accepts_ranges) {
         (Some(total), true) if total > 0 => plan_blocks(total, concurrency, min_block),
         _ => vec![(0, u64::MAX)], // 单流
@@ -95,6 +99,7 @@ pub async fn download_direct(
         let (start, end) = (*start, *end);
         let progress = progress.clone();
         let cancel = cancel.clone();
+        let header_map = header_map.clone();
         let permit = sem.clone().acquire_owned().await?;
         handles.push(tokio::spawn(async move {
             let _permit = permit;
@@ -105,7 +110,7 @@ pub async fn download_direct(
                     return Ok(());
                 }
             }
-            let req = client.get(&url);
+            let req = client.get(&url).headers(header_map);
             let req = if end != u64::MAX {
                 req.header("Range", format!("bytes={start}-{}", end - 1))
             } else {
@@ -147,6 +152,111 @@ pub async fn download_direct(
         std::fs::remove_file(&part_path).ok();
     }
     out.flush().await?;
+    Ok(())
+}
+
+/// `path` 是否已经是一个**完整的**轨道文件。
+///
+/// `expected` 为 `None` 时一律返回 false：不知道大小就无法断言完整，宁可重下。
+/// 暂停在"视频下完、音频下到一半"时，恢复的 worker 靠它跳过整段视频。
+pub fn file_matches_size(path: &Path, expected: Option<u64>) -> bool {
+    let Some(expected) = expected.filter(|s| *s > 0) else {
+        return false;
+    };
+    std::fs::metadata(path)
+        .map(|m| m.len() == expected)
+        .unwrap_or(false)
+}
+
+/// 下载一条独立轨道（合并下载时的音频轨）。
+///
+/// 与 `download_direct` 的区别：不规划分块、不续传，直接整条流式写入
+/// `dest` 旁边的 `.part`，完成后原子改名。DASH 音频通常只有几 MB，分块收益
+/// 抵不上复杂度。失败重试 3 次，进度按本模块统一的回滚规则处理。
+pub async fn download_track(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &[(String, String)],
+    dest: &Path,
+    expected_size: Option<u64>,
+    progress: &ProgressHandle,
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).context("create track dir")?;
+    }
+    let part_path = dest.with_extension("part");
+    let header_map = crate::core::request::header_map(headers);
+    let mut last_err = None;
+    for attempt in 0..3 {
+        if cancel.is_cancelled() {
+            anyhow::bail!("canceled");
+        }
+        match download_track_once(
+            client,
+            url,
+            &header_map,
+            &part_path,
+            expected_size,
+            progress,
+            cancel,
+        )
+        .await
+        {
+            Ok(()) => {
+                tokio::fs::rename(&part_path, dest).await?;
+                return Ok(());
+            }
+            Err(e) => {
+                last_err = Some(e);
+                if cancel.is_cancelled() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("track download failed")))
+}
+
+async fn download_track_once(
+    client: &reqwest::Client,
+    url: &str,
+    header_map: &reqwest::header::HeaderMap,
+    part_path: &Path,
+    expected_size: Option<u64>,
+    progress: &ProgressHandle,
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
+    use futures_util::StreamExt;
+    // 与分块下载同一套回滚：重试时不能把上一次尝试已计入的字节留在进度里。
+    let mut rollback = ProgressRollback::new(progress);
+    let resp = client
+        .get(url)
+        .headers(header_map.clone())
+        .send()
+        .await?
+        .error_for_status()?;
+    let mut stream = resp.bytes_stream();
+    let mut file = tokio::fs::File::create(part_path).await?;
+    while let Some(chunk) = stream.next().await {
+        if cancel.is_cancelled() {
+            return Err(anyhow!("canceled")); // 守卫在此 drop，自动回滚
+        }
+        let chunk = chunk?;
+        file.write_all(&chunk).await?;
+        rollback.add(chunk.len() as u64);
+    }
+    file.flush().await?;
+    // 服务端提前断流时 reqwest 不一定报错。已知总大小时必须核对，
+    // 否则会把一个截断的音频轨送进 ffmpeg，得到音画不同步的成品。
+    if let Some(expected) = expected_size.filter(|s| *s > 0) {
+        let actual = std::fs::metadata(part_path)?.len();
+        if actual != expected {
+            anyhow::bail!("track incomplete: {actual}/{expected} bytes");
+        }
+    }
+    rollback.disarm();
     Ok(())
 }
 

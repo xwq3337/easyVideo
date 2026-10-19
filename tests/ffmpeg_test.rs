@@ -1,4 +1,4 @@
-use easydownvideo::core::ffmpeg::{build_remux, ensure_ffmpeg};
+use easydownvideo::core::ffmpeg::{build_mux, build_remux, ensure_ffmpeg};
 use std::path::PathBuf;
 
 #[test]
@@ -41,4 +41,28 @@ fn build_remux_args_are_container_agnostic() {
         !joined.contains("aac_adtstoasc"),
         "不应硬编码 aac_adtstoasc，否则 AC-3 音轨的 TS 会合并失败"
     );
+}
+
+/// DASH 合并：视频一条、音频一条，必须显式 `-map` 且无损复制。
+#[test]
+fn build_mux_maps_one_video_and_one_audio_stream() {
+    let ffmpeg = PathBuf::from("/usr/bin/ffmpeg");
+    let video = PathBuf::from("/tmp/task-1/video.mp4");
+    let audio = PathBuf::from("/tmp/task-1/audio.m4a");
+    let out = PathBuf::from("/tmp/out.mp4");
+    let cmd = build_mux(&ffmpeg, &video, &audio, &out);
+    let args: Vec<String> = cmd
+        .as_std()
+        .get_args()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(args.iter().filter(|a| *a == "-i").count(), 2, "两条输入轨");
+    assert!(args.windows(2).any(|w| w == ["-map", "0:v:0"]));
+    assert!(args.windows(2).any(|w| w == ["-map", "1:a:0"]));
+    assert!(args.windows(2).any(|w| w == ["-c", "copy"]), "禁止重编码");
+    assert!(
+        args.windows(2).any(|w| w == ["-movflags", "+faststart"]),
+        "moov 必须前置"
+    );
+    assert_eq!(args.last().map(String::as_str), Some("/tmp/out.mp4"));
 }

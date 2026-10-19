@@ -32,7 +32,7 @@ pub async fn frame_data_url(
     at_secs: f64,
     max_width: u32,
 ) -> anyhow::Result<String> {
-    let out = tokio::process::Command::new(ffmpeg)
+    let out = crate::core::process::hidden_command(ffmpeg)
         .args(["-nostdin", "-v", "error", "-y"])
         .arg("-ss").arg(format!("{:.3}", at_secs.max(0.0)))
         .arg("-i").arg(input)

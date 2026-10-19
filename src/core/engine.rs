@@ -7,13 +7,17 @@ use tokio::runtime::Handle;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::core::direct::{download_direct, unique_path_avoiding, MIN_BLOCK_SIZE};
+use crate::core::direct::{
+    download_direct, download_track, file_matches_size, unique_path_avoiding, MIN_BLOCK_SIZE,
+};
 use crate::core::events::{Choice, ChoiceKind, EngineEvent, ProgressHandle, TaskId, TaskState};
-use crate::core::ffmpeg::{ensure_ffmpeg, remux_to_mp4, RemuxOutcome};
+use crate::core::ffmpeg::{ensure_ffmpeg, mux_video_audio, remux_to_mp4, RemuxOutcome};
 use crate::core::hls::{download_media, parse::parse_playlist, parse::ParsedPlaylist};
 use crate::core::probe::{filename_from_url, probe, ProbeOutcome};
 use crate::core::task::{task_dir, write_manifest, ManifestKind, TaskManifest};
-use crate::core::ytdlp::{cookie_jar_from_netscape, fetch_formats, find_ytdlp};
+use crate::core::ytdlp::{
+    cookie_jar_from_netscape, fetch_formats, find_ytdlp, is_dash_fragment_url, YtdlpAudio,
+};
 use crate::settings::Settings;
 
 /// 不伪装时用的 UA。诚实标出自己是谁。
@@ -63,6 +67,11 @@ struct Inner {
 struct TaskEntry {
     url: String,
     filename: String,
+    /// 浏览器扩展捕获到的请求头。由 `add_url_with_headers` 净化后存进来，
+    /// 之后的探测、分片下载、yt-dlp 都复用它。
+    headers: crate::core::request::Headers,
+    /// 选中的 yt-dlp 纯视频格式配套的音频轨（DASH）。`None` 表示不需要二次合并。
+    audio: Option<YtdlpAudio>,
     state: TaskState,
     cancel: CancellationToken,
     pending_choice: Option<ChoiceKind>,
@@ -123,6 +132,16 @@ impl TaskEntry {
             self.state,
             TaskState::Probing | TaskState::Downloading | TaskState::Merging
         )
+    }
+}
+
+/// 外部 JSON 里的容器扩展名 → 可安全拼进任务目录文件名的短 ASCII 串。
+fn safe_track_ext(ext: &str) -> String {
+    let ext = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+    if !ext.is_empty() && ext.len() <= 8 && ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        ext
+    } else {
+        "m4a".to_string()
     }
 }
 
@@ -233,10 +252,28 @@ impl Engine {
     }
 
     pub fn add_url(&self, url: String) -> TaskId {
+        self.add_url_with_headers(url, None, Vec::new())
+    }
+
+    /// 带浏览器上下文的入队：建议文件名 + 捕获到的请求头。
+    ///
+    /// 与 `add_url` 走同一条 `insert_entry` —— 扩展任务和手工粘贴的任务在引擎里
+    /// 没有第二种生命周期。文件名与请求头都在这里净化（见 `core::request`），
+    /// 调用方（本地 HTTP 接口）不需要自己再挡一遍。
+    pub fn add_url_with_headers(
+        &self,
+        url: String,
+        filename: Option<String>,
+        headers: Vec<(String, String)>,
+    ) -> TaskId {
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
-        // 复用 probe 里的唯一实现，不要在这里再抄一份推导逻辑
-        let filename = filename_from_url(&url);
-        self.insert_entry(id, url, filename, None);
+        // 建议名不合法时回退到 URL 推导 —— 与手工粘贴完全同一套规则。
+        let filename = filename
+            .as_deref()
+            .and_then(crate::core::request::sanitize_filename)
+            .unwrap_or_else(|| filename_from_url(&url));
+        let headers = crate::core::request::sanitize_headers(&headers);
+        self.insert_entry(id, url, filename, headers, None, None);
         id
     }
 
@@ -248,10 +285,16 @@ impl Engine {
         // 这不是边角情况：它发生在每次重启后的第一次新增。
         self.inner.next_id.fetch_max(m.id + 1, Ordering::SeqCst);
         // 先克隆出 id/url/filename，再把完整的 manifest 交给 insert_entry——直接
-        // `insert_entry(m.id, m.url, m.filename, Some(m))` 会 partial move：字段被挪走后
+        // `insert_entry(m.id, m.url, m.filename, m.headers.clone(), Some(m))` 会 partial move：字段被挪走后
         // 整个 `m` 无法再传值（E0382）。manifest 需要保持完整以便写盘。
-        let (id, url, filename) = (m.id, m.url.clone(), m.filename.clone());
-        self.insert_entry(id, url, filename, Some(m));
+        let (id, url, filename, headers, audio) = (
+            m.id,
+            m.url.clone(),
+            m.filename.clone(),
+            m.headers.clone(),
+            m.audio.clone(),
+        );
+        self.insert_entry(id, url, filename, headers, audio, Some(m));
     }
 
     pub fn set_filename(&self, id: TaskId, name: String) {
@@ -401,25 +444,39 @@ impl Engine {
         {
             let mut tasks = self.inner.tasks.lock().unwrap();
             let Some(t) = tasks.get_mut(&id) else { return };
-            let url = {
+            let picked = {
                 let Some(kind) = t.pending_choice.as_ref() else {
                     return;
                 };
                 match (kind, choice) {
-                    (ChoiceKind::HlsVariants(v), Choice::Variant(i)) => {
-                        v.get(i).map(|c| c.uri.clone())
-                    }
-                    (ChoiceKind::YtdlpFormats(f), Choice::YtdlpFormat(i)) => {
-                        f.get(i).map(|c| c.url.clone())
-                    }
+                    (ChoiceKind::HlsVariants(v), Choice::Variant(i)) => v
+                        .get(i)
+                        .map(|c| (c.uri.clone(), Vec::new(), None)),
+                    (ChoiceKind::YtdlpFormats(f), Choice::YtdlpFormat(i)) => f
+                        .get(i)
+                        .map(|c| (c.url.clone(), c.headers.clone(), c.audio.clone())),
                     _ => None,
                 }
             };
-            let Some(url) = url else {
+            let Some((url, format_headers, audio)) = picked else {
                 return; // 无效选择：什么都不动，候选列表留给下一次正确的调用
             };
             t.pending_choice = None;
+            // 页面的 Cookie/Authorization 属于页面所在的域。选中的格式可能指向
+            // 另一个主机的 CDN（B 站页面 → *.bilivideo.com），把它们原样带过去
+            // 等于绕过浏览器的同域策略泄露会话。跨主机时先剥掉，让域作用域的
+            // cookie Jar 决定 CDN 到底该收到什么；Referer/UA 仍然保留。
+            let base_headers = if crate::core::request::same_host(&t.url, &url) {
+                t.headers.clone()
+            } else {
+                crate::core::request::strip_credentials(&t.headers)
+            };
             t.url = url;
+            t.audio = audio;
+            // **格式自带的 http_headers 必须合并进任务。** 之前这里只取 url，
+            // B 站 CDN 的 Referer 就丢了，下载随即变成 `[generic] … 403 Forbidden`。
+            // 同名的 Referer/UA 以 yt-dlp 解析出的为准。
+            t.headers = crate::core::request::merge_headers(&base_headers, &format_headers);
             t.state = TaskState::Queued;
         }
         self.inner.queue.lock().unwrap().push_back(id);
@@ -433,6 +490,8 @@ impl Engine {
         id: TaskId,
         url: String,
         filename: String,
+        headers: crate::core::request::Headers,
+        audio: Option<YtdlpAudio>,
         manifest: Option<TaskManifest>,
     ) {
         let (state, cancel) = (TaskState::Queued, CancellationToken::new());
@@ -444,6 +503,8 @@ impl Engine {
                 TaskEntry {
                     url: url.clone(),
                     filename,
+                    headers,
+                    audio,
                     state,
                     cancel,
                     pending_choice: None,
@@ -553,6 +614,8 @@ impl Engine {
                         Some((
                             id,
                             t.url.clone(),
+                            t.headers.clone(),
+                            t.audio.clone(),
                             t.progress.clone(),
                             t.cancel.clone(),
                             t.workers.clone(),
@@ -567,7 +630,9 @@ impl Engine {
                     _ => None,
                 }
             };
-            let Some((id, url, progress, cancel, workers)) = started else { continue };
+            let Some((id, url, headers, audio, progress, cancel, workers)) = started else {
+                continue;
+            };
             // 状态事件在锁外发。这里**不调 set_state**：它会再次进入 pump，把这条路径变成递归。
             let _ = self
                 .inner
@@ -595,7 +660,14 @@ impl Engine {
                 // token 在 pump 里就取好了并随 worker 一起走：**worker 必须拿"自己那一个" token**。
                 // 若像原先那样在 run_task 内部再去 entry 上读，暂停→继续换过 token 之后，旧 worker
                 // 会读到新 token（没被取消），于是它既不会停下、收尾时也无法判断自己被顶替了。
-                let task = engine.run_task(id, url.clone(), progress.clone(), cancel.clone());
+                let task = engine.run_task(
+                    id,
+                    url.clone(),
+                    headers.clone(),
+                    audio.clone(),
+                    progress.clone(),
+                    cancel.clone(),
+                );
                 tokio::pin!(task);
                 let result = loop {
                     tokio::select! {
@@ -659,14 +731,25 @@ impl Engine {
         &self,
         id: TaskId,
         url: String,
+        headers: crate::core::request::Headers,
+        audio: Option<YtdlpAudio>,
         progress: ProgressHandle,
         cancel: CancellationToken,
     ) -> anyhow::Result<()> {
         let settings = self.inner.settings.lock().unwrap().clone();
         let client = self.http();
-        let outcome = probe(&client, &url).await?;
+        let outcome = probe(&client, &url, &headers).await?;
         match outcome {
             ProbeOutcome::WebPage => {
+                // 这类地址永远解析不出可下载的完整文件：它要求播放页的 Referer，
+                // 而且签名会过期。直接说清楚，别让用户对着一句 `[generic] … 403` 猜。
+                if is_dash_fragment_url(&url) {
+                    anyhow::bail!(
+                        "这是 DASH 音视频分片直链（.m4s/.m4a），通常要求播放页的 Referer 且会过期，\
+                         无法单独下载。请粘贴视频页面链接（例如 https://www.bilibili.com/video/BV…），\
+                         再从格式列表里选择清晰度。"
+                    );
+                }
                 if settings.ytdlp_enabled {
                     if let Some(exe) = find_ytdlp() {
                         let formats = fetch_formats(
@@ -675,6 +758,7 @@ impl Engine {
                             &self.cookies_file(),
                             settings.cookies_from_browser.as_deref(),
                             settings.impersonate,
+                            &headers,
                         )
                         .await?;
                         // yt-dlp 刚把 cookie jar 写回文件（--cookies 既是输入也是输出），
@@ -702,7 +786,10 @@ impl Engine {
                 }
                 anyhow::bail!("无法识别的网页地址；可安装 yt-dlp 或在设置中启用");
             }
-            ProbeOutcome::Hls { url } => self.run_hls(id, &url, &settings, &progress, &cancel).await,
+            ProbeOutcome::Hls { url } => {
+                self.run_hls(id, &url, &headers, &settings, &progress, &cancel)
+                    .await
+            }
             ProbeOutcome::Direct {
                 url,
                 size,
@@ -718,7 +805,10 @@ impl Engine {
                         }
                     }
                 }
-                let (final_path, tdir) = self.paths(id, &settings, None);
+                // 需要合并音频时最终产物一定是 mp4。唯一性检查也必须按 mp4 判，
+                // 否则 `paths` 可能放行一个已存在的同名 mp4，ffmpeg 带着 `-y` 直接覆盖它。
+                let output_ext = audio.as_ref().map(|_| "mp4");
+                let (final_path, tdir) = self.paths(id, &settings, output_ext);
                 // 任务一开始就写 manifest：中途退出应用可据扫描恢复。
                 //
                 // **必须在状态切到 Downloading 之前落盘。** Downloading 对外承诺
@@ -735,6 +825,8 @@ impl Engine {
                         .unwrap_or_default(),
                     download_dir: settings.download_dir.clone(),
                     kind: ManifestKind::Direct { size },
+                    headers: headers.clone(),
+                    audio: audio.clone(),
                 };
                 let _ = write_manifest(&tdir, &manifest);
                 // 用户在探测期间可能已经点了删除。`advance_state` 会拒绝覆盖 `Canceled`
@@ -743,30 +835,155 @@ impl Engine {
                 if !self.advance_state(id, TaskState::Downloading) {
                     anyhow::bail!("canceled");
                 }
-                download_direct(
-                    &client,
-                    &url,
-                    &final_path,
-                    &tdir,
-                    size,
-                    accepts_ranges,
-                    settings.segment_concurrency,
-                    MIN_BLOCK_SIZE,
-                    &progress,
-                    cancel,
-                )
-                .await?;
-                // 完成后整个任务目录一起清掉（含 manifest），避免重启时误恢复已完成任务
-                std::fs::remove_dir_all(&tdir).ok();
+                if let Some(audio) = audio.as_ref() {
+                    self.run_direct_with_audio(
+                        id,
+                        &url,
+                        &headers,
+                        size,
+                        accepts_ranges,
+                        audio,
+                        &final_path,
+                        &tdir,
+                        &settings,
+                        &client,
+                        &progress,
+                        &cancel,
+                    )
+                    .await?;
+                } else {
+                    download_direct(
+                        &client,
+                        &url,
+                        &final_path,
+                        &tdir,
+                        &headers,
+                        size,
+                        accepts_ranges,
+                        settings.segment_concurrency,
+                        MIN_BLOCK_SIZE,
+                        &progress,
+                        cancel,
+                    )
+                    .await?;
+                    // 完成后整个任务目录一起清掉（含 manifest），避免重启时误恢复已完成任务
+                    std::fs::remove_dir_all(&tdir).ok();
+                }
                 Ok(())
             }
         }
+    }
+
+    /// 纯视频格式 + 独立音频轨：下完两条轨后无损合成 mp4。
+    ///
+    /// 暂停/失败后的恢复逻辑：视频与音频都先落在任务目录里，`file_matches_size`
+    /// 判断哪一条已经完整。暂停在合并阶段时整个目录保留，继续时只重跑 ffmpeg。
+    #[allow(clippy::too_many_arguments)]
+    async fn run_direct_with_audio(
+        &self,
+        id: TaskId,
+        video_url: &str,
+        headers: &[(String, String)],
+        video_size: Option<u64>,
+        accepts_ranges: bool,
+        audio: &YtdlpAudio,
+        final_path: &Path,
+        tdir: &Path,
+        settings: &Settings,
+        client: &reqwest::Client,
+        progress: &ProgressHandle,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<()> {
+        let video_ext = final_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("mp4");
+        let video_path = tdir.join(format!("video.{video_ext}"));
+        // 扩展名来自 yt-dlp 的 JSON，仍按白名单过滤后再拼进路径。
+        let audio_path = tdir.join(format!("audio.{}", safe_track_ext(&audio.ext)));
+
+        // 进度总量可以用估算值；完整性校验只认 yt-dlp 给出的精确大小。
+        let audio_estimate = audio.filesize.or(audio.filesize_approx);
+        if file_matches_size(&video_path, video_size) {
+            // 上一轮已经把视频下完。ProgressHandle 跨运行存活，先归零，
+            // 再把磁盘上已有的成果计入本轮进度（不计入 bytes —— 本轮没走网络）。
+            progress.reset();
+            let bytes = std::fs::metadata(&video_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            progress.add(bytes);
+            progress.set_total(match audio_estimate {
+                Some(size) => bytes + size,
+                None => 0, // 音频大小未知时按"总大小未知"显示，别报一个必然超过的总数
+            });
+        } else {
+            download_direct(
+                client,
+                video_url,
+                &video_path,
+                tdir,
+                headers,
+                video_size,
+                accepts_ranges,
+                settings.segment_concurrency,
+                MIN_BLOCK_SIZE,
+                progress,
+                cancel.clone(),
+            )
+            .await?;
+            if let Some(size) = audio_estimate {
+                let downloaded = progress.snapshot().0;
+                progress.set_total(downloaded + size);
+            }
+        }
+
+        // 音频格式自己的 http_headers 通常只有 Referer/UA，登录 Cookie 在任务头里。
+        // 只传 audio.headers 会让需要登录态的 CDN 在音频这一步 403。
+        let audio_headers = crate::core::request::merge_headers(headers, &audio.headers);
+        if file_matches_size(&audio_path, audio.filesize) {
+            progress.add(audio_estimate.unwrap_or(0));
+        } else {
+            download_track(
+                client,
+                &audio.url,
+                &audio_headers,
+                &audio_path,
+                // 只用精确大小做完整性校验；估算值会让正常的音轨永远"不完整"。
+                audio.filesize,
+                progress,
+                cancel,
+            )
+            .await?;
+        }
+
+        // 两条轨都就位后才进入 Merging：界面上的"合并中"因此名副其实。
+        if !self.advance_state(id, TaskState::Merging) {
+            anyhow::bail!("canceled");
+        }
+        let ffmpeg = match &settings.ffmpeg_path_override {
+            Some(p) => p.clone(),
+            None => ensure_ffmpeg(&self.inner.data_dir)?,
+        };
+        if mux_video_audio(&ffmpeg, &video_path, &audio_path, final_path, cancel).await?
+            == RemuxOutcome::Interrupted
+        {
+            // 只有"用户取消"才清盘。**不能按"当前不是 Paused"判断**：暂停后立刻继续时
+            // 新 worker 已经把状态改成 Queued，旧 worker 会在这里把两条已完成的轨删掉，
+            // 新 worker 只好从头重下。与 `pump` 里失败收尾的判定保持一致。
+            if matches!(self.state_of(id), Some(TaskState::Canceled)) {
+                std::fs::remove_dir_all(tdir).ok();
+            }
+            return Ok(());
+        }
+        std::fs::remove_dir_all(tdir).ok();
+        Ok(())
     }
 
     async fn run_hls(
         &self,
         id: TaskId,
         playlist_url: &str,
+        headers: &[(String, String)],
         settings: &Settings,
         progress: &ProgressHandle,
         cancel: &CancellationToken,
@@ -776,6 +993,7 @@ impl Engine {
         let body = {
             let resp = client
                 .get(playlist_url)
+                .headers(crate::core::request::header_map(headers))
                 .send()
                 .await?
                 .error_for_status()?;
@@ -818,6 +1036,8 @@ impl Engine {
                 kind: ManifestKind::Hls {
                     playlist_url: playlist_url.to_string(),
                 },
+                headers: headers.to_vec(),
+                audio: None,
             },
         );
         if !self.advance_state(id, TaskState::Downloading) {
@@ -826,7 +1046,9 @@ impl Engine {
         let plan = download_media(
             &client,
             &media,
+            playlist_url,
             &tdir,
+            headers,
             settings.segment_concurrency,
             progress,
             cancel.clone(),
@@ -843,10 +1065,11 @@ impl Engine {
         };
         // 合并可能很久（-c copy 要把整个文件搬一遍），必须能被暂停/取消打断。
         if remux_to_mp4(&ffmpeg, &plan, &final_path, cancel).await? == RemuxOutcome::Interrupted {
-            // 用户暂停：保留任务目录（分片还在，继续时只重跑合并这一步）。
+            // 只有用户取消才清盘。暂停后立刻继续时状态已经是 Queued（新 worker 正在跑），
+            // 这里若按"不是 Paused"判断，会把分片全删掉，继续变成从头下载。
             // 用户取消：什么都不留 —— `cancel` 见到 Merging 就把清理交给了 worker，
             // 这个地方必须自己做完，否则任务目录会孤零零留在盘上被 scan_resume 复活。
-            if !matches!(self.state_of(id), Some(TaskState::Paused)) {
+            if matches!(self.state_of(id), Some(TaskState::Canceled)) {
                 std::fs::remove_dir_all(&tdir).ok();
             }
             return Ok(());

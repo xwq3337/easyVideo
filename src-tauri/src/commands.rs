@@ -14,6 +14,7 @@ use crate::dto::{
     job_dto, settings_dto, settings_from, task_dto, ChoiceDto, ChoiceKindDto, JobDto, JobParamsDto,
     MergeCheckDto, SettingsDto, TaskDto, VideoInfoDto,
 };
+use crate::extension_api::{generate_token, ExtensionConfig, ExtensionConfigDto};
 use crate::state::AppState;
 
 type R<T> = Result<T, String>;
@@ -245,6 +246,49 @@ pub async fn preview_frame(state: State<'_, AppState>, path: String, at_secs: f6
     ops.preview(PathBuf::from(path), at_secs)
         .await
         .map_err(|e| format!("{e:#}"))
+}
+
+// ===== 浏览器扩展 =====
+//
+// 本地 HTTP 接口的配置。接口本身在 `extension_api` 里，这里是给设置页用的三件套：
+// 读、改、换令牌。
+
+#[tauri::command]
+pub fn get_extension_config(state: State<'_, AppState>) -> ExtensionConfigDto {
+    let (port, token) = state.local_api.config();
+    ExtensionConfigDto { port, token }
+}
+
+/// 保存并立即生效。**先落盘再启动**：如果监听失败（端口被占用），设置文件里留下
+/// 的仍是用户刚填的值，下次启动会再试一次 —— 比"静默回退到旧端口"更符合预期。
+#[tauri::command]
+pub fn update_extension_config(
+    state: State<'_, AppState>,
+    config: ExtensionConfigDto,
+) -> R<ExtensionConfigDto> {
+    let cfg = ExtensionConfig::validated(config.port, config.token)
+        .map_err(|e| format!("{e:#}"))?;
+    cfg.save().map_err(|e| format!("保存扩展设置失败：{e:#}"))?;
+    state
+        .local_api
+        .start(cfg.port, cfg.token.clone())
+        .map_err(|e| format!("启动扩展接口失败：{e:#}"))?;
+    Ok(cfg.into())
+}
+
+#[tauri::command]
+pub fn regenerate_extension_token(state: State<'_, AppState>) -> R<ExtensionConfigDto> {
+    let (port, _) = state.local_api.config();
+    let cfg = ExtensionConfig {
+        port,
+        token: generate_token(),
+    };
+    cfg.save().map_err(|e| format!("保存扩展设置失败：{e:#}"))?;
+    state
+        .local_api
+        .start(cfg.port, cfg.token.clone())
+        .map_err(|e| format!("启动扩展接口失败：{e:#}"))?;
+    Ok(cfg.into())
 }
 
 /// 多选视频文件（合并用）。与 `pick_video_file` 同理走回调式 API，不阻塞工作线程。

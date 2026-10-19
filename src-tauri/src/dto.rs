@@ -147,6 +147,8 @@ pub struct FormatDto {
     pub note: String,
     pub filesize: Option<u64>,
     pub url: String,
+    /// 选中后最终是否会有声音。`false` 的格式界面会标成"仅视频"。
+    pub has_audio: bool,
 }
 
 // **不用新类型变体**(`HlsVariants(Vec<VariantDto>)`)。serde 内部标签
@@ -183,6 +185,7 @@ impl From<ChoiceKind> for ChoiceKindDto {
                         note: c.note,
                         filesize: c.filesize,
                         url: c.url,
+                        has_audio: c.has_audio,
                     })
                     .collect(),
             },
@@ -627,6 +630,9 @@ mod tests {
                 note: "1080p video only".into(),
                 filesize: Some(123_456_789),
                 url: "https://example.com/v".into(),
+                headers: Vec::new(),
+                audio: None,
+                has_audio: true,
             }]),
         });
         assert_eq!(
@@ -641,7 +647,8 @@ mod tests {
                         "ext": "mp4",
                         "note": "1080p video only",
                         "filesize": 123_456_789,
-                        "url": "https://example.com/v"
+                        "url": "https://example.com/v",
+                        "hasAudio": true
                     }]
                 }
             })

@@ -65,10 +65,23 @@ fn main() {
         engine.resume(m);
     }
 
+    // 浏览器扩展接口。配置读不到/损坏时会自动补一个新令牌并落盘，所以这里只
+    // 在"端口真的没绑上"时记录错误，不影响下载主流程。
+    let extension_config =
+        easydownvideo_tauri::extension_api::ExtensionConfig::load_or_create();
+    let local_api = easydownvideo_tauri::extension_api::LocalApi::new(
+        rt.handle().clone(),
+        engine.clone(),
+    );
+    if let Err(e) = local_api.start(extension_config.port, extension_config.token) {
+        tracing::error!("浏览器扩展接口未启动：{e:#}");
+    }
+
     let app_state = AppState {
         engine: engine.clone(),
         videoops: videoops.clone(),
         settings: std::sync::Mutex::new(settings),
+        local_api,
     };
 
     tauri::Builder::default()
@@ -98,6 +111,9 @@ fn main() {
             commands::probe_video,
             commands::check_merge,
             commands::preview_frame,
+            commands::get_extension_config,
+            commands::update_extension_config,
+            commands::regenerate_extension_token,
         ])
         .setup(move |app| {
             // **macOS 上必须保留 decorations。** Tauri 自己的配置文档
